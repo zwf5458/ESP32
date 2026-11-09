@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 · 后台管理</title>
+<style>
+:root{
+  --bg:#f5f0e8; --ink:#111; --cream:#faf3e3; --yellow:#ffe14d; --yellow-bd:#f5d943;
+  --orange:#ffa14d; --pink:#ff9ecf; --blue:#7fd9ff; --purple:#b7a4ff;
+  --red-bg:#ffb3ab; --green-bg:#b9f0ae; --ok:#35c04a;
+  --bd:3px solid #111; --sh:4px 4px 0 #111; --sh2:2px 2px 0 #111; --r:14px;
+}
+html[data-theme=dark]{--bg:#17140f;--ink:#f5efe4;--cream:#241f18;--yellow:#6b5615;--yellow-bd:#5c4a12;
+  --orange:#7a4d1c;--pink:#4d2738;--blue:#1d4258;--purple:#3a2f66;--red-bg:#4d2723;--green-bg:#26451f;--sh:4px 4px 0 #000;--sh2:2px 2px 0 #000}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:"PingFang SC",-apple-system,"Microsoft YaHei",sans-serif;font-size:14px;line-height:1.6;
+  padding-top:58px}
+.mono{font-family:"SF Mono",Menlo,Consolas,monospace}
+/* ---------- topbar ---------- */
+#topbar{position:fixed;top:0;left:0;right:0;z-index:50;display:flex;align-items:center;gap:12px;
+  padding:9px 14px;background:var(--yellow-bd);border-bottom:var(--bd)}
+#burger{width:42px;height:42px;display:grid;place-items:center;gap:5px;cursor:pointer;
+  background:var(--cream);border:var(--bd);border-radius:12px;box-shadow:var(--sh);flex:0 0 auto}
+#burger .l{display:block;width:20px;height:3px;background:#111;border-radius:2px}
+html[data-theme=dark] #burger .l{background:#f5efe4}
+#burger.bx .l1{transform:translateY(8px) rotate(45deg)}
+#burger.bx .l2{opacity:0}
+#burger.bx .l3{transform:translateY(-8px) rotate(-45deg)}
+#topbar h1{margin:0;font-size:16px;font-weight:900;font-family:"SF Mono",Menlo,monospace;flex:1;letter-spacing:.5px}
+.tp-pill{display:flex;align-items:center;gap:6px;background:var(--cream);border:var(--bd);border-radius:999px;
+  padding:6px 12px;font-size:12px;font-weight:800;box-shadow:var(--sh2)}
+#tp-theme{cursor:pointer}
+.memb{width:74px;height:10px;border:2px solid #111;border-radius:4px;overflow:hidden;background:#fff}
+.memb i{display:block;height:100%;background:#35c04a}
+/* ---------- drawer ---------- */
+#scrim{position:fixed;inset:0;background:#0009;z-index:40;display:none}
+#drawer{position:fixed;top:0;left:-290px;bottom:0;width:280px;z-index:45;background:var(--cream);
+  border-right:var(--bd);transition:left .18s;overflow-y:auto;padding:18px 14px}
+#drawer.open{left:0}
+.dr-brand{display:flex;align-items:center;gap:10px;background:var(--yellow-bd);border:var(--bd);
+  border-radius:12px;padding:10px;box-shadow:var(--sh);margin-bottom:16px;font-weight:900;font-size:17px}
+.dr-ic{width:40px;height:40px;display:grid;place-items:center;background:var(--pink);border:var(--bd);border-radius:10px}
+.dr-sec{font-size:11px;font-weight:800;letter-spacing:1px;color:#8a7f6d;margin:14px 6px 6px}
+.dr-item{display:flex;align-items:center;gap:10px;padding:11px 12px;border-radius:10px;font-weight:800;
+  font-size:14px;cursor:pointer;border:2px solid transparent}
+.dr-item:hover{background:#00000010}
+.dr-item.on{background:var(--orange);border-color:#111;box-shadow:var(--sh2)}
+.dr-item.dis{opacity:.5;cursor:not-allowed}
+.dr-item small{font-size:10px;color:#8a7f6d;margin-left:auto}
+/* ---------- cards ---------- */
+main{max-width:1180px;margin:0 auto;padding:18px 14px 40px}
+.card{background:var(--cream);border:var(--bd);border-radius:var(--r);box-shadow:var(--sh);padding:14px 16px;margin-bottom:18px}
+.card h3{margin:0 0 10px;font-size:14px;font-weight:900;text-align:center;letter-spacing:.5px}
+.banner{background:var(--yellow);border:var(--bd);border-radius:var(--r);box-shadow:var(--sh);
+  padding:22px;text-align:center;margin-bottom:18px}
+.banner.big{font-size:30px;font-weight:900;letter-spacing:2px}
+.banner .chip-st{display:inline-block;background:#000;color:#ffe14d;border-radius:6px;padding:2px 10px;
+  font-size:12px;font-weight:800;margin-top:6px}
+.grid{display:grid;gap:18px}
+.g3{grid-template-columns:repeat(3,1fr)}
+.g3a{grid-template-columns:repeat(3,1fr)}
+@media(max-width:860px){.g3,.g3a{grid-template-columns:1fr}}
+.mod{padding:18px 10px;text-align:center;font-weight:900;font-size:15px;border-radius:var(--r)}
+.mod small{display:block;margin-top:6px;font-weight:900;color:#5b4d17}
+html[data-theme=dark] .mod small{color:#cbb977}
+.mod.o{background:var(--orange)} .mod.p{background:var(--pink)} .mod.y{background:var(--yellow)}
+.kv{display:flex;justify-content:space-between;gap:10px;padding:5px 2px;border-bottom:1px dashed #0003;font-size:13px}
+.kv:last-child{border-bottom:0}
+.kv .k{color:#8a7f6d;font-weight:700}
+.kv .v{font-weight:900;font-family:"SF Mono",Menlo,monospace}
+.sub{display:flex;align-items:center;justify-content:center;gap:10px;margin:8px 0 14px;flex-wrap:wrap}
+.btn{border:var(--bd);border-radius:12px;padding:10px 16px;font-size:14px;font-weight:900;cursor:pointer;
+  color:#111;box-shadow:var(--sh);background:var(--yellow);transition:transform .06s,box-shadow .06s;font-family:inherit}
+.btn:hover{transform:translate(-1px,-1px);box-shadow:5px 5px 0 #111}
+.btn:active{transform:translate(3px,3px);box-shadow:1px 1px 0 #111}
+.btn:disabled{opacity:.55;cursor:not-allowed}
+.btn.red{background:#ff7f6e}.btn.green{background:var(--green-bg)}.btn.pinkbg{background:var(--pink)}
+.btn.purplebg{background:var(--purple)}.btn.gray{background:#dcd4c4}
+.btn.sm{padding:7px 14px;font-size:12.5px;border-radius:10px;box-shadow:var(--sh2)}
+.diag{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+@media(max-width:860px){.diag{grid-template-columns:1fr 1fr}}
+.dg{border:var(--bd);border-radius:12px;padding:12px;text-align:center;font-weight:900}
+.dg b{display:block;font-size:22px;font-family:"SF Mono",Menlo,monospace}
+.dg small{color:#5b4d17;font-weight:800}
+html[data-theme=dark] .dg small{color:#cbb977}
+.dg.v{background:var(--purple)} .dg.o{background:var(--orange)} .dg.y{background:var(--yellow)} .dg.p{background:var(--pink)}
+.badge-ok{position:absolute;right:14px;top:-2px;background:#33cc66;border:var(--bd);border-radius:8px;
+  padding:2px 10px;font-size:11px;font-weight:900}
+.card.rel{position:relative}
+.legal{background:var(--red-bg)}
+.legal h3{text-align:left}
+.legal li{font-size:12.5px;margin:5px 0}
+.logc{background:#0a0a0a;color:#33ff66;font-family:"SF Mono",Menlo,monospace;font-size:12.5px;line-height:1.7;
+  padding:12px 14px;border-radius:10px;height:170px;overflow-y:auto;white-space:pre-wrap;border:var(--bd)}
+/* ---------- scan ---------- */
+.scanband{background:#1b1b1b;border:var(--bd);border-radius:var(--r);box-shadow:var(--sh);
+  padding:12px 14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px;position:relative}
+.scanband .st{color:#ffe14d;font-size:12px;font-weight:800;font-family:"SF Mono",Menlo,monospace}
+.filters{display:flex;gap:8px;align-items:center;color:#111;background:var(--cream);border:var(--bd);
+  border-radius:999px;padding:6px 10px}
+.filters label{font-size:12px;font-weight:800;display:flex;align-items:center;gap:4px;cursor:pointer}
+.table-wrap{background:#1b1b1b;border:var(--bd);border-radius:var(--r);box-shadow:var(--sh);
+  padding:0;max-height:560px;overflow:auto;min-height:200px}
+table{width:100%;border-collapse:collapse;font-family:"SF Mono",Menlo,monospace;font-size:12.5px}
+th{position:sticky;top:0;background:var(--yellow);color:#111;text-align:left;padding:9px 10px;font-size:12px;
+  border-bottom:2px solid #000;z-index:1}
+td{padding:8px 10px;border-bottom:1px solid #333;color:#eee}
+td.ssid{font-weight:800;color:#ffe14d}
+td.rssi{color:#28c94f;font-weight:800}
+.tbtn{border:2px solid #000;border-radius:8px;padding:4px 12px;font-weight:900;font-size:12px;cursor:pointer;box-shadow:1px 1px 0 #000}
+.tbtn.pink{background:var(--pink)}
+.tbtn:disabled{opacity:.45;cursor:default}
+.nores{padding:40px;text-align:center;color:#888;font-weight:800}
+.hidden-ssid{color:#ff7f6e}
+/* ---------- config ---------- */
+.frow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0}
+.frow label{font-size:13px;font-weight:800;min-width:92px}
+.frow .val{font-weight:900;font-family:"SF Mono",Menlo,monospace;background:var(--yellow);
+  border:var(--bd);border-radius:10px;padding:8px 14px;flex:1}
+select.mini{padding:8px 12px;font-weight:800;border:var(--bd);border-radius:10px;background:var(--yellow);font-family:inherit}
+.note{font-size:12px;color:#8a7f6d;margin-top:6px}
+.attack-banner{background:var(--yellow);border:var(--bd);border-radius:var(--r);box-shadow:var(--sh);padding:16px 18px;
+  font-size:13px;font-weight:700;margin-bottom:16px}
+#toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:99;background:#111;color:#ffe14d;
+  border:var(--bd);border-radius:12px;padding:10px 18px;font-weight:900;box-shadow:var(--sh);display:none}
+</style>
+</head>
+<body>
+
+<!-- ===== TOPBAR ===== -->
+<div id="topbar">
+  <div id="burger"><span class="l l1"></span><span class="l l2"></span><span class="l l3"></span></div>
+  <h1 id="pageTitle">状态总览</h1>
+  <div class="tp-pill" id="tpTheme">☀️</div>
+  <div class="tp-pill">运行时间 <span class="mono" id="up">00:00:00</span></div>
+  <div class="tp-pill">内存 <div class="memb"><i id="memBar" style="width:0%"></i></div> <span class="mono" id="memTxt">--%</span></div>
+</div>
+
+<!-- ===== DRAWER ===== -->
+<div id="scrim"></div>
+<aside id="drawer">
+  <div class="dr-brand"><span class="dr-ic">🎛</span> ESP32</div>
+
+  <div class="dr-sec">仪表板</div>
+  <div class="dr-item on" data-page="dash">✳️ 状态总览</div>
+
+  <div class="dr-sec">WIFI 模块</div>
+  <div class="dr-item" data-page="scan">📶 扫描与嗅探</div>
+  <div class="dr-item dis" data-page="none">👤 邪恶双子攻击 <small>合规未启用</small></div>
+  <div class="dr-item dis" data-page="none">⬍ Karma攻击 <small>合规未启用</small></div>
+  <div class="dr-item dis" data-page="none">⛔ 取消认证器 <small>合规未启用</small></div>
+
+  <div class="dr-sec">系统</div>
+  <div class="dr-item" data-page="cfg">⚙️ 配置</div>
+  <div class="frow" style="margin-top:18px"><select class="mini" style="flex:1"><option>中文</option><option disabled>English (暂未提供)</option></select></div>
+</aside>
+
+<main id="view"></main>
+<div id="toast"></div>
+
+<script>
+/* ================== helpers ================== */
+const $=(s,r=document)=>r.querySelector(s), $$=(s,r=document)=>[...r.querySelectorAll(s)];
+const fmtBytes=b=>b>=1048576?(b/1048576).toFixed(1)+' MB':(b/1024).toFixed(1)+'K';
+const up2=n=>String(n).padStart(2,'0');
+const fmtUp=s=>{const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60),x=s%60;
+  return (d?d+'天':'')+up2(h)+':'+up2(m)+':'+up2(x)};
+const nowTs=()=>{const d=new Date();return '['+up2(d.getHours())+':'+up2(d.getMinutes())+':'+up2(d.getSeconds())+']'};
+function toast(t){const el=$('#toast');el.textContent=t;el.style.display='block';clearTimeout(el._t);el._t=setTimeout(()=>el.style.display='none',1800)}
+async function api(path,opt){try{const r=await fetch(path,opt);const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.status);return j}catch(e){log('[SYSTEM] 请求失败 '+path+' '+e.message,'t-err');throw e}}
+
+/* ================== state ================== */
+const state={info:null,target:null,scan:[],logId:0,filter:'all',scanning:false};
+
+/* ================== log ================== */
+function log(txt,cls){const c=$('#logc');if(!c)return;
+  c.textContent+=nowTs()+(cls?' ':' ')+txt+'\n';c.scrollTop=c.scrollHeight}
+
+/* ================== shell ================== */
+const burger=$('#burger'),drawer=$('#drawer'),scrim=$('#scrim');
+const toggleDrawer=o=>{const d=o??!drawer.classList.contains('open');drawer.classList.toggle('open',d);burger.classList.toggle('bx',d);scrim.style.display=d?'block':'none'};
+burger.onclick=()=>toggleDrawer();
+scrim.onclick=()=>toggleDrawer(false);
+$$('#drawer .dr-item').forEach(el=>el.onclick=()=>{
+  if(el.dataset.page==='none'){toast('为遵守法律法规，主动攻击类模块未启用');return}
+  $$('#drawer .dr-item').forEach(x=>x.classList.remove('on'));el.classList.add('on');
+  toggleDrawer(false);go(el.dataset.page);
+});
+$('#tpTheme').onclick=()=>{const d=document.documentElement.dataset.theme==='dark'?'':'dark';
+  document.documentElement.dataset.theme=d;if(d)$('#tpTheme').textContent='🌙';else $('#tpTheme').textContent='☀️'};
+
+/* ================== pages ================== */
+const pages={
+  dash:'状态总览', scan:'扫描与嗅探', cfg:'配置'
+};
+function go(p){
+  location.hash=p;
+  $('#pageTitle').textContent=pages[p]||pages.dash;
+  if(p==='dash')renderDash();
+  else if(p==='scan')renderScan();
+  else if(p==='cfg')renderCfg();
+}
+
+/* ---------- 状态总览 ---------- */
+function legal(){
+  return `<div class="card legal"><h3>法律声明与免责条款</h3><ul>
+  <li>攻击破解他人WiFi属于违法行为，视情节轻重可能面临民事赔偿、行政处罚甚至刑事处罚。</li>
+  <li>《计算机信息网络国际联网安全保护管理办法》明确规定，未经允许不得进入计算机信息网络或使用其资源</li>
+  <li>禁止将其用于任何未经授权的设备或网络，包括但不限于攻击、干扰、监听等行为。</li>
+  <li>本程序仅供学习研究网络安全通信为目的，请勿用于非法用途。</li>
+  <li>使用者应自行确保其行为符合当地法律法规，并自行承担全部法律责任。</li></ul></div>`;
+}
+function fragPct(free,maxBlock){return free>0?Math.max(0,(100-100*maxBlock/free)).toFixed(0):'--'}
+function renderDash(){
+  $('#view').innerHTML=`
+  <div class="banner"><div class="big">仪表板</div><div class="chip-st" id="sysState">读取中…</div></div>
+  <div class="grid g3"><div class="card mod o">扫描引擎<small id="mScan">--</small></div>
+    <div class="card mod p">接入点<small id="mAP">--</small></div>
+    <div class="card mod y">主动攻击模块<small style="color:#000">合规未启用</small></div></div>
+  <div class="grid g3a">
+    <div class="card"><h3>主要目标信息</h3><div id="tgtBox"></div></div>
+    <div class="card"><h3>本机热点</h3><div id="apBox"></div></div>
+    <div class="card"><h3>情报与捕获</h3><div id="capBox"></div></div>
+  </div>
+  <div class="card rel"><span class="badge-ok">正常</span><h3>内存诊断</h3>
+    <div class="diag">
+      <div class="dg v"><b id="d1">--</b><small>可用</small></div>
+      <div class="dg o"><b id="d2">--</b><small>最低水位</small></div>
+      <div class="dg y"><b id="d3">--</b><small>最大块</small></div>
+      <div class="dg p"><b id="d4">--</b><small>碎片率</small></div>
+    </div></div>
+  ${legal()}
+  <div class="logc" id="logc">[SYSTEM] 就绪。</div>`;
+  refreshInfo();
+  renderTarget();
+}
+function renderTarget(){
+  const t=state.target, i=state.info;
+  if(t){
+    $('#tgtBox').innerHTML=`
+      <div class="kv"><span class="k">SSID</span><span class="v">${esc(t.ssid||'(隐藏)')}</span></div>
+      <div class="kv"><span class="k">MAC 地址</span><span class="v">${esc(t.bssid||'--')}</span></div>
+      <div class="kv"><span class="k">信道</span><span class="v mono">${t.channel??'--'}</span></div>
+      <div class="kv"><span class="k">安全</span><span class="v mono">${esc(t.auth||'--')}</span></div>
+      <div class="kv"><span class="k">信号</span><span class="v mono">${t.rssi??'--'} dBm</span></div>`;
+  }else{
+    $('#tgtBox').innerHTML=`<div class="kv"><span class="v" style="color:#8a7f6d">无目标 — 到「扫描与嗅探」页选择目标</span></div>`;
+  }
+  if(i){
+    $('#mScan').textContent='就绪 · 信道 '+i.channel;
+    $('#mAP').textContent=i.ssid+' · '+i.clients+' 客户端';
+    $('#capBox').innerHTML=`
+      <div class="kv"><span class="k">运行时长</span><span class="v">${fmtUp(i.uptime)}</span></div>
+      <div class="kv"><span class="k">固件版本</span><span class="v">${esc(i.version)}</span></div>
+      <div class="kv"><span class="k">芯片</span><span class="v mono">${esc(i.chip)}</span></div>`;
+    $('#sysState').textContent=i.ssid?'系统空闲 · '+i.ssid:'系统空闲';
+    $('#d1').textContent=fmtBytes(i.freeMem);
+    $('#d2').textContent=fmtBytes(i.minFreeMem??0);
+    $('#d3').textContent=fmtBytes(i.maxBlock??0);
+    $('#d4').textContent=fragPct(i.freeMem,i.maxBlock)+ '%';
+    $('#memBar').style.width=(i.memUsedPct??0)+'%';
+    $('#memTxt').textContent=(i.memUsedPct??0)+'%';
+    $('#up').textContent=fmtUp(i.uptime);
+  }
+}
+const esc=s=>String(s??'').replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+
+/* ---------- 扫描与嗅探 ---------- */
+let scanFlag=false;
+async function realScan(){
+  if(scanFlag)return; scanFlag=true;
+  $('#scanStatus').textContent='正在扫描 …';
+  $('#btnScan').disabled=true;
+  try{
+    const j=await api('/api/scan');
+    state.scan=j.networks||[];
+    log('[SYSTEM] 扫描完成: '+state.scan.length+' 个 AP','t-ok');
+    $('#scanStatus').textContent=state.scan.length+' 个 AP 点击列表标题排序';
+  }catch(e){ $('#scanStatus').textContent='扫描失败: '+e.message; }
+  scanFlag=false;$('#btnScan').disabled=false;
+  paintScan();
+}
+function passFilter(n){
+  const f=state.filter;
+  if(f==='24')return n.channel<=14;
+  if(f==='5')return n.channel>14;
+  return true;
+}
+function paintScan(){
+  const list=state.scan.filter(passFilter).sort((a,b)=>(b.hidden-a.hidden)||(b.rssi-a.rssi));
+  $('#tbody').innerHTML=list.length?list.map((n,idx)=>`
+    <tr>
+      <td class="ssid ${n.hidden?'hidden-ssid':''}">${n.hidden?'(隐藏网络)':esc(n.ssid)}</td>
+      <td class="rssi">${n.rssi}</td>
+      <td>${n.channel}</td><td>${esc(n.bssid)}</td><td>${esc(n.auth)}</td>
+      <td><button class="tbtn pink" ${state.target&&state.target.bssid===n.bssid?'disabled':''}
+        onclick='pickTarget(${JSON.stringify({ssid:n.ssid,bssid:n.bssid,channel:n.channel,rssi:n.rssi,auth:n.auth}).replace(/'/g,"&#39;")})'>目标</button>
+      </td>
+    </tr>`).join(''):`<tr><td colspan="6" class="nores">${
+      state.scanning?'' : (state.scan.length? '无 '+({all:'任何',24:'2.4G',5:'5G'}[state.filter])+' 频段结果' : '尚未扫描 — 点「开始扫描」')}</td></tr>`;
+}
+function renderScan(){
+  $('#view').innerHTML=`
+  <div class="scanband">
+    <button class="btn yellow" id="btnScan" style="background:var(--yellow)">开始扫描</button>
+    <div class="filters">Filter:
+      <label><input type="radio" name="f" value="all" checked> 全部</label>
+      <label><input type="radio" name="f" value="24"> 2.4G</label>
+      <label><input type="radio" name="f" value="5"> 5G</label>
+    </div>
+    <span class="st" id="scanStatus">39@ 点击列表标题排序</span>
+  </div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>SSID</th><th>RSSI</th><th>信道</th><th>BSSID</th><th>安全</th><th>操作</th></tr></thead>
+    <tbody id="tbody"></tbody>
+  </table></div>
+  ${legal()}
+  <div class="logc" id="logc">[SYSTEM] 就绪。</div>`;
+  $$('.filters input').forEach(r=>r.onchange=()=>{state.filter=r.value;paintScan()});
+  $('#btnScan').onclick=realScan;
+  paintScan();
+}
+async function pickTarget(t){
+  await api('/api/target',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(t)});
+  state.target=t;
+  log('[SYSTEM] 已选择目标: '+(t.ssid||'(隐藏)')+' @ '+t.channel,'t-ok');
+  toast('目标已设置: '+t.ssid);
+  go('dash');
+}
+
+/* ---------- 配置 ---------- */
+async function act(url,msg){
+  if(!confirm(msg))return;
+  await fetch(url,{method:'POST'});
+  toast('已发送, 设备将重启');
+}
+function renderCfg(){
+  const i=state.info||{};
+  $('#view').innerHTML=`
+  <div class="card"><h3>接入点设置 (修改需重启生效)</h3>
+    <div class="frow"><label>热点 SSID</label><div class="val" id="cfgSsid">--</div></div>
+    <div class="frow"><label>默认密码</label><div class="val">00000000</div></div>
+    <div class="frow"><label>信道</label><select class="mini" id="cfgCh">
+      ${[1,2,3,4,5,6,7,8,9,10,11].map(c=>`<option ${i.channel===c?'selected':''}>${c}</option>`).join('')}</select></div>
+    <div class="frow"><label>MAC 地址</label><div class="val" id="cfgMac">--</div></div>
+    <div class="frow"><label>固件版本</label><div class="val" id="cfgVer">--</div></div>
+    <div class="note">修改信道后需点「重启设备」生效（会短暂断开已连接客户端）。</div>
+  </div>
+  <div class="card"><h3>系统操作</h3>
+    <div class="frow">
+      <button class="btn yellow" onclick="location.reload()">↻ 刷新页面</button>
+      <button class="btn gray" onclick="doReboot()">↻ 重启设备</button>
+      <button class="btn red" onclick="doFactory()">⚠ 恢复出厂</button>
+    </div>
+    <div class="note">恢复出厂将清除配置并重启; 若设备异常可用此功能复位。</div>
+  </div>
+  <div class="attack-banner"><b>合规说明:</b> 为遵守相关法律法规，主动攻击模块（邪恶双子 / deauth / Karma / 握手破解）未在此固件中实现；
+    本设备仅提供网络扫描与自身热点管理，用于合法的网络诊断学习。</div>
+  ${legal()}
+  <div class="logc" id="logc">[SYSTEM] 就绪。</div>`;
+  $('#cfgSsid').textContent=i.ssid||'--';
+  $('#cfgMac').textContent=i.mac||'--';
+  $('#cfgVer').textContent=i.version||'--';
+}
+async function doReboot(){await act('/api/reset','确定重启设备?') }
+async function doFactory(){await act('/api/factory-reset','确定恢复出厂设置? (清除配置并重启)')}
+
+/* ================== ticker ================== */
+let lastLog=0, printed=0;
+async function pollInfo(){
+  try{
+    const i=await api('/api/info');
+    state.info=i;
+    if(!state.target&&i.target)state.target=i.target;   // 刷新后从设备恢复目标
+    $('#up').textContent=fmtUp(i.uptime);
+    $('#memBar').style.width=(i.memUsedPct??0)+'%';
+    $('#memTxt').textContent=(i.memUsedPct??0)+'%';
+    if(state.target)renderTarget();
+    // 每 5s 重画 dashboard 关键数字
+    if(location.hash==='#dash'||location.hash===''||location.hash==='#/'){
+      if($('#d1')&&state.info){
+        $('#d1').textContent=fmtBytes(i.freeMem);
+        $('#d2').textContent=fmtBytes(i.minFreeMem??0);
+        $('#d3').textContent=fmtBytes(i.maxBlock??0);
+        $('#d4').textContent=fragPct(i.freeMem,i.maxBlock)+'%';
+        if(!state.target){$('#mScan').textContent='就绪 · 信道 '+i.channel;$('#mAP').textContent=i.ssid+' · '+i.clients+' 客户端';}
+      }
+    }
+  }catch(e){}
+}
+async function pollLog(){
+  try{
+    const r=await fetch('/api/log?since='+state.logId);
+    const j=await r.json();
+    if(j.entries&&j.entries.length){
+      for(const e of j.entries){ if(e.id<=state.logId)continue;
+        log(e.line); state.logId=e.id; }
+    }
+  }catch(e){}
+}
+function boot(){
+  log('[SYSTEM] Connecting ...  系统界面初始化');
+  go(((location.hash||'').replace('#',''))||'dash');
+  pollInfo();pollLog();
+  setInterval(pollInfo,2000);
+  setInterval(pollLog,1500);
+}
+window.addEventListener('hashchange',()=>{const p=location.hash.slice(1);
+  if(pages[p])go(p)});
+boot();
+</script>
+</body>
+</html>

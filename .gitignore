@@ -1,0 +1,18 @@
+# dependencies
+node_modules/
+
+# platformio build artifacts
+firmware/.pio/
+
+# runtime data (烧录码 / 核销记录 — 绝不入库)
+server/db.sqlite
+server/db.sqlite-shm
+server/db.sqlite-wal
+server/*.db
+
+# logs & temp
+*.log
+.DS_Store
+
+# local download caches (工具链/库下载脚本的工作目录不在此仓库内, 双保险)
+pio-dl/

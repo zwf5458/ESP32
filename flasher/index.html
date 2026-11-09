@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESP32无线网络开发固件烧录台 · WEB SERIAL FLASHER</title>
+  <link rel="stylesheet" href="/flasher/style.css">
+  <script src="https://unpkg.com/crypto-js@4.2.0/index.js"></script>
+</head>
+<body>
+
+<!-- ===== 顶栏 ===== -->
+<header class="topbar">
+  <div class="brand-row">
+    <div class="brand-badge">🛜</div>
+    <div class="brand-text">
+      <h1>ESP32无线网络开发固件烧录台</h1>
+      <div class="brand-sub">WEB SERIAL FLASHER</div>
+    </div>
+  </div>
+  <div class="top-right">
+    <div class="status" id="serialStatus"><span class="dot"></span><span id="serialStatusText">未连接</span></div>
+    <button class="chip-btn" id="btnLang">EN</button>
+    <button class="chip-btn icon-btn" id="btnTheme" aria-label="切换主题">☀️</button>
+  </div>
+</header>
+
+<main>
+  <!-- ===== 左列: 步骤卡 ===== -->
+  <div class="col-left">
+
+    <!-- ① 串口连接 -->
+    <section class="card cream" id="secPort">
+      <h2><span class="ico">💬</span> ① 串口连接</h2>
+      <hr class="cut">
+      <label class="field-label">已授权串口</label>
+      <div class="sel-box yellow" id="portLabel">— 无已授权端口 —</div>
+      <div class="btn-row">
+        <button class="btn yellow" id="btnChoosePort">＋ 选择串口</button>
+        <button class="btn pale-green" id="btnConnect" disabled>连接</button>
+        <button class="btn pale-red" id="btnDisconnect" disabled>断开</button>
+      </div>
+      <p class="hint">首次使用请点「选择串口」，在浏览器弹窗中授权开发板对应的串口（CP2102 / CH34x / USB-JTAG 等）。授权后会被记住，选中即自动连接。</p>
+      <p class="hint">找不到串口？请把谷歌（Chrome）或 Edge 浏览器更新到最新版。</p>
+      <label class="box-check">
+        <input type="checkbox" id="skipAutoReset">
+        <span>跳过自动复位（连接总失败时勾选：按住 <b>BOOT</b> 再点「连接」，手动进入下载模式）</span>
+      </label>
+    </section>
+
+    <!-- ② 烧录码 -->
+    <section class="card yellow" id="secCode">
+      <div class="head-row">
+        <h2><span class="ico">🔒</span> ② 烧录码</h2>
+        <div class="qq-badge">
+          <span class="qq-tag">本地发码</span>
+          <code class="qq-num">tools/gen-code.sh</code>
+          <span class="qq-tag dark">获取烧录码</span>
+        </div>
+      </div>
+      <hr class="cut">
+      <label class="field-label">烧录码（一次性，烧录成功后失效）</label>
+      <input type="text" id="flashCode" placeholder="粘贴 14~20 位烧录码" autocomplete="off">
+      <button class="btn pale-green wide" id="btnVerify" disabled>✓ 校验烧录码</button>
+      <p class="hint ok" id="codeHint"></p>
+    </section>
+
+    <!-- ③ 开发板与烧录 -->
+    <section class="card cream" id="secFlash">
+      <h2><span class="ico">⚡</span> ③ 开发板与烧录</h2>
+      <hr class="cut">
+      <label class="field-label">开发板型号（自动识别，可手动指定）</label>
+      <select class="sel-box yellow" id="chipLabel">
+        <option value="">— 自动识别（推荐）—</option>
+      </select>
+      <div class="meta-row">
+        <span>固件: <b id="fwLabel-mini">—</b></span>
+        <span id="fwSize" class="muted2"></span>
+      </div>
+      <div class="progress-wrap">
+        <div class="progress" id="progress"></div>
+        <div class="bar-label" id="progressLabel">待命</div>
+      </div>
+      <label class="box-check">
+        <input type="checkbox" id="agreeTerms">
+        <span>我已阅读并同意右侧<b>《使用条款与法律声明》</b>全部内容</span>
+      </label>
+      <button class="btn pale-red big" id="btnFlash" disabled>⚡ 开始烧录</button>
+      <p class="hint">烧录会覆写设备上原有固件。整片镜像从地址 <b>0x0</b> 写入，烧录完成后设备自动复位。</p>
+    </section>
+
+    <!-- ④ 当前固件版本 -->
+    <section class="card cream" id="secVersion">
+      <h2><span class="ico">☆</span> ④ 当前固件版本</h2>
+      <hr class="cut">
+      <div class="ver-row">
+        <span class="ver-label">当前版本</span>
+        <b class="ver-num" id="fwLabel">—</b>
+      </div>
+      <p class="hint" id="fwNote">暂无版本说明</p>
+    </section>
+  </div>
+
+  <!-- ===== 右列: 控制台 + 信息卡 ===== -->
+  <div class="col-right">
+
+    <!-- 串口控制台 -->
+    <section class="card console-card" id="secConsole">
+      <div class="console-head">
+        <h2 class="on-dark">&gt;_ 串口控制台</h2>
+        <div class="console-btns">
+          <button class="btn yellow sm" id="btnResetConsole">复位</button>
+          <button class="btn pink sm" id="btnCopy">复制</button>
+          <button class="btn pink sm" id="btnClear">清屏</button>
+        </div>
+      </div>
+      <pre id="console" class="console"></pre>
+    </section>
+
+    <!-- 使用条款 -->
+    <section class="card yellow" id="secTerms">
+      <h2><span class="ico">⚠️</span> 使用条款与法律声明</h2>
+      <hr class="cut">
+      <ul>
+        <li><b>攻击破解他人WiFi属于违法行为</b>，视情节轻重可能面临民事赔偿、行政处罚甚至刑事处罚。</li>
+        <li>《计算机信息网络国际联网安全保护管理办法》明确规定，未经允许不得进入计算机信息网络或使用其资源。</li>
+        <li>禁止将其用于任何未经授权的设备或网络，包括但不限于攻击、干扰、监听等行为。</li>
+        <li>本程序仅供学习研究网络安全通信为目的，请勿用于非法用途，用户须在烧录测试完自己的设备后 24 小时内清除相关固件。</li>
+        <li>使用者应自行确保其行为符合当地法律法规，并自行承担全部法律责任。</li>
+        <li>点击「开始烧录」，即代表你已阅读并同意本声明全部内容。</li>
+      </ul>
+    </section>
+
+    <!-- 设备连接说明 -->
+    <section class="card blue" id="secConnect">
+      <h2><span class="ico">📶</span> 设备连接说明</h2>
+      <hr class="cut">
+      <ul>
+        <li>无线网名称：<code class="chip black">WiFi-</code> <span class="small">（MAC 尾 4 位随板上电生成）</span></li>
+        <li>默认初始密码：<code class="chip black">00000000</code></li>
+        <li>后台管理地址：<code class="chip black">http://192.168.4.1/admin.html</code>（连接上述无线网后访问）</li>
+        <li>固件内置后台：设备信息 / 客户端列表 / 重启 / 恢复出厂</li>
+      </ul>
+    </section>
+  </div>
+</main>
+
+<footer>ESP32无线网络开发固件烧录台 · WEB SERIAL · 2026</footer>
+
+<script src="/flasher/app.js" type="module"></script>
+</body>
+</html>
