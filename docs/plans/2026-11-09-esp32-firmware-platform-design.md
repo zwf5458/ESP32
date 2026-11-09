@@ -58,6 +58,10 @@ ESP32/
 - 共用 `src/main.cpp`；当前 6 个 env 编译同一份源码，未见差异宏需求（曾预留 S2 无 BLE 隔离）
 - 串口 UART 日志 115200（烧录台串口控制台可见；未启用 USB CDC 宏）
 - AP：SSID `WiFi-` + MAC 尾 4 位十六进制，密码 `00000000`，信道 6
+- Captive Portal（强制门户）：`DNSServer` UDP 53 通配 `*` 解析 → `192.168.4.1`；
+  `notFound()` 对 iOS(`/hotspot-detect.html`) / Android(`/generate_204`) /
+  Windows(`/connecttest.txt`) 探测路径与任意未知路径返回 302 → `/admin.html`，
+  连热点自动弹后台；`/api/*` 保持 404 以不破坏后台 SPA fetch 契约
 - 后台：`http://192.168.4.1/admin.html`，deflate 后内嵌：
   - 设备信息：芯片型号、MAC、固件版本、运行时长、可用内存
   - 主目标信息（扫描页选定后回填，仅存 RAM）
@@ -69,7 +73,12 @@ ESP32/
   `GET /api/log?since=`、`POST /api/reset`、`POST /api/factory-reset`
 - 镜像产出：每个 env 编译后
   `esptool merge-bin -o firmware-<target>-<ver>.bin`
-  即 bootloader+partition+app 单文件，烧录时 offset 0x0
+  即 bootloader+partition+app 单文件，整片从 0x0 烧录。
+  **bootloader 偏移按芯片 ROM 规定**（见 README「合并镜像布局」）：
+  `esp32/s2=0x1000`、`esp32c5=0x2000`、其余 `=0x0`；
+  partitions 固定 `0x8000`、app 固定 `0x10000`。
+  后端注册时按对应偏移校验 `0xE9` 魔数。
+  ⚠️ espressif32 v8 平台把 c5 也按 0x0 处理（适配缺陷），构建脚本显式按芯片指定。
 - 版本：`FW_VERSION` 宏（如 "1.0.0"），后台显示 + 镜像文件名携带
 
 ## 3.1 合规边界（明确不做）
@@ -81,6 +90,7 @@ ESP32/
 |---|---|---|
 | AP 热点 | ✅ 实现 | `WiFi-` + MAC 尾 4 位 / `00000000` / `192.168.4.1` |
 | Web 后台三页 | ✅ 实现 | 状态总览 / 扫描与嗅探 / 配置（内嵌 SPA） |
+| Captive Portal | ✅ 实现 | UDP 53 通配解析 + OS 探测路径 302 → 连热点自动弹后台 |
 | 周边 AP 扫描 | ✅ 实现 | 被动列出 SSID/RSSI/信道/加密方式（合法观察） |
 | 已连客户端计数 | ✅ 实现 | `softAPgetStationNum()` 只读 |
 | 事件日志 | ✅ 实现 | 64 条环形缓冲，`/api/log?since=` |
@@ -118,7 +128,8 @@ UI 与法律声明页明示边界；烧录台《使用条款》与后台法律�
 2. ② 烧录码：输入框 + 「✓ 校验烧录码」→ `POST /api/codes/verify`（得一次性 nonce）；
    「本地发码」徽章提示取码方式
 3. ③ 开发板与烧录：esptool-js 读芯片 → 从 manifest 自动匹配镜像（下拉联动）；
-   「开始烧录」需先勾选《使用条款》；`writeFlash` 单镜像 offset 0；
+   「开始烧录」需先勾选《使用条款》；`writeFlash` 整片从 offset 0 写合并镜像
+    （bootloader 在镜像内的偏移由 merge 阶段按芯片决定，见 §3）；
    条纹进度条实时百分比
 4. ④ 当前固件版本：大号版本号（读 manifest）+ 覆盖芯片说明
 
@@ -182,11 +193,17 @@ redeem 只在 writeFlash 完整成功后由前端触发，且后端按 nonce+chi
 1. `node server/src/index.js` 起服务，`tools/gen-code.sh 3` 生成 3 个码 ✓
 2. 无板子：verify 通过 → 烧录失败/取消 → DB 状态仍 `未用` ✓
 3. 真机烧录：烧录完成 → 控制台启动日志 → 记录 `redeemed` + flash_log ⬜（待真机）
-4. 手机连 `WiFi-xxxx` / `00000000` → `http://192.168.4.1/admin.html`
-   显示后台三页 + 版本 ⬜（待真机）
+4. 手机连 `WiFi-xxxx` / `00000000` → Captive Portal 自动弹窗或手动
+   `http://192.168.4.1/admin.html` 显示后台三页 + 版本 ⬜（待真机）
 5. 二次烧用已核销的码 → verify 拒绝 ✓
 6. 可编 6 颗芯片镜像全部产出并出现在 manifest ✓
    （esp32/s2/s3/c3/c5/c6 各 4MB 合并镜像；c5 为本地注入 libs 编出，实验性）
+7. 代码审查修复回归（2026-11-09 二）✓：
+   - 6 镜像 bootloader 落在其 ROM 规定偏移（0x1000 / 0x2000 / 0x0），该处 `0xE9` ✓
+   - 后端按芯片偏移校验魔数：3 种偏移注册放行、坏镜像 400 拦截 ✓
+   - verify 限流（第 11 次起 429）、nonce 过期清理、token 不打印 ✓
+   - 烧录台 `consoleHint` 元素存在/零 JS 报错、静态托管脱离 cwd ✓
+   - Captive Portal：6 env 全部编译 SUCCESS（DNSServer 引入无回归）✓
 
 ## 9. 后续阶段（非本期）
 
@@ -197,3 +214,8 @@ redeem 只在 writeFlash 完整成功后由前端触发，且后端按 nonce+chi
 - ESP32-C5 真机验证（镜像已产出；espressif32 v8 无官方 c5-libs，
   由 tools/install-c5-libs.sh 本地注入编译，板级参数待真机复核）
 - Web 发码管理页（当前仅 `tools/gen-code.sh` CLI 发码 + `POST /api/admin/codes`）
+- CDN 本地化：`flasher/vendor/` 沉淀 esptool-js / crypto-js，支持断网/内网烧录
+  （2026-11-09 审查建议，评估后暂缓；当前仍走 unpkg CDN）
+- 异步 WiFi 扫描：把同步 `scanNetworks` 改为异步启动 + 轮询，
+  避免 C5 双频扫描长时间阻塞触发 TWDT（评估后暂缓，需前端轮询配合）
+- 串口探针免码升级：与一次性烧录码核销闭环冲突，**不采纳**

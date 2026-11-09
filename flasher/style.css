@@ -227,6 +227,11 @@ html.dark .card.yellow .box-check,html.dark .card.blue .box-check{background:rgb
 }
 .console-head h2{margin:0}
 .console-btns{display:flex; gap:10px}
+.console-hint{
+  font-size:12px; font-weight:700; color:#000;
+  background:var(--pink, #ff9ecf); padding:6px 16px;
+  border-top:var(--bd); border-bottom:var(--bd);
+}
 .console{
   margin:0; height:520px; overflow-y:auto;
   background:var(--console-bg); color:var(--console-tx);

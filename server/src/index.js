@@ -1,6 +1,6 @@
 // ESP32 无线固件烧录台后端
 // Hono + @hono/node-server + better-sqlite3
-// 运行: node server/src/index.js   (工作目录必须为仓库根)
+// 运行: node server/src/index.js   (静态资源用绝对路径, 任意 cwd 均可)
 import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { Hono } from 'hono';
@@ -50,7 +50,16 @@ CREATE TABLE IF NOT EXISTS flash_log(
 const CHIP_ALIASES = ['esp32', 'esp32s2', 'esp32s3', 'esp32c3', 'esp32c5', 'esp32c6'];
 
 // nonce 内存表: nonce -> { code, chip, expiresAt }
+// 仅 verify 成功时写入; redeem(成功/失败) 时删除。为防止只 verify 不 redeem
+// 导致 Map 无限膨胀, 定期清理过期项 (unref 让计时器不阻止进程退出)。
 const nonceStore = new Map();
+const sweepNonces = () => {
+  const now = Date.now();
+  for (const [nonce, entry] of nonceStore) {
+    if (now > entry.expiresAt) nonceStore.delete(nonce);
+  }
+};
+setInterval(sweepNonces, 5 * 60 * 1000).unref();
 const registerNonce = (code, chip) => {
   const nonce = crypto.randomUUID() + '.' + crypto.randomBytes(12).toString('hex');
   nonceStore.set(nonce, { code, chip: chip || null, expiresAt: Date.now() + CODE_TTL_MS });
@@ -93,8 +102,33 @@ app.get('/api/firmware/bin/:chip', (c) => {
 });
 
 // ---------- 烧录码 ----------
+// 轻量滑动窗口限流: 单 IP 每分钟最多 N 次 (防烧录码暴力枚举)
+// 仅内存态, 重启清零; 本地/内网使用足够, 云部署时应放到网关层 + 持久化
+const verifyHits = new Map(); // ip -> [ts, ...]
+const VERIFY_WINDOW_MS = 60 * 1000;
+const VERIFY_LIMIT = 10;
+const tooManyVerify = (ip) => {
+  const now = Date.now();
+  const hits = (verifyHits.get(ip) || []).filter(ts => now - ts < VERIFY_WINDOW_MS);
+  hits.push(now);
+  verifyHits.set(ip, hits);
+  return hits.length > VERIFY_LIMIT;
+};
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, hits] of verifyHits) {
+    const live = hits.filter(ts => now - ts < VERIFY_WINDOW_MS);
+    if (live.length) verifyHits.set(ip, live); else verifyHits.delete(ip);
+  }
+}, VERIFY_WINDOW_MS).unref();
+
 // 校验: 一次性码 → 发一次性 nonce (烧录成功核销, 失败不扣)
 app.post('/api/codes/verify', async (c) => {
+  const ip = c.req.header('x-forwarded-for')?.split(',')[0]?.trim()
+    || c.req.header('x-real-ip') || 'local';
+  if (tooManyVerify(ip)) {
+    return json(c, { error: '校验过于频繁, 请稍后再试 (每分钟最多 10 次)' }, 429);
+  }
   const { code, chip = null } = await readBody(c);
   if (!code || typeof code !== 'string') return json(c, { error: '请输入烧录码' }, 400);
   const row = db.prepare('SELECT * FROM codes WHERE code = ?').get(code.trim().toUpperCase());
@@ -112,10 +146,11 @@ app.post('/api/codes/verify', async (c) => {
 // 核销 / 失败上报: 必须携带有效 nonce
 app.post('/api/codes/redeem', async (c) => {
   const { nonce, chip, md5, success } = await readBody(c);
-  if (!nonce || !nonceStore.has(nonce)) {
+  const entry = nonceStore.get(nonce);
+  if (!nonce || !entry || Date.now() > entry.expiresAt) {
+    if (nonce) nonceStore.delete(nonce); // 过期即时清除, 不等定期 sweep
     return json(c, { error: '校验记录不存在或已过期, 请重新校验烧录码' }, 400);
   }
-  const entry = nonceStore.get(nonce);
   const chipFinal = chip || entry.chip || null;
 
   if (!success) {
@@ -177,9 +212,15 @@ app.post('/api/admin/firmware/:chip', requireAdmin, async (c) => {
   const { version = '1.0.0', sourcePath = null } = await readBody(c);
   if (!sourcePath || !existsSync(sourcePath)) return json(c, { error: '缺 sourcePath 或文件不存在' }, 400);
   const buf = readFileSync(sourcePath);
-  // 合并镜像从 bootloader 头开始, ESP image magic 固定 0xE9
-  if (buf[0] !== 0xE9) {
-    return json(c, { error: `镜像魔数不符 (期望 0xE9, 实际 0x${buf[0]?.toString(16)}), 拒绝注册` }, 400);
+  // 合并镜像中 bootloader 由芯片 ROM 规定在不同偏移 (见 tools/build-firmware.sh):
+  //   esp32/esp32s2=0x1000, esp32c5=0x2000, 其余=0x0; 该处应为 ESP image magic 0xE9。
+  // 另兼容直接上传 app-only 镜像 (从 0x0 开始) 的开发调试场景。
+  const BOOTLOADER_OFFSET = { esp32: 0x1000, esp32s2: 0x1000, esp32c5: 0x2000 };
+  const expected = BOOTLOADER_OFFSET[chip] ?? 0x0;
+  const hasMagic = (buf.length > expected && buf[expected] === 0xE9)
+    || (buf[0] === 0xE9);
+  if (!hasMagic) {
+    return json(c, { error: `镜像魔数不符 (期望在 0x${expected.toString(16)} 或 0x0 找到 ESP 启动标志 0xE9), 拒绝注册` }, 400);
   }
   const dest = join(FIRMWARE_DIR, `firmware-${chip}-${version}.bin`);
   writeFileSync(dest, buf);
@@ -194,14 +235,14 @@ app.post('/api/admin/firmware/:chip', requireAdmin, async (c) => {
 });
 
 // ---------- 静态托管 ----------
-// 注意: serveStatic 的 root 相对进程 cwd, 需在仓库根目录运行本服务
+// 用绝对路径绑定 flasher/, 不依赖进程 cwd (ROOT 已由 import.meta.url 算出)
 // no-store: 烧录台前端属迭代频繁的开发工具, 强制浏览器每次取最新 (避免旧 JS/样式)
 app.use('/flasher/*', async (c, next) => { await next(); c.header('Cache-Control', 'no-store'); });
-app.use('/flasher/*', serveStatic({ root: 'flasher', rewriteRequestPath: (p) => p.replace(/^\/flasher\/?/, '') || 'index.html' }));
+app.use('/flasher/*', serveStatic({ root: join(ROOT, 'flasher'), rewriteRequestPath: (p) => p.replace(/^\/flasher\/?/, '') || 'index.html' }));
 app.get('/', (c) => c.redirect('/flasher/index.html'));
 
 serve({ fetch: app.fetch, port: PORT }, (info) => {
   console.log(`[server] 烧录台:  http://localhost:${info.port}`);
   console.log(`[server] manifest: http://localhost:${info.port}/api/firmware/manifest`);
-  console.log(`[server] 管理口令 ADMIN_TOKEN=${ADMIN_TOKEN}`);
+  console.log(`[server] 管理口令校验已启用 (ADMIN_TOKEN 已配置, 值不打印)`);
 });

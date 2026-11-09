@@ -29,12 +29,23 @@ for CHIP in "${CHIPS[@]}"; do
   [[ -f "$APP_BIN" ]] || { echo "[$CHIP] 未找到 firmware.bin"; continue; }
 
   MERGED="$OUT_DIR/firmware-${CHIP}-${VERSION}.bin"
-  # merge_bin: bootloader + partitions + app → 单镜像, 从 0x0 烧录
+  # merge_bin: bootloader + partitions + app → 单镜像 (整片从 0x0 烧录)
+  # bootloader 偏移由芯片 ROM 规定, 三方一致 (arduino boards.txt / IDF sdkconfig
+  # CONFIG_BOOTLOADER_OFFSET_IN_FLASH / esptool BOOTLOADER_FLASH_OFFSET):
+  #   esp32 / esp32s2 = 0x1000 ; esp32c5 = 0x2000 ; 其余 = 0x0
+  # 注意: espressif32 v8 的 platformio-build.py 把 esp32c5 也当成 0x0 (平台适配缺陷),
+  #       因此这里必须显式按芯片指定, 不可沿用 pio upload 的默认。
+  case "$CHIP" in
+    esp32|esp32s2) BL_OFFSET="0x1000" ;;
+    esp32c5)       BL_OFFSET="0x2000" ;;
+    *)             BL_OFFSET="0x0" ;;
+  esac
   if [[ -f "$BOOTLOADER" && -f "$PARTITIONS" ]]; then
     ~/.venvs/platformio/bin/esptool --chip "$CHIP" merge-bin --pad-to-size 4MB -o "$MERGED" \
-      0x0 "$BOOTLOADER" \
+      "$BL_OFFSET" "$BOOTLOADER" \
       0x8000 "$PARTITIONS" \
       0x10000 "$APP_BIN" | tail -2
+    echo "[$CHIP] bootloader @ $BL_OFFSET"
   else
     # 数据分区/缺 bootloader (C5/C6 等环境差异) → 直接注册 app (开发调试用)
     cp "$APP_BIN" "$MERGED"

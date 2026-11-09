@@ -5,6 +5,7 @@
  *  - 上电串口日志 115200 (烧录台「串口控制台」可见)
  *  - 开热点 SSID = WiFi-<MAC尾4hex>  密码 00000000  (与参考站一致)
  *  - http://192.168.4.1/admin.html  Neo-brutalism 后台 (内嵌页面)
+ *  - Captive Portal: UDP 53 通配解析 + OS 探测路径 302, 连热点自动弹后台
  *
  * API:
  *  GET  /api/info    设备信息 (内存诊断/信道/客户端/版本)
@@ -22,6 +23,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <DNSServer.h>          // Captive Portal: UDP 53 通配解析 → 192.168.4.1
 #include <ESPmDNS.h>
 #include <nvs_flash.h>
 #include "admin_page.h"
@@ -36,8 +38,10 @@
 static const char *AP_PASSWORD  = "00000000";
 static const char *ADMIN_HTML_C = "http://192.168.4.1/admin.html";
 static const uint8_t AP_CHANNEL_DEFAULT = 6;
+static const uint16_t DNS_PORT = 53;
 
 WebServer server(80);
+DNSServer dnsServer;             // Captive Portal DNS 劫持 (通配 * → AP IP)
 static String apSsid;
 static uint8_t apChannel = AP_CHANNEL_DEFAULT;
 
@@ -269,8 +273,31 @@ static void redirectToAdmin() {
   server.send(302, "text/plain", "");
 }
 
+// Captive Portal: 连上热点后手机/电脑会自动探测网络并弹出登录页。
+// 各 OS 探测路径返回 302 → /admin.html (iOS/Android/Windows 均认可为"需要登录");
+// 其余未知路径(用户手输任意域名)也重定向到后台;
+// 但 /api/* 必须原样 404, 否则会破坏后台 SPA 的 fetch 契约。
+static void captiveRedirect(const char *type = "text/plain") {
+  server.sendHeader("Location", "/admin.html");
+  server.send(302, type, "");
+}
+
 static void notFound() {
-  server.send(404, "text/plain", "404 — 访问 " + String(ADMIN_HTML_C));
+  String uri = server.uri();
+  if (uri.startsWith("/api/")) {
+    server.send(404, "text/plain", "404 — 未知 API: " + uri);
+    return;
+  }
+  // 常见系统探测路径 (返回 302 让系统判定为 Captive Portal 并弹窗)
+  if (uri == "/hotspot-detect.html" || uri == "/library/test/success.html" ||   // iOS / macOS
+      uri == "/generate_204" || uri == "/gen_204" ||                              // Android
+      uri == "/connecttest.txt" || uri == "/redirect" || uri == "/ncsi.txt" ||   // Windows
+      uri == "/success.txt" || uri == "/fwlink" || uri == "/") {                  // 其它/根
+    captiveRedirect();
+    return;
+  }
+  // 任意其它域名/路径 → 后台 (配合 DNS 通配解析实现强制门户)
+  captiveRedirect();
 }
 
 void setup() {
@@ -311,10 +338,19 @@ void setup() {
   server.onNotFound(notFound);
   server.begin();
   log("[http] 管理后台 HTTP 服务已启动 (80)");
+
+  // Captive Portal: DNS 通配解析所有域名 → AP IP(192.168.4.1),
+  // 配合 notFound() 的 302 让手机连热点后自动弹出后台页
+  if (dnsServer.start(DNS_PORT, "*", WiFi.softAPIP())) {
+    log("[dns] Captive Portal DNS 已启动 (53, * → 192.168.4.1)");
+  } else {
+    log("[dns] Captive Portal DNS 启动失败 (后台仍可用, 需手动输地址)");
+  }
 }
 
 void loop() {
   server.handleClient();
+  dnsServer.processNextRequest();   // 新版为 AsyncUDP 回调(空实现), 保留以兼容旧核
   // 心跳: 每 30 秒打印状态 (控制台可见; /api/log 增量同步到后台)
   static uint32_t lastBeat = 0;
   uint32_t now = millis();

@@ -409,7 +409,8 @@ async function startConsole() {
     return;
   }
   state.consoleConn = true;
-  $('consoleHint').textContent = '控制台读取中 (115200)… 固件日志实时显示';
+  const hintEl = $('consoleHint');
+  if (hintEl) hintEl.textContent = '控制台读取中 (115200)… 固件日志实时显示';
   // 经典复位: DTR/RTS 令芯片重启
   try {
     await state.transport.setDTR(false);

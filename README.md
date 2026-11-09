@@ -12,7 +12,7 @@
 ## 快速开始（本地跑通）
 
 ```bash
-# 1. 启动后端（必须在仓库根目录运行 — 静态文件路径相对 cwd）
+# 1. 启动后端（静态资源用绝对路径, 任意 cwd 均可启动）
 node server/src/index.js
 # → 烧录台: http://localhost:8787
 
@@ -27,7 +27,8 @@ sh tools/build-firmware.sh 1.0.0
 ```
 
 烧录成功后：手机/电脑连接热点 `WiFi-xxxx`（密码 `00000000`），
-访问 `http://192.168.4.1/admin.html` 打开固件后台
+会自动弹出固件后台（Captive Portal 强制门户）；若未弹窗，手动访问
+`http://192.168.4.1/admin.html`
 （状态总览 / 扫描与嗅探 / 配置；主动攻击类模块依合规要求未启用）。
 
 ## 功能范围与合规边界
@@ -40,6 +41,7 @@ sh tools/build-firmware.sh 1.0.0
 |---|---|---|
 | AP 热点 | ✅ 实现 | SSID `WiFi-xxxx`（MAC 尾 4 位）/ 密码 `00000000` / `192.168.4.1` |
 | Web 后台三页 | ✅ 实现 | 状态总览 / 扫描与嗅探 / 配置（内嵌 SPA） |
+| Captive Portal | ✅ 实现 | UDP 53 通配解析 + iOS/Android/Windows 探测路径 302 → 连热点自动弹后台 |
 | 周边 AP 扫描 | ✅ 实现 | `WiFi.scanNetworks()` 被动列出 SSID/RSSI/信道/加密方式 |
 | 已连客户端计数 | ✅ 实现 | `softAPgetStationNum()` 只读计数 |
 | 事件日志 | ✅ 实现 | 64 条环形缓冲，`GET /api/log?since=` 增量拉取 |
@@ -102,7 +104,7 @@ sh tools/build-firmware.sh 1.0.0
 
 ```
 firmware/           PlatformIO 工程（Arduino 框架, espressif32 v8）
-├── platformio.ini  可编 env: esp32/s2/s3/c3/c6（c5 保留 env、实验性不出镜像）
+├── platformio.ini  可编 env: esp32/s2/s3/c3/c5/c6（c5 需本地注入 libs）
 ├── src/main.cpp    共享固件逻辑（AP + admin API, 含日志环形缓冲/扫描/目标）
 ├── src/admin_page.h     自动生成（勿手改）
 ├── data/admin.html      固件后台 SPA（内嵌源文件；zlib deflate 压缩进固件）
@@ -126,6 +128,27 @@ tools/              构建与运维脚本
 
 docs/plans/         设计文档（含固件 API、合规边界、视觉规范）
 ```
+
+## 合并镜像布局与 Bootloader 偏移（重要）
+
+`tools/build-firmware.sh` 用 `esptool merge-bin` 把三段合成单镜像，
+整片从 `0x0` 写入 flash。Bootloader 的偏移由芯片 ROM 规定，三方一致
+（arduino `boards.txt` / IDF `CONFIG_BOOTLOADER_OFFSET_IN_FLASH` /
+esptool `BOOTLOADER_FLASH_OFFSET`）：
+
+| 芯片 | bootloader 偏移 | 说明 |
+|---|---|---|
+| `esp32` / `esp32s2` | `0x1000` | 经典 ESP32 与 S2 的 ROM 约定 |
+| `esp32c5` | `0x2000` | WiFi 6 双频芯片, 前 2 扇区保留 |
+| `esp32s3` / `esp32c3` / `esp32c6` | `0x0` | 新版 RISC-V/S3 从 0 起 |
+
+分区表固定 `0x8000`、app 固定 `0x10000`（PlatformIO 默认，全系列一致）。
+后端注册时的魔数校验会在**对应芯片的 bootloader 偏移**处检查 `0xE9`
+（并兼容直接从 `0x0` 开始的 app-only 调试镜像）。
+
+> ⚠️ espressif32 v8 的 `platformio-build.py` 把 `esp32c5` 也按 `0x0` 处理
+> （平台对 C5 的适配缺陷，与 C5 的 ROM/sdkconfig/esptool 均矛盾）。
+> 因此 `build-firmware.sh` 显式按芯片指定偏移，不沿用 `pio upload` 默认值。
 
 ## 烧录码生命周期
 
@@ -156,7 +179,34 @@ unused ──verify──▶ verified(15min) ──烧录成功/pair nonce──
 - ✅ 固件后台 SPA 已内嵌（/api/scan、/api/target、/api/log、扩展 /api/info 编译通过）
 - ⬜ 真机烧录 + 热点后台端到端（需要接一块 ESP32/S2/S3/C3/C6 板）
 
-## 变更记录（2026-11-09）
+## 变更记录
+
+### 2026-11-09（二）代码审查修复 + Captive Portal
+
+**Added**
+- **Captive Portal 强制门户**：固件引入 `DNSServer`（UDP 53 通配解析 → AP IP），
+  `notFound()` 对 iOS/Android/Windows 探测路径及任意未知路径返回 302 → `/admin.html`，
+  手机连热点自动弹后台；`/api/*` 保持 404 不破坏后台 SPA
+
+**Fixed (P0 / 安全 / 稳定性)**
+- **Bootloader 偏移错误**（审查核心项，且审查自身论断有误）：按芯片动态指定
+  `esp32/s2=0x1000`、`esp32c5=0x2000`、其余 `=0x0`，修复 3 颗芯片镜像放错位置
+  导致无法开机的问题。审查稿仅识别经典 ESP32，并错误地让 S2/C5 保持 0x0
+  （三方证据：arduino boards.txt / IDF sdkconfig / esptool 均已核对）；
+  同时绕开 espressif32 v8 平台把 C5 也当 0x0 的适配缺陷
+- **后端魔数校验误杀**：改为按芯片预期 bootloader 偏移检查 `0xE9`（对齐上表），
+  并兼容 app-only 调试镜像（0x0）
+- **烧录台 `consoleHint` 空指针**：HTML 补 `#consoleHint` 元素 + JS 判空保护 + 样式
+- **nonce 内存无限膨胀**：5 分钟定期 sweep + `redeem` 真正校验 `expiresAt`
+  （原实现过期 nonce 仍可核销）
+- **verify 无限流**：单 IP 滑动窗口 10 次/分（`429`）
+- **ADMIN_TOKEN 明文打印**：启动日志改为「已启用」提示，不输出值
+- **静态托管依赖 cwd**：`serveStatic` 改用 `join(ROOT,'flasher')` 绝对路径
+
+未采纳（经评估暂缓，见 §9）：CDN 本地化、异步扫描、串口探针免码升级
+（后者与一次性烧录码核销闭环冲突）。
+
+### 2026-11-09（一）初始版本
 
 **Added**
 - **ESP32-C5 固件支持**：`tools/install-c5-libs.sh` 注入本地 c5-libs（lib-builder
