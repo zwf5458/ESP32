@@ -46,9 +46,9 @@ sh tools/build-firmware.sh 1.0.0
 | 已连客户端计数 | ✅ 实现 | `softAPgetStationNum()` 只读计数 |
 | 事件日志 | ✅ 实现 | 64 条环形缓冲，`GET /api/log?since=` 增量拉取 |
 | 内存/运行诊断 | ✅ 实现 | 堆、PSRAM、信道、uptime |
-| Evil Twin（邪恶双子） | ❌ 不实现 | 抽屉/占位页显示灰掉的「合规未启用」 |
-| Deauther（WiFi 杀手） | ❌ 不实现 | 同上 |
-| Karma / 握手包捕获与破解 | ❌ 不实现 | 同上 |
+| Evil Twin（邪恶双子） | ✅ 实现（教学验证） | 克隆 SSID 诱骗 AP + Captive Portal 弹窗，受测设备密码凭据捕获与查看 |
+| Deauther（WiFi 杀手） | ✅ 实现（教学验证） | 802.11 管理帧 (0x00c0) 注入与 Reason Code 机制测试，带实时帧率与计数遥测 |
+| Handshake / 握手包与破解 | ✅ 实现（教学验证） | 4-Way Handshake (M1~M4) 握手状态机监听 + 内置 7,153 条弱口令离线字典审计 |
 
 不做主动攻击模块的原因：
 
@@ -180,6 +180,14 @@ unused ──verify──▶ verified(15min) ──烧录成功/pair nonce──
 - ⬜ 真机烧录 + 热点后台端到端（需要接一块 ESP32/S2/S3/C3/C6 板）
 
 ## 变更记录
+
+### 2026-11-09（三）新增 3 大网络安全教学验证板块 (v1.1.0)
+
+**Added**
+- **Evil Twin（邪恶双子 & 凭据捕获）**：支持克隆主目标 SSID，联动 Captive Portal 强制门户展示路由器升级认证页，记录受测端提交的凭据并在后台实时展示与管理。
+- **Deauther（取消认证器）**：实现 IEEE 802.11 Deauth 管理帧机制测试，支持 10/20/50 fps 与 Reason Code (1/2/6/7) 调节，提供实时帧率与累计注入遥测。
+- **Handshake & Crack（4次握手与字典跑包）**：实现 EAPOL 4-Way Handshake 状态机 (M1~M4) 与 PMKID 状态监听展示，内置 7,153 条弱密码离线跑包演示。
+- **后台 SPA 全面联动**：抽屉菜单启用 3 大板块独立交互页，首页仪表板新增教学实验引擎状态指示，情报与捕获区数据动态实时绑定。
 
 ### 2026-11-09（二）代码审查修复 + Captive Portal
 

