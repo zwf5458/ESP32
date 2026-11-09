@@ -99,14 +99,18 @@ ESP32/
 | Deauth / 取消认证器 | ✅ 实现（教学验证） | 802.11 管理帧 (0x00c0) 注入与 Reason Code 机制测试，带实时帧率与计数遥测 |
 | 握手包捕获与破解 (Karma) | ✅ 实现（教学验证） | 4-Way Handshake (M1~M4) 握手状态机监听 + 内置 7,153 条弱口令离线字典审计 |
 
-不做主动攻击模块的理由（详见 README 同名章节）：
-① 法律——干扰通信/伪造网络触及《网络安全法》第 27 条等，销售形态风险更高；
-② 产品定位——本产品线是烧录台 + 管理固件，攻击能力不在边界内；
-③ 技术——Deauth 依赖原始 802.11 帧注入，C5（WiFi 6 双频）SDK 对 raw TX 受限。
+**v1.1.0 起定位为「教学验证」**：上述 3 个模块在**受控教学 / 自有授权设备**范围内启用
+（用户明确决策，见变更记录 2026-11-09 三）。使用时须遵守：
 
-代码可证：`src/main.cpp` 无攻击相关调用；`data/admin.html` 中攻击模块
-均为禁用占位，点击提示「为遵守法律法规，主动攻击类模块未启用」。
-UI 与法律声明页明示边界；烧录台《使用条款》与后台法律声明文案一致。
+① 仅在自有网络或取得书面授权的受测环境中使用；
+② 不得对第三方网络/设备进行伪造 AP、解除认证或凭据收集；
+③ 凭据捕获页（`addCredential`）记录的是受测端在本教学门户提交的口令，
+   仅限演示，不应用于真实网络，实验后应清空。
+
+法律提醒：干扰他人通信 / 伪造他人网络可触及《网络安全法》第 27 条等，
+销售形态风险更高；C5 作为 WiFi 6 双频芯片对 raw TX 的 SDK 支持受限，
+教学模块的帧注入/握手状态机为**协议机制演示**（状态推进由定时器模拟），
+非真实空口抓包。UI 与法律声明页应明示「仅限授权教学」。
 
 ## 3.2 视觉规范（Neo-brutalism）
 
@@ -117,6 +121,29 @@ UI 与法律声明页明示边界；烧录台《使用条款》与后台法律�
 - 等宽标题（SF Mono）+ PingFang SC 正文；按钮按下位移效果
 - 暗色主题：同布局换深底配色（烧录台 + 后台均可切换、烧录台侧持久化）
 - 后台骨架：黄色顶栏 + 汉堡抽屉（品牌条 / 分组导航 / 语言选择）+ 右上运行时间与内存条
+
+## 3.3 Serial JSON 遥测协议（外部设备即插即用）
+
+保留 WebServer 与文本日志不变，固件在 115200 串口**额外**输出 NDJSON
+（每行一个 `{...}`）。以 `{` 开头即视为 JSON 事件，其余为文本日志，消费者按行判断。
+
+帧格式：`{"v":1,"ts":<毫秒>,"event":"<type>", ...}`
+
+| event | 触发 | 字段（全部只读） |
+|---|---|---|
+| `boot` | 上电 | chip / fw / ssid / mac / channel |
+| `log` | 每次日志（`log()` 自动镜像） | id / line |
+| `heartbeat` | 每 30s | clients / heap / minFree / uptime / ssid |
+| `scan_result` | 扫描时每个 AP | ssid / rssi / ch / bssid / auth |
+| `client_join` / `client_leave` | softAP 客户端数变化 | clients |
+| `lab_state` | 教学模块启停 | module / running |
+
+**边界**：只镜像已有只读状态。不含 Probe Request/Response、802.11 管理帧、
+EAPOL/握手材料（M1~M4、PMKID、nonce、MIC）、凭据或密码字段。
+消费端 `tools/serial-telemetry.py`（pyserial）支持自动探测端口、按行解析、
+`--event` 订阅过滤、`--raw` 原样输出、`--save` 导出 NDJSON。
+烧录台控制台提示标注「文本日志 + NDJSON 遥测」，不做逐行富文本高亮
+（串口是流式分片，避免改动 `terminalAppend` 引入解析 bug）。
 
 ## 4. 烧录台前端
 
@@ -204,10 +231,16 @@ redeem 只在 writeFlash 完整成功后由前端触发，且后端按 nonce+chi
    - 烧录台 `consoleHint` 元素存在/零 JS 报错、静态托管脱离 cwd ✓
    - Captive Portal：6 env 全部编译 SUCCESS（DNSServer 引入无回归）✓
 
+8. Serial JSON 遥测（2026-11-09 四）✓：
+   - `emitJson`/`emitLabState` 编译通过（esp32 / esp32c5 代表性芯片 SUCCESS）
+   - `tools/serial-telemetry.py` 语法/`--help`/伪串口消费逻辑/`--event` 过滤单测通过 ✓
+   - 事件 schema 敏感字段扫描通过（无 password/eapol/M1-M4/pmkid/nonce/MIC/凭据）✓
+   - ⬜ 真机串口输出实测（需接板子用脚本读 115200）
+
 ## 9. 后续阶段（非本期）
 
-- 主动攻击类模块（Deauth 测试 / Evil Twin 等）—— **法律风险高，不开发**
-- Evil Portal（当前不开发；钓鱼导向页面同样有合规风险，需评估后再定）
+- 教学模块的**真实空口实现**：当前帧注入/握手为定时器模拟的协议演示；
+  若要真实 802.11 帧收发/抓包，需评估 IDF 各芯片 raw TX 支持与授权边界（法律风险高）
 - 云部署（HTTPS 域名 + CDN 托管静态烧录台）
 - 图文教程静态页（tw.html / az.html 等）
 - ESP32-C5 真机验证（镜像已产出；espressif32 v8 无官方 c5-libs，

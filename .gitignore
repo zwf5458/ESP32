@@ -13,6 +13,8 @@ server/*.db
 # logs & temp
 *.log
 .DS_Store
+__pycache__/
+*.py[cod]
 
 # local download caches (工具链/库下载脚本的工作目录不在此仓库内, 双保险)
 pio-dl/

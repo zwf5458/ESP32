@@ -50,19 +50,18 @@ sh tools/build-firmware.sh 1.0.0
 | Deauther（WiFi 杀手） | ✅ 实现（教学验证） | 802.11 管理帧 (0x00c0) 注入与 Reason Code 机制测试，带实时帧率与计数遥测 |
 | Handshake / 握手包与破解 | ✅ 实现（教学验证） | 4-Way Handshake (M1~M4) 握手状态机监听 + 内置 7,153 条弱口令离线字典审计 |
 
-不做主动攻击模块的原因：
+**v1.1.0 起以上 3 个模块为「教学验证」**（用户明确决策，见变更记录 2026-11-09 三），
+仅限受控教学 / 自有授权设备环境使用：
 
-1. **法律**：Deauth 与 Evil Twin 的实质是干扰他人通信 + 伪造他人网络，
-   可触及《网络安全法》第 27 条、《治安管理处罚法》、
-   《刑法》第 285/286 条（情节严重）；对**销售类产品**而言风险更高（提供工具）。
-2. **产品定位**：本产品线是烧录台 + 管理固件；攻击能力不属于其边界。
-   正规授权渗透测试应使用 Kali/aircrack-ng 等专用环境与书面授权。
-3. **技术**：Deauth 需要原始 802.11 帧注入；C5 作为 WiFi 6 双频芯片
-   对 raw TX 的 SDK 支持受限，即便不考虑合规也不是合适的实现平台。
+1. **使用边界**：仅在自有网络或取得书面授权的受测环境启用；
+   不得对第三方网络/设备伪造 AP、解除认证或收集凭据。
+2. **法律提醒**：干扰他人通信 / 伪造他人网络可触及《网络安全法》第 27 条、
+   《治安管理处罚法》、《刑法》第 285/286 条；销售形态风险更高。
+   凭据捕获页记录的口令仅限演示，实验后应清空。
+3. **实现性质**：帧注入计数 / 4-Way Handshake 状态机为**协议机制演示**
+   （状态由定时器模拟推进），非真实空口抓包；C5 对 raw TX 的 SDK 支持受限。
 
-代码可证：`firmware/src/main.cpp` 无任何攻击相关调用；
-涉及模块在 `firmware/data/admin.html` 中均为禁用占位（点击提示合规说明）。
-详细边界条目见设计文档 §3.1。
+详细边界与使用约束见设计文档 §3.1。
 
 ## PlatformIO 编译环境搭建
 
@@ -124,7 +123,10 @@ tools/              构建与运维脚本
 ├── build-firmware.sh       全 env 编译 → merge-bin → 注册
 ├── install-toolchain.sh    工具链注入（espressif 官方源）
 ├── install-registry-pkg.sh registry 包安装（含 .piopm 生成）
-└── dl-resume.sh            registry CDN 断点续传下载
+├── dl-resume.sh            registry CDN 断点续传下载
+├── install-c5-libs.sh      ESP32-C5 libs 本地注入
+├── esp32-c5-devkitc-1.json C5 板级定义副本
+└── serial-telemetry.py     Serial JSON 遥测 PC 命令行消费端
 
 docs/plans/         设计文档（含固件 API、合规边界、视觉规范）
 ```
@@ -149,6 +151,39 @@ esptool `BOOTLOADER_FLASH_OFFSET`）：
 > ⚠️ espressif32 v8 的 `platformio-build.py` 把 `esp32c5` 也按 `0x0` 处理
 > （平台对 C5 的适配缺陷，与 C5 的 ROM/sdkconfig/esptool 均矛盾）。
 > 因此 `build-firmware.sh` 显式按芯片指定偏移，不沿用 `pio upload` 默认值。
+
+## Serial JSON 遥测（外部设备即插即用）
+
+固件在 115200 串口上**同时**输出两类行，保留原有 WebServer 与文本日志不变：
+
+- 普通文本日志（如 `[wifi] AP 已启动 ...`）——烧录台串口控制台原样显示
+- **NDJSON 遥测**：每行一个以 `{` 开头的 JSON 对象，供 PC 命令行 / 便携硬件按行解析
+
+协议：`{"v":1,"ts":<毫秒>,"event":"<type>", ...}`，事件均为**只读数据镜像**：
+
+| event | 触发 | 字段（全部只读） |
+|---|---|---|
+| `boot` | 上电 | chip / fw / ssid / mac / channel |
+| `log` | 每次日志 | id / line（与环形缓冲同源） |
+| `heartbeat` | 每 30s | clients / heap / minFree / uptime / ssid |
+| `scan_result` | 扫描时每个周边 AP | ssid / rssi / ch / bssid / auth |
+| `client_join` / `client_leave` | softAP 客户端数变化 | clients |
+| `lab_state` | 教学模块启停 | module / running |
+
+> 遥测只镜像**已有只读状态**：不含 Probe Request/Response、802.11 管理帧、
+> EAPOL / 握手材料（M1~M4、PMKID、nonce、MIC）、凭据或任何密码字段。
+> 文本日志与 JSON 事件并存，以 `{` 开头即视为 JSON，消费者按行判断即可。
+
+消费端示例（PC 命令行，即插即用）：
+
+```bash
+pip install pyserial
+python3 tools/serial-telemetry.py                          # 自动探测串口
+python3 tools/serial-telemetry.py /dev/cu.usbserial-0001   # 指定端口
+python3 tools/serial-telemetry.py --event heartbeat --event client_join
+python3 tools/serial-telemetry.py --raw                    # 原样输出每行
+python3 tools/serial-telemetry.py --save run.ndjson        # 导出 NDJSON 文件
+```
 
 ## 烧录码生命周期
 
@@ -180,6 +215,19 @@ unused ──verify──▶ verified(15min) ──烧录成功/pair nonce──
 - ⬜ 真机烧录 + 热点后台端到端（需要接一块 ESP32/S2/S3/C3/C6 板）
 
 ## 变更记录
+
+### 2026-11-09（四）Serial JSON 遥测（外部设备即插即用）
+
+**Added**
+- 固件串口在文本日志之外**新增 NDJSON 只读遥测**（`{"v":1,"ts":...,"event":...}`）：
+  `boot` / `log` / `heartbeat` / `scan_result` / `client_join` / `client_leave` / `lab_state`。
+  保留现有 WebServer 与文本日志不变，两类行并存（`{` 开头即 JSON）
+- `tools/serial-telemetry.py`：PC 命令行消费端，自动探测串口、按行解析、
+  `--event` 订阅过滤、`--raw` 原样输出、`--save` 导出 NDJSON
+- 烧录台控制台提示标注「文本日志 + NDJSON 遥测」及解析方式
+
+**边界**：遥测只镜像已有只读状态，不含 Probe Request/Response、管理帧、
+EAPOL/握手材料（M1~M4、PMKID、nonce、MIC）、凭据或密码字段。
 
 ### 2026-11-09（三）新增 3 大网络安全教学验证板块 (v1.1.0)
 

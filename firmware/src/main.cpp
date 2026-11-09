@@ -6,11 +6,25 @@
  *  - 开热点 SSID = WiFi-<MAC尾4hex>  密码 00000000  (与参考站一致)
  *  - http://192.168.4.1/admin.html  Neo-brutalism 后台 (内嵌页面)
  *  - Captive Portal: UDP 53 通配解析 + OS 探测路径 302, 连热点自动弹后台 (或双子钓鱼页)
+ *  - Serial JSON 遥测: 串口额外输出 NDJSON(每行一个 {...}) 只读事件流,
+ *    供 PC 命令行 / 便携硬件即插即用 (不含 Probe 响应/管理帧/EAPOL/凭据等材料)
  *
  * 3 大教学验证模块:
  *  1. 👤 Evil Twin (邪恶双子 & Captive Portal 凭据捕获验证)
  *  2. ⛔ Deauther (802.11 管理帧机制与取消认证阻断验证)
  *  3. ⬍ Handshake & Crack (4-Way Handshake 捕获与弱口令离线字典跑包审计)
+ *
+ * Serial 遥测协议 (NDJSON, UTF-8, 115200, 每行一个对象):
+ *   {"v":1,"ts":<ms>,"event":"<type>", ...}
+ *   event 取值 (全部为只读数据镜像):
+ *     boot          上电: chip/fw/ssid/mac/channel
+ *     log           日志: id/line (与环形缓冲同源)
+ *     heartbeat     30s 周期: clients/heap/uptime
+ *     scan_result   扫描: 每个 AP 一条 ssid/rssi/ch/bssid/auth
+ *     client_join   softAP 客户端数增加: clients
+ *     client_leave  softAP 客户端数减少: clients
+ *     lab_state     教学模块中性状态: module/running (不含任何凭据/握手材料)
+ *   约定: 以 '{' 开头的行为 JSON, 其余为原文本日志, 消费者按行解析即可。
  */
 
 #include <Arduino.h>
@@ -47,12 +61,33 @@ static LogEntry sLogs[64];        // 环形 64 条
 static uint8_t  sLogHead = 0;     // 下一个写入位置
 static uint32_t sLogId   = 0;     // 单调递增
 
+static String jsonEscape(const String &in);   // 前置声明 (emitJson/log 需要)
+
+/* ---------------- Serial JSON 遥测 (NDJSON, 只读镜像) ---------------- */
+// 统一事件发射: 串口输出一行 {"v":1,"ts":...,"event":...,<fields>}
+// fields 需为已拼好的合法 JSON 片段 (不含最外层花括号), 例如 "\"clients\":2"
+// 仅镜像已有的只读数据; 绝不输出 Probe/管理帧/EAPOL/握手材料/凭据。
+static void emitJson(const String &event, const String &fields) {
+  String out = "{\"v\":1,\"ts\":" + String(millis()) + ",\"event\":\"" + event + "\"";
+  if (fields.length()) out += "," + fields;
+  out += "}";
+  Serial.println(out);
+}
+
+// 教学模块状态遥测: 只发模块名与 running 布尔, 不携带任何敏感载荷
+static void emitLabState(const char *module, bool running) {
+  emitJson("lab_state", "\"module\":\"" + String(module) +
+           "\",\"running\":" + String(running ? "true" : "false"));
+}
+
 static void log(const String &line) {
   Serial.println(line);
   LogEntry &e = sLogs[sLogHead];
   e.id = ++sLogId;
   strlcpy(e.line, line.c_str(), sizeof(e.line));
   sLogHead = (sLogHead + 1) % (sizeof(sLogs) / sizeof(sLogs[0]));
+  // 镜像一条结构化日志事件, 供外部按行解析 (line 已 jsonEscape 过)
+  emitJson("log", "\"id\":" + String(sLogId) + ",\"line\":\"" + jsonEscape(line) + "\"");
 }
 
 static String jsonEscape(const String &in) {
@@ -314,6 +349,13 @@ static void handleScan() {
       default: auth = "Unknown"; break;
     }
     json += "\"auth\":\"" + auth + "\"}";
+    // 每个 AP 镜像一条结构化遥测 (只读: SSID/RSSI/信道/BSSID/加密方式)
+    emitJson("scan_result",
+             "\"ssid\":\"" + jsonEscape(hidden ? "" : ssid) +
+             "\",\"rssi\":" + String(WiFi.RSSI(i)) +
+             ",\"ch\":" + String(WiFi.channel(i)) +
+             ",\"bssid\":\"" + WiFi.BSSIDstr(i) +
+             "\",\"auth\":\"" + auth + "\"");
     count++;
   }
   json += "]}";
@@ -364,6 +406,7 @@ static void handleEvilTwinStart() {
   }
   sEvilTwin.active = true;
   sEvilTwin.startTime = millis();
+  emitLabState("eviltwin", true);
   log("[eviltwin] 邪恶双子实验已启动! 克隆SSID=" + sEvilTwin.cloneSsid + " (Captive Portal 引导至钓鱼验证)");
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", "{\"ok\":true,\"active\":true,\"cloneSsid\":\"" + jsonEscape(sEvilTwin.cloneSsid) + "\"}");
@@ -371,6 +414,7 @@ static void handleEvilTwinStart() {
 
 static void handleEvilTwinStop() {
   sEvilTwin.active = false;
+  emitLabState("eviltwin", false);
   log("[eviltwin] 邪恶双子实验已停止");
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", "{\"ok\":true,\"active\":false}");
@@ -419,6 +463,7 @@ static void handleDeauthStart() {
   sDeauth.running = true;
   sDeauth.frameCount = 0;
   sDeauth.lastTxTime = millis();
+  emitLabState("deauth", true);
   log("[deauth] 取消认证器已启动! 目标=" + sDeauth.targetBssid + " ch=" + String(sDeauth.targetChannel) + " 原因码=" + String(sDeauth.reasonCode));
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", "{\"ok\":true,\"running\":true}");
@@ -426,6 +471,7 @@ static void handleDeauthStart() {
 
 static void handleDeauthStop() {
   sDeauth.running = false;
+  emitLabState("deauth", false);
   log("[deauth] 取消认证器已停止, 累计发送 " + String(sDeauth.frameCount) + " 帧");
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", "{\"ok\":true,\"running\":false,\"count\":" + String(sDeauth.frameCount) + "}");
@@ -448,6 +494,7 @@ static void handleDeauthStatus() {
 static void handleHandshakeStart() {
   sHandshake.capturing = true;
   sHandshake.captureStartTime = millis();
+  emitLabState("handshake", true);
   sHandshake.m1 = sHandshake.m2 = sHandshake.m3 = sHandshake.m4 = sHandshake.pmkid = false;
   sHandshake.cracking = false;
   sHandshake.crackedPass = "";
@@ -460,6 +507,7 @@ static void handleHandshakeStart() {
 static void handleHandshakeStop() {
   sHandshake.capturing = false;
   sHandshake.cracking = false;
+  emitLabState("handshake", false);
   log("[eapol] 停止握手包监听与跑包");
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", "{\"ok\":true,\"capturing\":false}");
@@ -585,6 +633,16 @@ void setup() {
   log("[wifi] 后台: " + String(ADMIN_HTML_C));
   log("[system] 芯片: " + detectChipKey() + "  FreeHeap: " + String(ESP.getFreeHeap()) + " bytes");
 
+  // 上电遥测: 设备身份 (只读)
+  uint8_t apMac[6];
+  WiFi.softAPmacAddress(apMac);
+  emitJson("boot",
+           "\"chip\":\"" + jsonEscape(detectChipKey()) +
+           "\",\"fw\":\"" FW_VERSION +
+           "\",\"ssid\":\"" + jsonEscape(apSsid) +
+           "\",\"mac\":\"" + formatMac(apMac) +
+           "\",\"channel\":" + String(apChannel));
+
   server.on("/", HTTP_GET, redirectToAdmin);
   server.on("/admin.html", HTTP_GET, sendAdminPage);
   server.on("/portal.html", HTTP_GET, sendPortalPage);
@@ -670,12 +728,28 @@ void loop() {
     }
   }
 
-  // 心跳: 每 30 秒打印状态
+  // 客户端上下线遥测: 由 softAP 客户端数变化推导 (只读计数)
+  static uint8_t lastClients = 0;
+  uint8_t clients = WiFi.softAPgetStationNum();
+  if (clients > lastClients) {
+    emitJson("client_join", "\"clients\":" + String(clients));
+  } else if (clients < lastClients) {
+    emitJson("client_leave", "\"clients\":" + String(clients));
+  }
+  lastClients = clients;
+
+  // 心跳: 每 30 秒打印状态 (文本日志 + 结构化遥测各一份)
   static uint32_t lastBeat = 0;
   if (now - lastBeat > 30000) {
     lastBeat = now;
-    log("[beacon] " + apSsid + " clients=" + String(WiFi.softAPgetStationNum())
+    log("[beacon] " + apSsid + " clients=" + String(clients)
         + "  heap=" + String(ESP.getFreeHeap()) + "  uptime=" + String(now / 1000) + "s");
+    emitJson("heartbeat",
+             "\"clients\":" + String(clients) +
+             ",\"heap\":" + String(ESP.getFreeHeap()) +
+             ",\"uptime\":" + String(now / 1000) +
+             ",\"minFree\":" + String(ESP.getMinFreeHeap()) +
+             ",\"ssid\":\"" + jsonEscape(apSsid) + "\"");
   }
   delay(10);
 }

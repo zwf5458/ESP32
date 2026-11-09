@@ -410,7 +410,7 @@ async function startConsole() {
   }
   state.consoleConn = true;
   const hintEl = $('consoleHint');
-  if (hintEl) hintEl.textContent = '控制台读取中 (115200)… 固件日志实时显示';
+  if (hintEl) hintEl.textContent = '控制台读取中 (115200)… 文本日志 + NDJSON 遥测（{ 开头为 JSON 事件）';
   // 经典复位: DTR/RTS 令芯片重启
   try {
     await state.transport.setDTR(false);
