@@ -30,6 +30,38 @@ sh tools/build-firmware.sh 1.0.0
 访问 `http://192.168.4.1/admin.html` 打开固件后台
 （状态总览 / 扫描与嗅探 / 配置；主动攻击类模块依合规要求未启用）。
 
+## 功能范围与合规边界
+
+本项目固件是「AP 热点 + Web 管理后台」的**合规开发工具**，
+刻意不做成攻击固件（如 ESP32 Marauder / WatchDogsGo 一类形态）。
+能力矩阵（6 颗芯片行为一致）：
+
+| 模块 | 状态 | 说明 |
+|---|---|---|
+| AP 热点 | ✅ 实现 | SSID `WiFi-xxxx`（MAC 尾 4 位）/ 密码 `00000000` / `192.168.4.1` |
+| Web 后台三页 | ✅ 实现 | 状态总览 / 扫描与嗅探 / 配置（内嵌 SPA） |
+| 周边 AP 扫描 | ✅ 实现 | `WiFi.scanNetworks()` 被动列出 SSID/RSSI/信道/加密方式 |
+| 已连客户端计数 | ✅ 实现 | `softAPgetStationNum()` 只读计数 |
+| 事件日志 | ✅ 实现 | 64 条环形缓冲，`GET /api/log?since=` 增量拉取 |
+| 内存/运行诊断 | ✅ 实现 | 堆、PSRAM、信道、uptime |
+| Evil Twin（邪恶双子） | ❌ 不实现 | 抽屉/占位页显示灰掉的「合规未启用」 |
+| Deauther（WiFi 杀手） | ❌ 不实现 | 同上 |
+| Karma / 握手包捕获与破解 | ❌ 不实现 | 同上 |
+
+不做主动攻击模块的原因：
+
+1. **法律**：Deauth 与 Evil Twin 的实质是干扰他人通信 + 伪造他人网络，
+   可触及《网络安全法》第 27 条、《治安管理处罚法》、
+   《刑法》第 285/286 条（情节严重）；对**销售类产品**而言风险更高（提供工具）。
+2. **产品定位**：本产品线是烧录台 + 管理固件；攻击能力不属于其边界。
+   正规授权渗透测试应使用 Kali/aircrack-ng 等专用环境与书面授权。
+3. **技术**：Deauth 需要原始 802.11 帧注入；C5 作为 WiFi 6 双频芯片
+   对 raw TX 的 SDK 支持受限，即便不考虑合规也不是合适的实现平台。
+
+代码可证：`firmware/src/main.cpp` 无任何攻击相关调用；
+涉及模块在 `firmware/data/admin.html` 中均为禁用占位（点击提示合规说明）。
+详细边界条目见设计文档 §3.1。
+
 ## PlatformIO 编译环境搭建
 
 espressif32 v8 平台要求的工具链/框架包从 PIO registry CDN 下载时
@@ -134,6 +166,8 @@ unused ──verify──▶ verified(15min) ──烧录成功/pair nonce──
 - 设备端 API：`GET /api/scan`（APSTA 扫描）、`POST /api/target`、
   `GET /api/log?since=`（环形 64 条）、`GET /api/info` 扩展内存诊断与恢复目标
 - 烧录台「开发板型号」下拉支持手动预选（自动识别仍优先，防选错芯片烧错镜像）
+- **功能范围与合规边界章节**（README + 设计文档 §3.1）：能力矩阵表 +
+  不做主动攻击模块的三点依据（法律/产品定位/技术），与外部攻击固件形态划清界限
 - 编译工具链三件套：`tools/install-toolchain.sh`、`tools/dl-resume.sh`、
   `tools/install-registry-pkg.sh`
 
