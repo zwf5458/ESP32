@@ -228,19 +228,13 @@ $('btnDisconnect').onclick = async () => {
     if (state.transport) await state.transport.disconnect();
     await sleep(300);
   } catch { /* ignore */ }
+  // 清空 transport/esploader 引用: 否则再次点「开始烧录」会跳过重连, 直接对已断开的 transport 写 flash
+  state.transport = state.esploader = null;
+  state.consoleConn = false;
   $('btnConnect').disabled = false; $('btnDisconnect').disabled = true;
   setStatus(false, '未连接');
   if (!state.chipManual) { state.chip = null; updateChipUI(); }
 };
-
-async function ensureFlasherConnection() {
-  if (!state.esploader) {
-    // 用户直接点烧录: 先尝试连接
-    await $('btnConnect').onclick();
-    if (!state.esploader) return false;
-  }
-  return true;
-}
 
 function updateChipUI() {
   const key = state.chip;

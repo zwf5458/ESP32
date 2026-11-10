@@ -35,18 +35,33 @@ html[data-theme=dark] #burger .l{background:#f5efe4}
 /* ---------- drawer ---------- */
 #scrim{position:fixed;inset:0;background:#0009;z-index:40;display:none}
 #drawer{position:fixed;top:0;left:-290px;bottom:0;width:280px;z-index:45;background:var(--cream);
-  border-right:var(--bd);transition:left .18s;overflow-y:auto;padding:18px 14px}
+  border-right:var(--bd);transition:left .18s;overflow-y:auto;padding:0 0 24px}
 #drawer.open{left:0}
-.dr-brand{display:flex;align-items:center;gap:10px;background:var(--yellow-bd);border:var(--bd);
-  border-radius:12px;padding:10px;box-shadow:var(--sh);margin-bottom:16px;font-weight:900;font-size:17px}
-.dr-ic{width:40px;height:40px;display:grid;place-items:center;background:var(--pink);border:var(--bd);border-radius:10px}
-.dr-sec{font-size:11px;font-weight:800;letter-spacing:1px;color:#8a7f6d;margin:14px 6px 6px}
-.dr-item{display:flex;align-items:center;gap:10px;padding:11px 12px;border-radius:10px;font-weight:800;
-  font-size:14px;cursor:pointer;border:2px solid transparent}
-.dr-item:hover{background:#00000010}
-.dr-item.on{background:var(--orange);border-color:#111;box-shadow:var(--sh2)}
+.dr-header{display:flex;align-items:center;gap:12px;padding:16px 16px 14px;border-bottom:var(--bd)}
+#drBurgerClose{width:40px;height:40px;display:grid;place-items:center;gap:4px;cursor:pointer;
+  background:var(--cream);border:var(--bd);border-radius:12px;box-shadow:var(--sh);flex:0 0 auto;padding:9px 7px}
+#drBurgerClose .l{display:block;width:22px;height:3.5px;background:#111;border-radius:2px}
+.dr-chip{width:38px;height:38px;display:grid;place-items:center;background:#ff85c0;border:var(--bd);border-radius:10px;box-shadow:var(--sh2);flex:0 0 auto}
+.dr-title{font-size:19px;font-weight:900;letter-spacing:1px;color:#111}
+.dr-sec{font-size:12px;font-weight:900;color:#111;padding:14px 18px 6px;letter-spacing:0.5px}
+.dr-item{display:flex;align-items:center;gap:12px;padding:10px 18px;font-size:14.5px;font-weight:800;
+  cursor:pointer;border:none;color:#111;transition:background .12s;user-select:none}
+.dr-item:hover{background:#0000000a}
+.dr-item.on{background:var(--orange);color:#111;font-weight:900;border-radius:0;box-shadow:none}
 .dr-item.dis{opacity:.5;cursor:not-allowed}
-.dr-item small{font-size:10px;color:#8a7f6d;margin-left:auto}
+.dr-svg{width:18px;height:18px;display:inline-block;flex:0 0 18px;vertical-align:middle}
+.dr-glyph{width:18px;display:inline-grid;place-items:center;font-size:16px;flex:0 0 18px;line-height:1}
+.dr-lang-row{display:flex;align-items:center;gap:10px;padding:6px 18px 12px}
+.dr-lang-dot{font-size:16px;color:#111;line-height:1;margin-left:2px}
+.dr-lang-select{flex:1;background:var(--cream);color:#111;border:var(--bd);border-radius:10px;
+  padding:7px 12px;font-weight:900;font-size:13.5px;font-family:inherit;box-shadow:var(--sh2);cursor:pointer}
+html[data-theme=dark] .dr-lang-select{background:#2a2a2a;color:#fff}
+html[data-theme=dark] #drBurgerClose{background:#2a2a2a}
+html[data-theme=dark] #drBurgerClose .l{background:#fff}
+html[data-theme=dark] .dr-item{color:var(--ink)}
+html[data-theme=dark] .dr-sec{color:var(--ink)}
+html[data-theme=dark] .dr-lang-dot{color:var(--ink)}
+html[data-theme=dark] .dr-title{color:var(--ink)}
 /* ---------- cards ---------- */
 main{max-width:1180px;margin:0 auto;padding:18px 14px 40px}
 .card{background:var(--cream);border:var(--bd);border-radius:var(--r);box-shadow:var(--sh);padding:14px 16px;margin-bottom:18px}
@@ -122,8 +137,10 @@ td{padding:8px 10px;border-bottom:1px solid #ddd}
 html[data-theme=dark] td{border-bottom-color:#333}
 tr:hover td{background:#0000000a}
 .hidden-ssid{color:#8a7f6d;font-style:italic}
-.tbtn{border:2px solid #111;background:var(--yellow);padding:3px 8px;border-radius:6px;font-weight:800;cursor:pointer}
-.tbtn.pink{background:var(--pink)} .tbtn.purple{background:var(--purple)}
+.tbtn{border:2px solid #111;background:var(--yellow);padding:3px 10px;border-radius:6px;font-weight:900;font-size:12px;cursor:pointer;color:#111;transition:transform .05s}
+.tbtn:hover{transform:translate(-1px,-1px)}
+.tbtn.pink{background:var(--pink)} .tbtn.yellow{background:var(--yellow)} .tbtn.purple{background:var(--purple)}
+.tbtn:disabled{opacity:.4;cursor:not-allowed;transform:none}
 .frow{display:flex;align-items:center;gap:12px;margin:10px 0;flex-wrap:wrap}
 .frow label{width:110px;font-weight:800;color:#8a7f6d}
 .frow .val{font-weight:900;font-family:"SF Mono",Menlo,monospace}
@@ -165,20 +182,65 @@ select.mini{padding:8px 12px;font-weight:800;border:var(--bd);border-radius:10px
 <!-- ===== DRAWER ===== -->
 <div id="scrim"></div>
 <aside id="drawer">
-  <div class="dr-brand"><span class="dr-ic">🎛</span> ESP32</div>
+  <div class="dr-header">
+    <div id="drBurgerClose" onclick="toggleDrawer(false)" title="收起菜单">
+      <span class="l"></span><span class="l"></span><span class="l"></span>
+    </div>
+    <div class="dr-chip">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#111" stroke-width="2.2">
+        <rect x="5" y="5" width="14" height="14" rx="2" fill="#fff"/>
+        <rect x="8" y="8" width="8" height="8" rx="1" fill="#ff85c0"/>
+        <path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/>
+      </svg>
+    </div>
+    <span class="dr-title">ESP32</span>
+  </div>
 
   <div class="dr-sec">仪表板</div>
-  <div class="dr-item on" data-page="dash">✳️ 状态总览</div>
+  <div class="dr-item on" data-page="dash"><span class="dr-glyph">☼</span> 状态总览</div>
+  <div class="dr-lang-row">
+    <span class="dr-lang-dot">●</span>
+    <select class="dr-lang-select">
+      <option>中文</option>
+      <option disabled>English (暂未开放)</option>
+    </select>
+  </div>
 
-  <div class="dr-sec">WIFI 教学实验模块</div>
-  <div class="dr-item" data-page="scan">📶 扫描与嗅探</div>
-  <div class="dr-item" data-page="eviltwin">👤 邪恶双子 (Evil Twin)</div>
-  <div class="dr-item" data-page="deauth">⛔ 取消认证器 (Deauth)</div>
-  <div class="dr-item" data-page="handshake">⬍ 握手包与密码破解</div>
+  <div class="dr-sec">WIFI模块</div>
+  <div class="dr-item" data-page="packet">
+    <svg class="dr-svg" viewBox="0 0 24 24" fill="currentColor"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+    数据包分析器
+  </div>
+  <div class="dr-item" data-page="airodump">
+    <svg class="dr-svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 16l7.36-5.73L21 9.07l-9-7-9 7 1.63 1.2L12 16z"/><path d="M12 18.54l-7.37-5.73L3 14.07l9 7 9-7-1.63-1.27-7.38 5.74z"/></svg>
+    Airodump侦察
+  </div>
+  <div class="dr-item" data-page="scan">
+    <svg class="dr-svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 3c-4.97 0-9.47 2.01-12.73 5.27l1.41 1.41C3.32 6.95 7.42 5.1 12 5.1s8.68 1.85 11.32 4.58l1.41-1.41C21.47 5.01 16.97 3 12 3zm0 4.2c-3.81 0-7.26 1.54-9.76 4.04l1.41 1.41C5.81 10.49 8.74 9.3 12 9.3s6.19 1.19 8.35 3.35l1.41-1.41C19.26 8.74 15.81 7.2 12 7.2zm0 4.2c-2.65 0-5.06 1.07-6.79 2.81l1.41 1.41C7.88 14.36 9.82 13.5 12 13.5s4.12.86 5.38 2.12l1.41-1.41C17.06 12.47 14.65 11.4 12 11.4zm0 4.2c-1.49 0-2.85.61-3.82 1.58l3.82 3.82 3.82-3.82C14.85 16.21 13.49 15.6 12 15.6z"/></svg>
+    扫描与嗅探
+  </div>
+  <div class="dr-item" data-page="eviltwin">
+    <svg class="dr-svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
+    邪恶双子攻击
+  </div>
+  <div class="dr-item" data-page="karma">
+    <span class="dr-glyph" style="font-size:18px;font-weight:900">↕</span>
+    Karma攻击
+  </div>
+  <div class="dr-item" data-page="deauth">
+    <span class="dr-glyph" style="font-size:14px">⬤</span>
+    取消认证器
+  </div>
 
   <div class="dr-sec">系统</div>
-  <div class="dr-item" data-page="cfg">⚙️ 配置</div>
-  <div class="frow" style="margin-top:18px"><select class="mini" style="flex:1"><option>中文</option><option disabled>English (暂未提供)</option></select></div>
+  <div class="dr-item" data-page="creds">
+    <svg class="dr-svg" viewBox="0 0 24 24" fill="currentColor"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>
+    捕获的凭据
+  </div>
+  <div class="dr-item" data-page="cfg">
+    <svg class="dr-svg" viewBox="0 0 24 24" fill="currentColor"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
+    配置
+  </div>
 </aside>
 
 <main id="view"></main>
@@ -207,16 +269,70 @@ const esc = s => String(s ?? '').replace(/[<>&"]/g, c => ({ '<': '&lt;', '>': '&
 function fragPct(free, maxBlock) { return free > 0 ? Math.max(0, (100 - 100 * maxBlock / free)).toFixed(0) : '--'; }
 
 const state = {
-  info: null, target: null, scan: [], filter: 'all', logId: 0,
+  info: null, target: null, scan: [], filter: 'all', showHidden: true,
+  scanSort: { key: 'rssi', asc: false }, logId: 0,
   deauthStatus: { running: false, count: 0, rate: 10, channel: 6, reason: 1 },
   handshakeStatus: { capturing: false, m1: false, m2: false, m3: false, m4: false, pmkid: false, captured: false, unsupported: false, keyver: 0, frames: 0, cracking: false, progress: 0, total: 7153, crackedPass: '' },
+  snifferStatus: { running: false, channel: 6, hopping: false, total: 0, mgmt: 0, ctrl: 0, data: 0, fps: 0, packets: [] },
+  airodumpStatus: { running: false, channel: 1, hopping: true, aps: [], stations: [] },
+  karmaStatus: { running: false, probesCaptured: 0, probesBaited: 0, probes: [] },
   creds: []
 };
 
 async function api(path, opts = {}) {
-  const r = await fetch(path, opts);
+  const r = await fetch(path, withAdminAuth(opts));
+  if (r.status === 401) {
+    showLogin('口令已失效，请重新登录');
+    throw new Error('未授权: 请输入后台口令');
+  }
   if (!r.ok) throw new Error((await r.text()) || r.statusText);
   return r.json();
+}
+
+/* ---------- 后台口令 (localStorage) ---------- */
+const adminToken = () => localStorage.getItem('adminToken') || '';
+function withAdminAuth(opts = {}) {
+  const headers = Object.assign({}, opts.headers || {});
+  const t = adminToken();
+  if (t) headers['X-Admin-Token'] = t;
+  opts.headers = headers;
+  return opts;
+}
+function showLogin(msg) {
+  let mask = $('#loginMask');
+  if (!mask) {
+    mask = document.createElement('div');
+    mask.id = 'loginMask';
+    mask.style.cssText = 'position:fixed;inset:0;z-index:9999;background:#121212;display:flex;align-items:center;justify-content:center;padding:20px';
+    mask.innerHTML = `
+      <div class="card" style="max-width:430px;width:100%;margin:0">
+        <h3 style="margin-top:0">🔐 后台登录</h3>
+        <p class="note">请输入后台访问口令。出厂默认口令见 README 或串口启动日志，登录后可在「配置」页修改。</p>
+        <input type="password" id="loginTok" placeholder="后台口令" autocomplete="current-password"
+               style="width:100%;box-sizing:border-box;margin:10px 0">
+        <div id="loginMsg" style="min-height:20px;color:#d33;font-weight:800"></div>
+        <button class="btn green" id="loginBtn" style="width:100%">进入后台</button>
+      </div>`;
+    document.body.appendChild(mask);
+    const submit = async () => {
+      const t = $('#loginTok').value.trim();
+      if (!t) return;
+      $('#loginMsg').textContent = '验证中…';
+      try {
+        const r = await fetch('/api/info', { headers: { 'X-Admin-Token': t } });
+        if (!r.ok) throw new Error('bad');
+        localStorage.setItem('adminToken', t);
+        mask.remove();
+        boot();
+      } catch (e) {
+        $('#loginMsg').textContent = '口令错误，请重试';
+      }
+    };
+    $('#loginBtn').onclick = submit;
+    $('#loginTok').addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
+    setTimeout(() => { const el = $('#loginTok'); if (el) el.focus(); }, 50);
+  }
+  if (msg) { const m = $('#loginMsg'); if (m) m.textContent = msg; }
 }
 function log(line, cls = '') {
   const c = $('#logc'); if (!c) return;
@@ -251,10 +367,13 @@ $('#tpTheme').onclick = () => {
 /* ================== pages ================== */
 const pages = {
   dash: '状态总览',
+  packet: '数据包分析器',
+  airodump: 'Airodump侦察',
   scan: '扫描与嗅探',
-  eviltwin: '邪恶双子 (Evil Twin)',
-  deauth: '取消认证器 (Deauth)',
-  handshake: '握手包与密码破解',
+  eviltwin: '邪恶双子攻击',
+  karma: 'Karma攻击',
+  deauth: '取消认证器',
+  creds: '捕获的凭据',
   cfg: '配置'
 };
 function go(p) {
@@ -264,10 +383,13 @@ function go(p) {
     el.classList.toggle('on', el.dataset.page === p);
   });
   if (p === 'dash') renderDash();
+  else if (p === 'packet') renderPacket();
+  else if (p === 'airodump') renderAirodump();
   else if (p === 'scan') renderScan();
   else if (p === 'eviltwin') renderEvilTwin();
+  else if (p === 'karma') renderKarma();
   else if (p === 'deauth') renderDeauth();
-  else if (p === 'handshake') renderHandshake();
+  else if (p === 'creds') renderCreds();
   else if (p === 'cfg') renderCfg();
 }
 
@@ -357,57 +479,119 @@ function renderTarget() {
 let scanFlag = false;
 async function realScan() {
   if (scanFlag) return; scanFlag = true;
-  $('#scanStatus').textContent = '正在扫描周围无线信道 …';
-  $('#btnScan').disabled = true;
+  const st = $('#scanStatus');
+  if (st) st.textContent = '正在扫描周围无线信道 …';
+  const btn = $('#btnScan');
+  if (btn) btn.disabled = true;
   try {
     const j = await api('/api/scan');
     state.scan = j.networks || [];
     log('[scan] 扫描完成: 共发现 ' + state.scan.length + ' 个 AP', 't-ok');
-    $('#scanStatus').textContent = state.scan.length + ' 个 AP 点击列表标题排序';
-  } catch (e) { $('#scanStatus').textContent = '扫描失败: ' + e.message; }
-  scanFlag = false; $('#btnScan').disabled = false;
+    if (st) st.textContent = state.scan.length + ' 个 AP 点击列表标题排序';
+  } catch (e) {
+    if (st) st.textContent = '扫描失败: ' + e.message;
+  }
+  scanFlag = false;
+  if (btn) btn.disabled = false;
   paintScan();
 }
+
+function sortScan(key) {
+  if (state.scanSort.key === key) {
+    state.scanSort.asc = !state.scanSort.asc;
+  } else {
+    state.scanSort.key = key;
+    state.scanSort.asc = (key === 'ssid' || key === 'auth' || key === 'bssid');
+  }
+  paintScan();
+}
+
 function passFilter(n) {
   const f = state.filter;
-  if (f === '24') return n.channel <= 14;
-  if (f === '5') return n.channel > 14;
+  if (f === '24' && n.channel > 14) return false;
+  if (f === '5' && n.channel <= 14) return false;
+  if (!state.showHidden && n.hidden) return false;
   return true;
 }
+
 function paintScan() {
-  const list = state.scan.filter(passFilter).sort((a,b) => (b.hidden - a.hidden) || (b.rssi - a.rssi));
-  $('#tbody').innerHTML = list.length ? list.map((n, idx) => `
+  const tb = $('#tbody'); if (!tb) return;
+  const { key, asc } = state.scanSort || { key: 'rssi', asc: false };
+  const filtered = state.scan.filter(passFilter);
+  const list = filtered.slice().sort((a, b) => {
+    let va = a[key], vb = b[key];
+    if (key === 'ssid') {
+      va = (a.ssid || '').toLowerCase();
+      vb = (b.ssid || '').toLowerCase();
+    }
+    if (va < vb) return asc ? -1 : 1;
+    if (va > vb) return asc ? 1 : -1;
+    return (b.rssi || 0) - (a.rssi || 0);
+  });
+
+  const arrow = col => (state.scanSort?.key === col ? (state.scanSort.asc ? ' ▲' : ' ▼') : '');
+  const thRow = $('#scanThead');
+  if (thRow) {
+    thRow.innerHTML = `<tr>
+      <th style="cursor:pointer" onclick="sortScan('ssid')">SSID${arrow('ssid')}</th>
+      <th style="cursor:pointer" onclick="sortScan('rssi')">RSSI${arrow('rssi')}</th>
+      <th style="cursor:pointer" onclick="sortScan('channel')">信道${arrow('channel')}</th>
+      <th style="cursor:pointer" onclick="sortScan('bssid')">BSSID${arrow('bssid')}</th>
+      <th style="cursor:pointer" onclick="sortScan('auth')">安全${arrow('auth')}</th>
+      <th>操作</th>
+    </tr>`;
+  }
+
+  const st = $('#scanStatus');
+  if (st && !scanFlag) {
+    st.textContent = state.scan.length ? `${state.scan.length} 个 AP 点击列表标题排序` : '尚未扫描 — 点「开始扫描」';
+  }
+
+  tb.innerHTML = list.length ? list.map((n, idx) => `
     <tr>
-      <td class="ssid ${n.hidden ? 'hidden-ssid' : ''}">${n.hidden ? '(隐藏网络)' : esc(n.ssid)}</td>
-      <td class="rssi mono">${n.rssi} dBm</td>
-      <td class="mono">${n.channel}${n.channel > 14 ? ' (5G)' : ' (2.4G)'}</td><td class="mono">${esc(n.bssid)}</td><td>${esc(n.auth)}</td>
-      <td style="white-space:nowrap"><button class="tbtn pink" ${state.target && state.target.bssid === n.bssid ? 'disabled' : ''}
-        onclick='pickTarget(${JSON.stringify({ssid:n.ssid,bssid:n.bssid,channel:n.channel,rssi:n.rssi,auth:n.auth}).replace(/'/g,"&#39;")}, "primary")'>设为主目标</button>
-        <button class="tbtn purple" style="margin-left:6px" ${(state.info?.twins || []).some(x => x.bssid === n.bssid) ? 'disabled' : ''}
-        onclick='pickTarget(${JSON.stringify({ssid:n.ssid,bssid:n.bssid,channel:n.channel,rssi:n.rssi,auth:n.auth}).replace(/'/g,"&#39;")}, "twin")'>设为双子</button>
+      <td class="ssid ${n.hidden ? 'hidden-ssid' : ''}" style="font-weight:900;color:var(--yellow)">${n.hidden ? '(隐藏网络)' : esc(n.ssid)}</td>
+      <td class="rssi mono" style="color:#4cd964;font-weight:900">${n.rssi}</td>
+      <td class="mono" style="color:#ffe14d;font-weight:800">${n.channel}</td>
+      <td class="mono" style="font-size:12px">${esc(n.bssid)}</td>
+      <td class="mono" style="font-size:12px">${esc(n.auth || 'OPEN')}</td>
+      <td style="white-space:nowrap">
+        <button class="tbtn pink" ${state.target && state.target.bssid === n.bssid ? 'disabled' : ''}
+          title="设为主目标 (2.4G · 克隆热点与持续 Deauth)"
+          onclick='pickTarget(${JSON.stringify({ssid:n.ssid,bssid:n.bssid,channel:n.channel,rssi:n.rssi,auth:n.auth}).replace(/'/g,"&#39;")}, "primary")'>目标</button>
+        <button class="tbtn yellow" style="margin-left:6px" ${(state.info?.twins || []).some(x => x.bssid === n.bssid) ? 'disabled' : ''}
+          title="设为双子 (5G/多频 · 跳频注入/假 AP)"
+          onclick='pickTarget(${JSON.stringify({ssid:n.ssid,bssid:n.bssid,channel:n.channel,rssi:n.rssi,auth:n.auth}).replace(/'/g,"&#39;")}, "twin")'>+双子</button>
       </td>
     </tr>`).join('') : `<tr><td colspan="6" class="nores" style="text-align:center;padding:20px;color:#888">${
       state.scan.length ? '无对应频段结果' : '尚未扫描 — 点「开始扫描」'}</td></tr>`;
 }
+
 function renderScan() {
   $('#view').innerHTML = `
   <div class="scanband">
-    <button class="btn yellow" id="btnScan">开始扫描</button>
-    <div class="filters">Filter:
-      <label><input type="radio" name="f" value="all" checked> 全部</label>
-      <label><input type="radio" name="f" value="24"> 2.4G</label>
-      <label><input type="radio" name="f" value="5"> 5G</label>
+    <button class="btn yellow" id="btnScan" style="font-size:13px;padding:8px 14px">开始扫描</button>
+    <div class="filters">
+      <span style="font-weight:900;margin-right:2px">频段:</span>
+      <label><input type="radio" name="f" value="24" ${state.filter==='24'?'checked':''}> 2.4G</label>
+      <label><input type="radio" name="f" value="5" ${state.filter==='5'?'checked':''}> 5G</label>
+      <label><input type="radio" name="f" value="all" ${state.filter==='all'?'checked':''}> 全部</label>
+      <label style="margin-left:6px;border-left:2px solid #ccc;padding-left:8px"><input type="checkbox" id="chkHidden" ${state.showHidden?'checked':''}> +隐藏</label>
     </div>
-    <span class="st" id="scanStatus">就绪 · 点击开始扫描</span>
+    <div class="st" id="scanStatus" style="width:100%;margin-top:2px">${state.scan.length ? state.scan.length + ' 个 AP 点击列表标题排序' : '就绪 · 点击开始扫描'}</div>
   </div>
-  <div class="card" style="padding:10px 14px;margin:0 0 12px;font-size:13px">操作顺序: <b>① 点击开始扫描 → ② 先把 5G 目标设为双子 → ③ 最后把 2.4G 设为主目标</b> → ④ 进入「邪恶双子攻击」点击「发起攻击」</div>
-  <div class="table-wrap"><table>
-    <thead><tr><th>SSID</th><th>RSSI</th><th>信道</th><th>BSSID</th><th>加密</th><th>操作</th></tr></thead>
+  <div class="card" style="padding:10px 14px;margin:0 0 12px;font-size:13px">
+    操作顺序: <b>③ 点击开始扫描 → ④ 先把 5G 目标设为「+双子」 → ⑤ 最后把 2.4G 设为「目标」</b> → ⑥ 进入「邪恶双子攻击」点击「发起攻击」
+  </div>
+  <div class="table-wrap"><table style="background:#1b1b1b">
+    <thead id="scanThead"></thead>
     <tbody id="tbody"></tbody>
   </table></div>
   ${legal()}
   <div class="logc" id="logc">[SYSTEM] 就绪。</div>`;
-  $$('.filters input').forEach(r => r.onchange = () => { state.filter = r.value; paintScan(); });
+
+  $$('.filters input[type=radio]').forEach(r => r.onchange = () => { state.filter = r.value; paintScan(); });
+  const chk = $('#chkHidden');
+  if (chk) chk.onchange = () => { state.showHidden = chk.checked; paintScan(); };
   $('#btnScan').onclick = realScan;
   paintScan();
 }
@@ -437,6 +621,228 @@ async function pickTarget(t, role) {
     let msg = e.message; try { msg = JSON.parse(e.message).error || msg; } catch (_) {}
     toast('设置失败: ' + msg);
   }
+}
+
+/* ---------- 2. 数据包分析器 (Packet Analyzer) ---------- */
+function updatePacketUI() {
+  const s = state.snifferStatus || {};
+  const pill = $('#sniffPill');
+  if (pill) {
+    pill.className = 'status-pill ' + (s.running ? 'run' : 'idle');
+    pill.textContent = s.running ? '● 正在抓包' : '○ 待命';
+  }
+  const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+  set('#sniffFps', s.fps || 0);
+  set('#sniffTotal', s.total || 0);
+  set('#sniffMgmt', s.mgmt || 0);
+  set('#sniffData', s.data || 0);
+  const btnStart = $('#btnStartSniff'); if (btnStart) btnStart.disabled = !!s.running;
+  const btnStop = $('#btnStopSniff'); if (btnStop) btnStop.disabled = !s.running;
+
+  const tb = $('#sniffTableBody');
+  if (tb && s.packets && s.packets.length) {
+    tb.innerHTML = s.packets.map(p => {
+      const typeStyle = (p.type === 'EAPOL') ? 'style="color:#d9534f;font-weight:900"' : (p.type === 'Deauth' ? 'style="color:#e67e22;font-weight:900"' : (p.type === 'Beacon' ? 'style="color:#35c04a;font-weight:800"' : ''));
+      return `<tr>
+        <td class="mono small">${fmtUp(Math.floor(p.ts / 1000))}</td>
+        <td class="mono">ch${p.ch}</td>
+        <td class="mono">${p.rssi} dBm</td>
+        <td ${typeStyle}>${esc(p.type)}</td>
+        <td class="mono small">${esc(p.src)}</td>
+        <td class="mono small">${esc(p.dst)}</td>
+        <td class="small">${esc(p.info)}</td>
+      </tr>`;
+    }).join('');
+  }
+}
+
+function renderPacket() {
+  const s = state.snifferStatus || {};
+  $('#view').innerHTML = `
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:10px">
+      <h3 style="margin:0">🔍 802.11 数据包分析器</h3>
+      <span class="status-pill ${s.running ? 'run' : 'idle'}" id="sniffPill">${s.running ? '● 正在抓包' : '○ 待命'}</span>
+    </div>
+    <p class="note">实时嗅探空中 802.11 射频数据包，按管理帧 (Beacon / Probe / Deauth)、控制帧 (RTS / CTS / ACK)、数据帧 (EAPOL / 数据载荷) 分类解析与吞吐遥测。</p>
+
+    <div class="frow" style="gap:10px;align-items:center;margin:14px 0">
+      <label style="width:auto">监听信道:</label>
+      <select class="mini" id="sniffCh" style="max-width:140px">
+        <option value="0" ${s.hopping ? 'selected' : ''}>全信道跳频轮询</option>
+        ${[1,2,3,4,5,6,7,8,9,10,11,12,13].map(c => `<option value="${c}" ${(!s.hopping && s.channel===c)?'selected':''}>信道 ${c}</option>`).join('')}
+      </select>
+      <button class="btn green sm" id="btnStartSniff" ${s.running ? 'disabled' : ''}>▶ 开始抓包</button>
+      <button class="btn gray sm" id="btnStopSniff" ${!s.running ? 'disabled' : ''}>⏹ 停止抓包</button>
+      <button class="btn pink sm" id="btnClearSniff">🗑️ 清空统计</button>
+    </div>
+
+    <div class="diag" style="margin-top:16px">
+      <div class="dg v"><b id="sniffFps">${s.fps || 0}</b><small>帧率 (fps)</small></div>
+      <div class="dg o"><b id="sniffTotal">${s.total || 0}</b><small>总捕获帧数</small></div>
+      <div class="dg y"><b id="sniffMgmt">${s.mgmt || 0}</b><small>管理帧 (Mgmt)</small></div>
+      <div class="dg p"><b id="sniffData">${s.data || 0}</b><small>数据帧 (Data)</small></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <h3 style="margin:0">📊 实时捕获数据包流 (滚动更新)</h3>
+    </div>
+    <div class="table-wrap" style="max-height:360px;overflow-y:auto">
+      <table>
+        <thead><tr><th>时间</th><th>信道</th><th>RSSI</th><th>帧类型</th><th>源 MAC</th><th>目的 MAC</th><th>载荷信息</th></tr></thead>
+        <tbody id="sniffTableBody">
+          <tr><td colspan="7" style="text-align:center;padding:16px;color:#888">点击「开始抓包」启动数据包流监听</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+  ${legal()}
+  <div class="logc" id="logc">[SYSTEM] 就绪。</div>`;
+
+  $('#btnStartSniff').onclick = async () => {
+    const val = parseInt($('#sniffCh').value);
+    const body = (val === 0) ? { hopping: true } : { channel: val, hopping: false };
+    try {
+      await api('/api/sniffer/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      toast('数据包分析器已启动');
+      state.snifferStatus.running = true;
+      updatePacketUI();
+    } catch (e) { toast('启动失败: ' + e.message); }
+  };
+  $('#btnStopSniff').onclick = async () => {
+    try {
+      await api('/api/sniffer/stop', { method: 'POST' });
+      toast('数据包分析器已停止');
+      state.snifferStatus.running = false;
+      updatePacketUI();
+    } catch (e) { toast('停止失败: ' + e.message); }
+  };
+  $('#btnClearSniff').onclick = () => {
+    state.snifferStatus.total = 0;
+    state.snifferStatus.mgmt = 0;
+    state.snifferStatus.ctrl = 0;
+    state.snifferStatus.data = 0;
+    state.snifferStatus.packets = [];
+    updatePacketUI();
+    toast('已清空统计');
+  };
+  updatePacketUI();
+}
+
+/* ---------- 3. Airodump 侦察 (Airodump Recon) ---------- */
+function updateAirodumpUI() {
+  const a = state.airodumpStatus || {};
+  const pill = $('#adPill');
+  if (pill) {
+    pill.className = 'status-pill ' + (a.running ? 'run' : 'idle');
+    pill.textContent = a.running ? '● 侦察中' : '○ 待命';
+  }
+  const btnStart = $('#btnStartAd'); if (btnStart) btnStart.disabled = !!a.running;
+  const btnStop = $('#btnStopAd'); if (btnStop) btnStop.disabled = !a.running;
+  const chTxt = $('#adChText'); if (chTxt) chTxt.textContent = `当前停驻: ch${a.channel || 1}`;
+
+  const apTb = $('#adApBody');
+  if (apTb) {
+    const list = state.scan || [];
+    apTb.innerHTML = list.length ? list.map((n, idx) => `
+      <tr>
+        <td class="mono small">${n.bssid}</td>
+        <td><b>${esc(n.ssid || '(隐藏网络)')}</b></td>
+        <td class="mono">ch${n.channel}</td>
+        <td class="mono">${n.rssi} dBm</td>
+        <td><span class="status-pill idle" style="font-size:11px">${n.auth || 'Open'}</span></td>
+        <td class="mono">${Math.abs(n.rssi) * 3 + 12}</td>
+        <td>
+          <button class="tbtn" onclick="selectTgt(${idx})">🎯 主目标</button>
+          <button class="tbtn pink" onclick="selectTwin(${idx})">👥 双子</button>
+        </td>
+      </tr>`).join('') : `<tr><td colspan="7" style="text-align:center;padding:16px;color:#888">点击右上角「重新扫描 AP」加载周围无线接入点</td></tr>`;
+  }
+
+  const staTb = $('#adStaBody');
+  if (staTb && a.stations) {
+    staTb.innerHTML = a.stations.length ? a.stations.map(s => `
+      <tr>
+        <td class="mono small"><b>${esc(s.mac)}</b></td>
+        <td class="mono small">${esc(s.bssid)}</td>
+        <td class="mono">${s.rssi} dBm</td>
+        <td class="mono">${s.packets}</td>
+        <td><span style="color:#d9534f;font-weight:800">${esc(s.probes || '--')}</span></td>
+      </tr>`).join('') : `<tr><td colspan="5" style="text-align:center;padding:16px;color:#888">暂未探测到活跃客户端探针 (等待设备发送 Probe Requests)</td></tr>`;
+  }
+}
+
+function renderAirodump() {
+  const a = state.airodumpStatus || {};
+  $('#view').innerHTML = `
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:10px">
+      <h3 style="margin:0">🗂️ Airodump 无线网络与客户端侦察</h3>
+      <span class="status-pill ${a.running ? 'run' : 'idle'}" id="adPill">${a.running ? '● 侦察中' : '○ 待命'}</span>
+    </div>
+    <p class="note">全信道跳频被动侦察空中无线接入点及其关联的客户端 Station。实时拦截手机、平板等客户端寻找历史已存网络的探针请求 (Probes)，用于网络指纹分析与目标定向。</p>
+
+    <div class="frow" style="gap:10px;align-items:center;margin:14px 0">
+      <button class="btn green sm" id="btnStartAd" ${a.running ? 'disabled' : ''}>▶ 开始侦察</button>
+      <button class="btn gray sm" id="btnStopAd" ${!a.running ? 'disabled' : ''}>⏹ 停止侦察</button>
+      <label style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;margin-left:10px;font-weight:800">
+        <input type="checkbox" id="adHop" ${a.hopping ? 'checked' : ''}> 自动信道跳频 (1-13)
+      </label>
+      <span class="mono" style="margin-left:auto;font-weight:900" id="adChText">当前停驻: ch${a.channel || 1}</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <h3 style="margin:0">📡 接入点列表 (BSSID / APs)</h3>
+      <button class="btn yellow sm" onclick="realScan()">↻ 重新扫描 AP</button>
+    </div>
+    <div class="table-wrap" style="max-height:300px;overflow-y:auto">
+      <table>
+        <thead><tr><th>BSSID</th><th>ESSID (WiFi名)</th><th>信道</th><th>信号 (PWR)</th><th>加密 (ENC)</th><th>信标</th><th>操作</th></tr></thead>
+        <tbody id="adApBody">
+          <tr><td colspan="7" style="text-align:center;padding:16px;color:#888">读取中…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>📱 活跃客户端与探针请求 (Station Clients & Probes)</h3>
+    <p class="note">捕获附近设备主动广播寻找的 Wi-Fi 探针请求 (Probes)，揭示终端曾连过的家庭、办公室或公共 WiFi：</p>
+    <div class="table-wrap" style="max-height:300px;overflow-y:auto">
+      <table>
+        <thead><tr><th>客户端 MAC (Station)</th><th>关联 AP (BSSID)</th><th>信号</th><th>数据包</th><th>寻找的历史网络 (Probes)</th></tr></thead>
+        <tbody id="adStaBody">
+          <tr><td colspan="5" style="text-align:center;padding:16px;color:#888">点击「开始侦察」启动终端探针捕获</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+  ${legal()}
+  <div class="logc" id="logc">[SYSTEM] 就绪。</div>`;
+
+  $('#btnStartAd').onclick = async () => {
+    const hop = $('#adHop').checked;
+    try {
+      await api('/api/airodump/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hopping: hop }) });
+      toast('Airodump 侦察已启动');
+      state.airodumpStatus.running = true;
+      updateAirodumpUI();
+    } catch (e) { toast('启动失败: ' + e.message); }
+  };
+  $('#btnStopAd').onclick = async () => {
+    try {
+      await api('/api/airodump/stop', { method: 'POST' });
+      toast('Airodump 侦察已停止');
+      state.airodumpStatus.running = false;
+      updateAirodumpUI();
+    } catch (e) { toast('停止失败: ' + e.message); }
+  };
+  if (!state.scan.length) realScan();
+  updateAirodumpUI();
 }
 
 /* ---------- 3. 邪恶双子 (Evil Twin & 凭据捕获) ---------- */
@@ -830,131 +1236,256 @@ function renderDeauth() {
   };
 }
 
-/* ---------- 5. 握手包与离线字典破解 ---------- */
-function updateHandshakeUI() {
-  const hs = state.handshakeStatus || {};
-  const pct = hs.total ? Math.min(100, (hs.progress / hs.total * 100)).toFixed(1) : '0.0';
-  const pill = $('#hsStatusPill');
+/* ---------- 5. Karma 攻击 (Karma Attack & 握手包跑包) ---------- */
+function updateKarmaUI() {
+  const k = state.karmaStatus || state.handshakeStatus || {};
+  const pct = k.total ? Math.min(100, (k.progress / k.total * 100)).toFixed(1) : '0.0';
+  const pill = $('#karmaPill');
   if (pill) {
-    pill.className = `status-pill ${hs.capturing ? 'run' : 'idle'}`;
-    pill.textContent = hs.capturing ? '● 正在监听' : (hs.captured ? '✓ 握手包已捕获' : '○ 待命');
+    pill.className = `status-pill ${k.running ? 'run' : (k.captured ? 'run' : 'idle')}`;
+    pill.textContent = k.running ? '● 攻击监听中' : (k.captured ? '✓ 握手包已捕获' : '○ 待命');
   }
-  const m1 = $('#hsM1'); if (m1) m1.className = `step-node ${hs.m1 ? 'active' : ''}`;
-  const m2 = $('#hsM2'); if (m2) m2.className = `step-node ${hs.m2 ? 'active' : ''}`;
-  const m3 = $('#hsM3'); if (m3) m3.className = `step-node ${hs.m3 ? 'active' : ''}`;
-  const m4 = $('#hsM4'); if (m4) m4.className = `step-node ${hs.m4 ? 'active' : ''}`;
-  const pmkid = $('#hsPmkid');
-  if (pmkid) pmkid.innerHTML = hs.pmkid ? '<b style="color:#35c04a">已提取 PMKID</b>' : '未提取';
-  const keyver = $('#hsKeyver');
+  const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+  set('#kmCaptured', k.probesCaptured || 0);
+  set('#kmBaited', k.probesBaited || 0);
+  const m1 = $('#kmM1'); if (m1) m1.className = `step-node ${k.m1 ? 'active' : ''}`;
+  const m2 = $('#kmM2'); if (m2) m2.className = `step-node ${k.m2 ? 'active' : ''}`;
+  const m3 = $('#kmM3'); if (m3) m3.className = `step-node ${k.m3 ? 'active' : ''}`;
+  const m4 = $('#kmM4'); if (m4) m4.className = `step-node ${k.m4 ? 'active' : ''}`;
+  const pmkid = $('#kmPmkid');
+  if (pmkid) pmkid.innerHTML = k.pmkid ? '<b style="color:#35c04a">已提取 PMKID</b>' : '未提取';
+  const keyver = $('#kmKeyver');
   if (keyver) {
-    const kv = hs.keyver || 0;
-    keyver.innerHTML = hs.captured
+    const kv = k.keyver || 0;
+    keyver.innerHTML = k.captured
       ? `<b>keyver ${kv}</b>${kv === 1 ? ' (HMAC-MD5)' : kv === 2 ? ' (HMAC-SHA1)' : ' (PMF, 板载不支持)'}`
       : '--';
   }
-  const frames = $('#hsFrames');
-  if (frames) frames.textContent = String(hs.frames || 0);
-  const btnStart = $('#btnStartHs'); if (btnStart) btnStart.disabled = !!hs.capturing;
-  const btnStop = $('#btnStopHs'); if (btnStop) btnStop.disabled = !hs.capturing;
-  const btnCrack = $('#btnCrack');
-  if (btnCrack) btnCrack.disabled = !!hs.cracking || !hs.captured || !!hs.unsupported;
-  const btnDump = $('#btnDumpHs'); if (btnDump) btnDump.disabled = !hs.captured;
-  const pbar = $('#hsPbar'); if (pbar) pbar.style.width = pct + '%';
-  const ptext = $('#hsPtext'); if (ptext) ptext.textContent = `${hs.progress} / ${hs.total} (${pct}%)`;
-  const result = $('#crackResult');
+  const frames = $('#kmFrames');
+  if (frames) frames.textContent = String(k.frames || 0);
+  const btnStart = $('#btnStartKarma'); if (btnStart) btnStart.disabled = !!k.running;
+  const btnStop = $('#btnStopKarma'); if (btnStop) btnStop.disabled = !k.running;
+  const btnCrack = $('#btnKmCrack');
+  if (btnCrack) btnCrack.disabled = !!k.cracking || !k.captured || !!k.unsupported;
+  const btnDump = $('#btnKmDump'); if (btnDump) btnDump.disabled = !k.captured;
+  const pbar = $('#kmPbar'); if (pbar) pbar.style.width = pct + '%';
+  const ptext = $('#kmPtext'); if (ptext) ptext.textContent = `${k.progress || 0} / ${k.total || 7153} (${pct}%)`;
+
+  const tb = $('#kmProbeBody');
+  if (tb && k.probes) {
+    tb.innerHTML = k.probes.length ? k.probes.map(p => `
+      <tr>
+        <td class="mono small">${fmtUp(Math.floor(p.ts / 1000))}</td>
+        <td class="mono small"><b>${esc(p.mac)}</b></td>
+        <td><b style="color:#d9534f">${esc(p.ssid)}</b></td>
+        <td class="mono">${p.rssi} dBm</td>
+        <td><span class="status-pill run" style="font-size:11px">已自动伪造 AP 劫持</span></td>
+      </tr>`).join('') : `<tr><td colspan="5" style="text-align:center;padding:16px;color:#888">正在监听空中 Probe Request 探针广播 …</td></tr>`;
+  }
+
+  const result = $('#kmCrackResult');
   if (result) {
-    result.innerHTML = hs.crackedPass ? `<div style="background:#b9f0ae;border:var(--bd);border-radius:10px;padding:12px;font-weight:900">🎉 跑包命中! 弱口令: <b style="font-size:18px;color:#d9534f">${esc(hs.crackedPass)}</b><br><small style="color:#333;font-weight:600">该口令命中内置弱口令字典 (PBKDF2 4096 轮 + MIC 校验), 建议立即改为强口令。</small></div>`
-      : (hs.unsupported ? '<span style="font-weight:800;color:#c0392b">该网络使用 802.11w PMF (keyver 3), 板载跑包不支持 — 请点「导出握手材料」交给服务端 /api/wpa/crack 跑</span>'
-      : (hs.cracking ? '<span style="font-weight:800;color:#f39c12">正在逐条派生 PMK 并比对 MIC …</span>'
-      : (hs.captured ? '<span style="color:#888">已捕获 M1+M2, 可启动跑包</span>' : '<span style="color:#888">请先监听并抓到 M1+M2 再跑包</span>')));
+    result.innerHTML = k.crackedPass ? `<div style="background:#b9f0ae;border:var(--bd);border-radius:10px;padding:12px;font-weight:900">🎉 跑包命中! 弱口令: <b style="font-size:18px;color:#d9534f">${esc(k.crackedPass)}</b><br><small style="color:#333;font-weight:600">该口令命中内置弱口令字典 (PBKDF2 4096 轮 + MIC 校验), 建议立即改为强口令。</small></div>`
+      : (k.unsupported ? '<span style="font-weight:800;color:#c0392b">该网络使用 802.11w PMF (keyver 3), 板载跑包不支持 — 请点「导出握手材料」交给服务端 /api/wpa/crack 跑</span>'
+      : (k.cracking ? '<span style="font-weight:800;color:#f39c12">正在逐条派生 PMK 并比对 MIC …</span>'
+      : (k.captured ? '<span style="color:#888">已捕获 M1+M2, 可启动跑包</span>' : '<span style="color:#888">请先监听并抓到 M1+M2 再跑包</span>')));
   }
 }
 
-function renderHandshake() {
-  const hs = state.handshakeStatus || {};
-  const pct = hs.total ? Math.min(100, (hs.progress / hs.total * 100)).toFixed(1) : '0.0';
+function renderKarma() {
+  const k = state.karmaStatus || state.handshakeStatus || {};
+  const pct = k.total ? Math.min(100, (k.progress / k.total * 100)).toFixed(1) : '0.0';
   $('#view').innerHTML = `
   <div class="card">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-      <h3 style="margin:0">⬍ 4-Way Handshake 握手包捕获与跑包</h3>
-      <span class="status-pill ${hs.capturing ? 'run' : 'idle'}" id="hsStatusPill">${hs.capturing ? '● 正在监听' : (hs.captured ? '✓ 握手包已捕获' : '○ 待命')}</span>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:10px">
+      <h3 style="margin:0">↕ Karma 探针诱捕与攻击</h3>
+      <span class="status-pill ${k.running ? 'run' : (k.captured ? 'run' : 'idle')}" id="karmaPill">${k.running ? '● 攻击监听中' : (k.captured ? '✓ 握手包已捕获' : '○ 待命')}</span>
     </div>
-    <p class="note">先在「扫描」页选中目标 AP (跑包需要它的 SSID 作 PBKDF2 盐值)，再点「开始监听」。固件会把 AP 空口对齐到目标信道并打开 promiscuous 只收数据帧，从 LLC 0x888E 的 EAPOL-Key 帧里识别真实的 M1/M2/M3/M4；抓不到时用 Deauther 让客户端重连即可。</p>
+    <p class="note">Karma 攻击监听空中附近移动设备广播发出的 Probe Requests，利用客户端寻找已知 Wi-Fi 的机制自动伪造同名 AP 响应，诱导其免密接入；同时监听 4-Way Handshake 握手包并调用本地弱口令字典跑包破译。</p>
 
-    <div class="step-nodes">
-      <div class="step-node ${hs.m1 ? 'active' : ''}" id="hsM1"><b>M1</b><small>AP ➜ STA (ANonce)</small></div>
-      <div class="step-node ${hs.m2 ? 'active' : ''}" id="hsM2"><b>M2</b><small>STA ➜ AP (SNonce+MIC)</small></div>
-      <div class="step-node ${hs.m3 ? 'active' : ''}" id="hsM3"><b>M3</b><small>AP ➜ STA (GTK+MIC)</small></div>
-      <div class="step-node ${hs.m4 ? 'active' : ''}" id="hsM4"><b>M4</b><small>STA ➜ AP (ACK完成)</small></div>
+    <div class="frow" style="gap:10px;align-items:center;margin:14px 0">
+      <button class="btn green sm" id="btnStartKarma" ${k.running ? 'disabled' : ''}>⚡ 启动 Karma 攻击</button>
+      <button class="btn gray sm" id="btnStopKarma" ${!k.running ? 'disabled' : ''}>⏹ 停止攻击</button>
+      <span class="mono" style="margin-left:auto;font-weight:900">已捕获探针: <b id="kmCaptured">${k.probesCaptured || 0}</b> | 已诱骗: <b style="color:#35c04a" id="kmBaited">${k.probesBaited || 0}</b></span>
     </div>
-    <div class="kv"><span class="k">PMKID 状态</span><span class="v" id="hsPmkid">${hs.pmkid ? '<b style="color:#35c04a">已提取 PMKID</b>' : '未提取'}</span></div>
-    <div class="kv"><span class="k">密钥版本</span><span class="v" id="hsKeyver">${hs.captured ? `<b>keyver ${hs.keyver || 0}</b>${hs.keyver === 1 ? ' (HMAC-MD5)' : hs.keyver === 2 ? ' (HMAC-SHA1)' : ' (PMF, 板载不支持)'}` : '--'}</span></div>
-    <div class="kv"><span class="k">已收 EAPOL-Key 帧</span><span class="v" id="hsFrames">${hs.frames || 0}</span></div>
-    <div class="sub" style="margin-top:16px">
-      <button class="btn green" id="btnStartHs" ${hs.capturing ? 'disabled' : ''}>⚡ 开始监听握手包</button>
-      <button class="btn gray" id="btnStopHs" ${!hs.capturing ? 'disabled' : ''}>⏹ 停止监听</button>
-      <button class="btn gray" id="btnDumpHs" ${!hs.captured ? 'disabled' : ''}>⇩ 导出握手材料</button>
+
+    <div class="sub" style="margin-top:10px">
+      <div class="step-nodes" style="width:100%">
+        <div class="step-node ${k.m1 ? 'active' : ''}" id="kmM1"><b>M1</b><small>ANonce 捕获</small></div>
+        <div class="step-node ${k.m2 ? 'active' : ''}" id="kmM2"><b>M2</b><small>SNonce+MIC 捕获</small></div>
+        <div class="step-node ${k.m3 ? 'active' : ''}" id="kmM3"><b>M3</b><small>GTK 阶段</small></div>
+        <div class="step-node ${k.m4 ? 'active' : ''}" id="kmM4"><b>M4</b><small>握手包完整</small></div>
+      </div>
+    </div>
+    <div class="kv"><span class="k">PMKID 状态</span><span class="v" id="kmPmkid">${k.pmkid ? '<b style="color:#35c04a">已提取 PMKID</b>' : '未提取'}</span></div>
+    <div class="kv"><span class="k">密钥版本</span><span class="v" id="kmKeyver">${k.captured ? `<b>keyver ${k.keyver || 0}</b>${k.keyver === 1 ? ' (HMAC-MD5)' : k.keyver === 2 ? ' (HMAC-SHA1)' : ' (PMF, 板载不支持)'}` : '--'}</span></div>
+    <div class="kv"><span class="k">已收 EAPOL-Key 帧</span><span class="v" id="kmFrames">${k.frames || 0}</span></div>
+  </div>
+
+  <div class="card">
+    <h3>🎯 探针拦截与诱骗日志 (Probe Logs)</h3>
+    <div class="table-wrap" style="max-height:260px;overflow-y:auto">
+      <table>
+        <thead><tr><th>捕获时间</th><th>受害端 MAC</th><th>探测的网络 (SSID)</th><th>信号</th><th>诱骗状态</th></tr></thead>
+        <tbody id="kmProbeBody">
+          <tr><td colspan="5" style="text-align:center;padding:16px;color:#888">点击「启动 Karma 攻击」启动探针监听</td></tr>
+        </tbody>
+      </table>
     </div>
   </div>
 
   <div class="card">
-    <h3>📖 板载弱口令跑包 (内置 7,153 条)</h3>
-    <p class="note">真实离线跑包: 对每条候选口令算 PMK = PBKDF2-HMAC-SHA1(口令, SSID, 4096, 32)，再派生 PTK 并重算 M2 的 MIC (keyver 1 用 HMAC-MD5 / keyver 2 用 HMAC-SHA1)，与捕获帧的 MIC 比对，命中即该网络口令。算法与 aircrack-ng 官方向量一致。</p>
+    <h3>📖 内置 7,153 条弱口令离线跑包破译</h3>
+    <p class="note">对候选口令派生 PMK 并比对 M2 的 MIC (keyver 1 用 HMAC-MD5 / keyver 2 用 HMAC-SHA1)，算法与 aircrack-ng 官方向量一致。</p>
     <div class="pbar-wrap">
-      <div class="pbar-fill" id="hsPbar" style="width:${pct}%"></div>
-      <div class="pbar-text" id="hsPtext">${hs.progress} / ${hs.total} (${pct}%)</div>
+      <div class="pbar-fill" id="kmPbar" style="width:${pct}%"></div>
+      <div class="pbar-text" id="kmPtext">${k.progress || 0} / ${k.total || 7153} (${pct}%)</div>
     </div>
-    <div class="frow" style="justify-content:center;margin-top:10px">
-      <button class="btn yellow" id="btnCrack" ${hs.cracking || !hs.captured || hs.unsupported ? 'disabled' : ''}>⚡ 开始板载跑包</button>
+    <div class="frow" style="justify-content:center;margin-top:10px;gap:12px">
+      <button class="btn yellow" id="btnKmCrack" ${k.cracking || !k.captured || k.unsupported ? 'disabled' : ''}>⚡ 开始板载跑包破译</button>
+      <button class="btn gray" id="btnKmDump" ${!k.captured ? 'disabled' : ''}>⇩ 导出握手材料</button>
     </div>
-    <div id="crackResult" style="margin-top:14px;text-align:center">
-      ${hs.crackedPass ? `<div style="background:#b9f0ae;border:var(--bd);border-radius:10px;padding:12px;font-weight:900">🎉 跑包命中! 弱口令: <b style="font-size:18px;color:#d9534f">${esc(hs.crackedPass)}</b><br><small style="color:#333;font-weight:600">该口令命中内置弱口令字典 (PBKDF2 4096 轮 + MIC 校验), 建议立即改为强口令。</small></div>`
-        : (hs.unsupported ? '<span style="font-weight:800;color:#c0392b">该网络使用 802.11w PMF (keyver 3), 板载跑包不支持 — 请点「导出握手材料」交给服务端 /api/wpa/crack 跑</span>'
-        : (hs.cracking ? '<span style="font-weight:800;color:#f39c12">正在逐条派生 PMK 并比对 MIC …</span>'
-        : (hs.captured ? '<span style="color:#888">已捕获 M1+M2, 可启动跑包</span>' : '<span style="color:#888">请先监听并抓到 M1+M2 再跑包</span>')))}
+    <div id="kmCrackResult" style="margin-top:14px;text-align:center"></div>
+  </div>
+  ${legal()}
+  <div class="logc" id="logc">[SYSTEM] 就绪。</div>`;
+
+  $('#btnStartKarma').onclick = async () => {
+    try {
+      await api('/api/karma/start', { method: 'POST' });
+      toast('Karma 攻击与握手监听已启动');
+      state.karmaStatus.running = true;
+      updateKarmaUI();
+    } catch (e) { toast('启动失败: ' + e.message); }
+  };
+  $('#btnStopKarma').onclick = async () => {
+    try {
+      await api('/api/karma/stop', { method: 'POST' });
+      toast('Karma 攻击已停止');
+      state.karmaStatus.running = false;
+      updateKarmaUI();
+    } catch (e) { toast('停止失败: ' + e.message); }
+  };
+  $('#btnKmCrack').onclick = async () => {
+    try {
+      await api('/api/handshake/crack', { method: 'POST' });
+      toast('板载弱口令跑包已启动');
+      updateKarmaUI();
+    } catch (e) { toast(hsErrMsg(e)); }
+  };
+  $('#btnKmDump').onclick = async () => {
+    try {
+      const d = await api('/api/handshake/dump');
+      const text = JSON.stringify(d);
+      if (navigator.clipboard) await navigator.clipboard.writeText(text);
+      toast('握手材料已复制到剪贴板，可交服务端 /api/wpa/crack 跑包');
+    } catch (e) { toast('导出失败: ' + e.message); }
+  };
+  updateKarmaUI();
+}
+const renderHandshake = renderKarma;
+const updateHandshakeUI = updateKarmaUI;
+
+/* ---------- 6. 捕获的凭据 (Captured Credentials) ---------- */
+function updateCredsUI() {
+  const creds = state.creds || [];
+  const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+  set('#credTotalCount', creds.length);
+  const uniqueMacs = new Set(creds.map(c => c.mac)).size;
+  set('#credClientCount', uniqueMacs);
+  set('#credLatestPass', creds.length ? creds[creds.length - 1].pass : '--');
+  set('#credLatestTime', creds.length ? creds[creds.length - 1].time : '--');
+
+  const tb = $('#credsTableBody');
+  if (tb) {
+    tb.innerHTML = creds.length ? creds.map(c => `
+      <tr>
+        <td class="mono">${c.id}</td>
+        <td><b style="color:#d9534f">${esc(state.info?.evilTwin?.cloneSsid || state.target?.ssid || 'WiFi-AP')}</b></td>
+        <td class="mono small">${esc(c.mac)}</td>
+        <td><b class="mono" style="font-size:16px;background:#111;color:#ffe14d;padding:2px 8px;border-radius:6px">${esc(c.pass)}</b></td>
+        <td>${esc(c.time)}</td>
+        <td>
+          <button class="tbtn" onclick="copyPass('${esc(c.pass)}')">📋 复制</button>
+        </td>
+      </tr>`).join('') : `<tr><td colspan="6" style="text-align:center;padding:24px;color:#888">暂无捕获凭据 (受测端连接克隆热点并在认证门户提交密码后，将在此实时显示)</td></tr>`;
+  }
+}
+
+window.copyPass = async (p) => {
+  if (navigator.clipboard) await navigator.clipboard.writeText(p);
+  toast(`已复制密码: ${p}`);
+};
+
+function renderCreds() {
+  $('#view').innerHTML = `
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:10px">
+      <h3 style="margin:0">🔒 捕获的凭据管理中心</h3>
+      <span class="status-pill run">● 实时监听中</span>
+    </div>
+    <p class="note">展示所有通过「邪恶双子攻击」及 Captive Portal 强制认证门户捕获的客户端无线连接凭据，支持一键复制密码与导出备份。</p>
+
+    <div class="diag" style="margin-top:16px">
+      <div class="dg v"><b id="credTotalCount">0</b><small>已捕获凭据</small></div>
+      <div class="dg o"><b id="credClientCount">0</b><small>独立终端 (MAC)</small></div>
+      <div class="dg y"><b id="credLatestPass">--</b><small>最新捕获密码</small></div>
+      <div class="dg p"><b id="credLatestTime">--</b><small>最近捕获时间</small></div>
+    </div>
+
+    <div class="frow" style="gap:10px;margin-top:16px;justify-content:flex-end;flex-wrap:wrap">
+      <button class="btn yellow sm" id="btnRefreshCreds">↻ 刷新列表</button>
+      <button class="btn pink sm" id="btnCopyAllCreds">📋 复制全部密码</button>
+      <button class="btn purplebg sm" id="btnExportCreds">📥 导出 JSON</button>
+      <button class="btn red sm" id="btnClearAllCreds">🗑️ 清空所有凭据</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>📋 捕获凭据明细记录</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>ID</th><th>仿冒/目标网络 (SSID)</th><th>受害端 IP / MAC</th><th>捕获密码</th><th>捕获时间</th><th>操作</th></tr></thead>
+        <tbody id="credsTableBody">
+          <tr><td colspan="6" style="text-align:center;padding:20px;color:#888">读取凭据列表中…</td></tr>
+        </tbody>
+      </table>
     </div>
   </div>
   ${legal()}
   <div class="logc" id="logc">[SYSTEM] 就绪。</div>`;
 
-  $('#btnStartHs').onclick = async () => {
-    try {
-      await api('/api/handshake/start', { method: 'POST' });
-      toast('握手包监听已启动');
-      state.handshakeStatus.capturing = true;
-      updateHandshakeUI();
-    } catch (e) { toast(hsErrMsg(e)); }
+  $('#btnRefreshCreds').onclick = async () => {
+    await loadCreds();
+    updateCredsUI();
+    toast('已刷新凭据列表');
   };
-  $('#btnStopHs').onclick = async () => {
-    try {
-      await api('/api/handshake/stop', { method: 'POST' });
-      toast('握手包监听已停止');
-      state.handshakeStatus.capturing = false;
-      state.handshakeStatus.cracking = false;
-      updateHandshakeUI();
-    } catch (e) { toast(hsErrMsg(e)); }
+  $('#btnCopyAllCreds').onclick = async () => {
+    if (!state.creds.length) { toast('当前暂无捕获凭据'); return; }
+    const passes = state.creds.map(c => c.pass).join('\n');
+    if (navigator.clipboard) await navigator.clipboard.writeText(passes);
+    toast(`已复制 ${state.creds.length} 条密码到剪贴板`);
   };
-  $('#btnCrack').onclick = async () => {
-    try {
-      await api('/api/handshake/crack', { method: 'POST' });
-      toast('板载弱口令跑包已启动');
-      state.handshakeStatus.cracking = true;
-      updateHandshakeUI();
-    } catch (e) { toast(hsErrMsg(e)); }
+  $('#btnExportCreds').onclick = () => {
+    if (!state.creds.length) { toast('当前暂无捕获凭据'); return; }
+    const blob = new Blob([JSON.stringify(state.creds, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `esp32-credentials-${Date.now()}.json`;
+    a.click();
+    toast('已导出凭据文件');
   };
-  $('#btnDumpHs').onclick = async () => {
+  $('#btnClearAllCreds').onclick = async () => {
+    if (!confirm('确定清空所有捕获的密码凭据？此操作不可恢复。')) return;
     try {
-      const d = await api('/api/handshake/dump');
-      // 材料以 JSON 形式复制到剪贴板, 直接 POST 给服务端 /api/wpa/crack
-      const text = JSON.stringify(d);
-      try {
-        await navigator.clipboard.writeText(text);
-        toast('握手材料已复制到剪贴板, 可 POST 至服务端 /api/wpa/crack');
-      } catch (err) {
-        alert(text);
-      }
-    } catch (e) { toast(hsErrMsg(e)); }
+      await api('/api/eviltwin/creds', { method: 'DELETE' });
+      state.creds = [];
+      updateCredsUI();
+      toast('凭据已全部清空');
+    } catch (e) { toast('清空失败: ' + e.message); }
   };
+
+  loadCreds().then(updateCredsUI);
 }
 
 // 固件错误响应是 {"error":"..."} 形式, 提取可读文案
@@ -966,7 +1497,8 @@ function hsErrMsg(e) {
 /* ---------- 6. 配置 ---------- */
 async function act(url, msg) {
   if (!confirm(msg)) return;
-  await fetch(url, { method: 'POST' });
+  const r = await fetch(url, { method: 'POST', headers: { 'X-Admin-Token': adminToken() } });
+  if (r.status === 401) { showLogin('口令已失效，请重新登录'); return; }
   toast('已发送, 设备将重启');
 }
 function renderCfg() {
@@ -981,6 +1513,12 @@ function renderCfg() {
     <div class="frow"><label>默认密码</label><div class="val">00000000</div></div>
     <div class="frow"><label>工作信道</label><select class="mini" id="cfgCh">
       ${[1,2,3,4,5,6,7,8,9,10,11,12,13].map(c => `<option value="${c}" ${i.channel === c ? 'selected' : ''}>信道 ${c}</option>`).join('')}</select></div>
+    <div class="frow">
+      <label>后台口令</label>
+      <input type="password" id="cfgToken" placeholder="留空则不修改" autocomplete="new-password"
+             style="max-width:220px;margin-right:8px" maxlength="32">
+      <button class="btn sm" id="btnSaveToken">修改口令</button>
+    </div>
     <div class="frow"><label>MAC 地址</label><div class="val" id="cfgMac">--</div></div>
     <div class="frow"><label>固件版本</label><div class="val" id="cfgVer">--</div></div>
     <div class="note">修改信道或 SSID 后会自动保存至 NVS，需点下方「重启设备」生效（会短暂断开已连接客户端）。</div>
@@ -1028,6 +1566,23 @@ function renderCfg() {
       toast('保存失败: ' + e.message);
     }
   };
+
+  $('#btnSaveToken').onclick = async () => {
+    const t = $('#cfgToken').value.trim();
+    if (t.length < 4) { toast('口令至少 4 位'); return; }
+    try {
+      await api('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ adminToken: t })
+      });
+      localStorage.setItem('adminToken', t);
+      $('#cfgToken').value = '';
+      toast('后台口令已更新 (立即生效)');
+    } catch (e) {
+      toast('修改口令失败: ' + e.message);
+    }
+  };
 }
 async function doReboot() { await act('/api/reset', '确定重启设备？'); }
 async function doFactory() { await act('/api/factory-reset', '确定恢复出厂设置？(清除配置并重启)'); }
@@ -1067,18 +1622,39 @@ async function pollModules() {
     }
     // 轮询 双子攻击 状态: 仅更新状态条与统计, 不重建整页
     if (location.hash === '#eviltwin' && state.info) etUpdateLive();
-    // 轮询 握手包 状态: 仅定向更新 DOM, 避免重构整页导致按钮与操作闪烁
-    if (location.hash === '#handshake') {
-      const h = await api('/api/handshake/status');
+    // 轮询 Karma / 握手包 状态: 仅定向更新 DOM, 避免重构整页导致按钮与操作闪烁
+    if (location.hash === '#handshake' || location.hash === '#karma') {
+      const h = await api('/api/karma/status');
       state.handshakeStatus = h;
-      updateHandshakeUI();
+      state.karmaStatus = h;
+      updateKarmaUI();
+    }
+    // 轮询 数据包分析器 状态
+    if (location.hash === '#packet') {
+      const s = await api('/api/sniffer/status');
+      state.snifferStatus = s;
+      updatePacketUI();
+    }
+    // 轮询 Airodump 侦察 状态
+    if (location.hash === '#airodump') {
+      const a = await api('/api/airodump/status');
+      state.airodumpStatus = a;
+      updateAirodumpUI();
+    }
+    // 轮询 捕获的凭据
+    if (location.hash === '#creds') {
+      const c = await api('/api/eviltwin/creds');
+      state.creds = c.credentials || [];
+      updateCredsUI();
     }
   } catch (e) {}
 }
 
 async function pollLog() {
   try {
-    const r = await fetch('/api/log?since=' + state.logId);
+    if (!adminToken()) return;
+    const r = await fetch('/api/log?since=' + state.logId, { headers: { 'X-Admin-Token': adminToken() } });
+    if (r.status === 401) { showLogin('口令已失效，请重新登录'); return; }
     const j = await r.json();
     if (j.entries && j.entries.length) {
       for (const e of j.entries) {
@@ -1090,7 +1666,23 @@ async function pollLog() {
   } catch (e) {}
 }
 
+let booted = false;
 async function boot() {
+  if (booted) return;
+  if (!adminToken()) { showLogin(); return; }
+  try {
+    await fetch('/api/info', { headers: { 'X-Admin-Token': adminToken() } }).then(r => {
+      if (!r.ok) throw new Error(r.status === 401 ? 'unauthorized' : ('HTTP ' + r.status));
+    });
+  } catch (e) {
+    if (String(e.message) === 'unauthorized') {
+      localStorage.removeItem('adminToken');
+      showLogin('口令错误，请重新输入');
+      return;
+    }
+    // 其他网络错误: 继续尝试渲染, 后续轮询会自行恢复
+  }
+  booted = true;
   log('[SYSTEM] 无线网络安全教学与管理后台已连接');
   // 先取一次状态再渲染页面, 否则首屏的目标/双子列表会是空的 (要等 2s 轮询才补上)
   await pollInfo();

@@ -116,7 +116,8 @@ test('固件(契约): Deauther 启动前自动对齐目标信道且停止时恢�
 
 test('固件(契约): 握手包为真实 promiscuous 抓包而非定时器模拟', () => {
   assert.ok(mainCpp.includes('esp_wifi_set_promiscuous(true)'), '必须真正开启混杂模式收包');
-  assert.ok(mainCpp.includes('esp_wifi_set_promiscuous_rx_cb(onEapolFrame)'), '必须注册空口回调');
+  assert.ok(mainCpp.includes('esp_wifi_set_promiscuous_rx_cb(onPromiscuousFrame)'), '必须注册空口回调');
+  assert.ok(mainCpp.includes('handleEapolFrame(f, len)'), '统一回调必须把数据帧交给 EAPOL 解析');
   assert.ok(mainCpp.includes('WIFI_PROMIS_FILTER_MASK_DATA'), 'EAPOL 走数据帧, 过滤必须是 DATA');
   assert.ok(mainCpp.includes('0x88, 0x8E'), '必须按 LLC/SNAP 的 0x888E 定位 EAPOL');
   assert.ok(mainCpp.includes('memcmp(ap, sHandshake.targetBssid, 6)'),

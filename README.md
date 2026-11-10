@@ -33,7 +33,8 @@ sh tools/build-firmware.sh 1.1.0
 烧录成功后：手机/电脑连接热点 `WiFi-xxxx`（密码 `00000000`），
 会自动弹出固件后台（Captive Portal 强制门户）；若未弹窗，手动访问
 `http://192.168.4.1/admin.html`
-（状态总览 / 扫描与嗅探 / 配置；主动攻击类模块依合规要求未启用）。
+（状态总览 / 扫描与嗅探 / 配置；首次登录口令 `esp32admin`，登录后可在「配置」页修改，
+之后所有 `/api/*` 管理接口均需携带 `X-Admin-Token` 请求头）。
 
 ## 功能范围与合规边界
 
@@ -53,6 +54,9 @@ sh tools/build-firmware.sh 1.1.0
 | Evil Twin（邪恶双子） | ✅ 真实实现 | 攻击时把本机热点**真实改名**为与主目标一模一样的 SSID（开放无密码、信道对齐主目标）→ 目标设备免密直连；同时自动对主目标持续注入 Deauth，并对双子目标（通常同路由 5G BSSID）每 2s 跳频连发注入 → 目标两个频段都无法联网；Captive Portal 自动弹钓鱼页，捕获第一条凭据后自动停止干扰，手动停止恢复原热点名/密码/信道 |
 | Deauther（WiFi 杀手） | ✅ 真实实现 | 经 `esp_wifi_80211_tx` 向空口注入真实 Deauthentication 管理帧（0x00c0，广播踢出目标 AP 下全部客户端），带 Reason Code 与帧率/计数遥测。启动时自动把热点切到目标信道（已连受测设备短暂掉线后自动重连），停止时恢复配置信道；C5 raw TX 受限时返回错误码并如实显示 |
 | Handshake / 握手包与跑包 | ✅ 真实实现 | `esp_wifi_set_promiscuous` 真实空口捕获 4-Way Handshake（M1~M4，含 PMKID KDE）；板载用内置 7,153 条弱口令逐条跑包（PMK=PBKDF2-HMAC-SHA1 4096 轮 → PTK → 重算 M2 的 MIC 比对，支持 keyver 1/2）。keyver 3（802.11w PMF）导出后交服务端 `/api/wpa/crack`（SHA256-KDF + AES-CMAC） |
+| 数据包分析器 (Sniffer) | ✅ 真实实现 | 共用 promiscuous 回调抓真实 802.11 管理/控制/数据帧，解析帧类型、源/目的 MAC、SSID、Deauth Reason；支持单信道停驻与 1-13 自动跳频，实时帧率统计 |
+| Airodump 侦察 | ✅ 真实实现 | 从真实空口帧按 MAC 聚合对端（RSSI / 帧数 / 探测过的 SSID），支持 1-13 跳频；与 Evil Twin / Deauth / 握手捕获并行时停驻当前信道，避免破坏射频状态 |
+| Karma 探针诱捕 | ✅ 真实实现 | 监听真实 Probe Request，记录客户端 MAC / 目标 SSID / RSSI；SSID 命中当前克隆热点时标记为「已诱捕」，并复用握手捕获链路同步收集 4-Way Handshake |
 
 **Evil Twin 自 2026-11-10 起为真实实现**（热点真实改名 + 联动 Deauth 双频段压制），
 Deauther 自 2026-11-10 起为真实帧注入，
@@ -183,6 +187,7 @@ esptool `BOOTLOADER_FLASH_OFFSET`）：
 
 > 遥测只镜像**已有只读状态**：不含 Probe Request/Response、802.11 管理帧、
 > EAPOL / 握手材料（M1~M4、PMKID、nonce、MIC）、凭据或任何密码字段。
+> 捕获到的凭据在文本日志中只记录密码长度，明文仅保留在受后台口令保护的凭据表 API 中。
 > 文本日志与 JSON 事件并存，以 `{` 开头即视为 JSON，消费者按行判断即可。
 
 消费端示例（PC 命令行，即插即用）：
