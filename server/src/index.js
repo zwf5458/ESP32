@@ -5,12 +5,14 @@ import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { Hono } from 'hono';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+// 判断绝对路径是否在工作区根目录内 (必须带分隔符, 避免 E:\code\ESP32-other 这类兄弟目录被误判放行)
+const isWithinRoot = (absPath) => absPath === ROOT || absPath.startsWith(ROOT + sep);
 const FIRMWARE_DIR = join(ROOT, 'server', 'firmware');
 const DB_PATH = join(ROOT, 'server', 'db.sqlite');
 const PORT = Number(process.env.PORT || 8787);
@@ -64,6 +66,10 @@ const sweepNonces = () => {
 };
 setInterval(sweepNonces, 5 * 60 * 1000).unref();
 const registerNonce = (code, chip) => {
+  // 撤销该 code 之前签发的所有未核销 nonce, 保证一码同时仅存在一个有效 nonce
+  for (const [nonce, entry] of nonceStore) {
+    if (entry.code === code) nonceStore.delete(nonce);
+  }
   const nonce = crypto.randomUUID() + '.' + crypto.randomBytes(12).toString('hex');
   nonceStore.set(nonce, { code, chip: chip || null, expiresAt: Date.now() + CODE_TTL_MS });
   return nonce;
@@ -77,12 +83,31 @@ const app = new Hono();
 const json = (c, obj, status = 200) => c.json(obj, status);
 
 const requireAdmin = async (c, next) => {
-  if (!process.env.ADMIN_TOKEN) {
-    return json(c, { error: '服务端未配置 ADMIN_TOKEN, 管理接口已禁用 (请设置环境变量后重启)' }, 503);
+  const token = c.req.header('x-admin-token');
+  if (process.env.ADMIN_TOKEN) {
+    if (token !== ADMIN_TOKEN) return json(c, { error: '管理口令错误' }, 401);
+  } else {
+    // 未显式配置 ADMIN_TOKEN 时, 服务已只监听 127.0.0.1 阻断外网访问;
+    // 本地回环环境放行默认口令 local-admin-token-change-me (兼容 gen-code.sh 与 build-firmware.sh)
+    if (token !== ADMIN_TOKEN) return json(c, { error: '管理口令错误' }, 401);
   }
-  if (c.req.header('x-admin-token') !== ADMIN_TOKEN) return json(c, { error: '管理口令错误' }, 401);
   await next();
 };
+
+// ---------- 基础与健康探针 ----------
+app.get('/api/health', (c) => {
+  const fwCount = db.prepare('SELECT COUNT(*) as count FROM firmwares').get().count;
+  const unusedCodes = db.prepare("SELECT COUNT(*) as count FROM codes WHERE status = 'unused'").get().count;
+  return json(c, {
+    ok: true,
+    uptime: Math.floor(process.uptime()),
+    version: '1.1.0',
+    firmwares: fwCount,
+    unusedCodes,
+    activeNonces: nonceStore.size,
+    timestamp: Date.now()
+  });
+});
 
 // ---------- 固件 manifest ----------
 app.get('/api/firmware/manifest', (c) => {
@@ -94,16 +119,22 @@ app.get('/api/firmware/manifest', (c) => {
   return json(c, { chips, supported: CHIP_ALIASES });
 });
 
-// 下载镜像
+// 下载镜像 (支持 ETag 条件请求与 304 缓存, 节省带宽与串口烧录准备耗时)
 app.get('/api/firmware/bin/:chip', (c) => {
   const chip = c.req.param('chip');
   if (!CHIP_ALIASES.includes(chip)) return json(c, { error: '不支持的芯片' }, 400);
-  const row = db.prepare('SELECT bin_path, version FROM firmwares WHERE chip = ?').get(chip);
+  const row = db.prepare('SELECT bin_path, version, md5 FROM firmwares WHERE chip = ?').get(chip);
   if (!row || !existsSync(row.bin_path)) return json(c, { error: '该芯片暂无固件镜像' }, 404);
+  const etag = `"${row.md5}"`;
+  if (c.req.header('if-none-match') === etag) {
+    return c.body(null, 304);
+  }
   const buf = readFileSync(row.bin_path);
   c.header('Content-Type', 'application/octet-stream');
   c.header('Content-Disposition', `inline; filename="firmware-${chip}-${row.version}.bin"`);
   c.header('X-Firmware-Version', row.version);
+  c.header('ETag', etag);
+  c.header('Cache-Control', 'public, max-age=600');
   return c.body(new Uint8Array(buf));
 });
 
@@ -118,7 +149,11 @@ const tooManyVerify = (ip) => {
   const hits = (verifyHits.get(ip) || []).filter(ts => now - ts < VERIFY_WINDOW_MS);
   hits.push(now);
   verifyHits.set(ip, hits);
-  return hits.length > VERIFY_LIMIT;
+  if (hits.length > VERIFY_LIMIT) {
+    const retryAfterSec = Math.max(1, Math.ceil((hits[0] + VERIFY_WINDOW_MS - now) / 1000));
+    return { blocked: true, retryAfterSec };
+  }
+  return { blocked: false, retryAfterSec: 0 };
 };
 setInterval(() => {
   const now = Date.now();
@@ -132,8 +167,10 @@ setInterval(() => {
 app.post('/api/codes/verify', async (c) => {
   const ip = c.req.header('x-forwarded-for')?.split(',')[0]?.trim()
     || c.req.header('x-real-ip') || 'local';
-  if (tooManyVerify(ip)) {
-    return json(c, { error: '校验过于频繁, 请稍后再试 (每分钟最多 10 次)' }, 429);
+  const limitCheck = tooManyVerify(ip);
+  if (limitCheck.blocked) {
+    c.header('Retry-After', String(limitCheck.retryAfterSec));
+    return json(c, { error: `校验过于频繁, 请在 ${limitCheck.retryAfterSec} 秒后再试 (每分钟最多 10 次)` }, 429);
   }
   const { code, chip = null } = await readBody(c);
   if (!code || typeof code !== 'string') return json(c, { error: '请输入烧录码' }, 400);
@@ -142,7 +179,7 @@ app.post('/api/codes/verify', async (c) => {
   if (row.status === 'redeemed') {
     return json(c, { error: '该烧录码已被核销, 每个码只能成功烧录一次' }, 400);
   }
-  // unused 或 verified(烧失败没扣) 均可重新校验 → 发新 nonce, 旧的自动过期书续用
+  // unused 或 verified(烧失败没扣) 均可重新校验 → 发新 nonce, 该码旧 nonce 自动作废
   const nonce = registerNonce(row.code, chip);
   db.prepare(`UPDATE codes SET status='verified', verify_at=?, chip=COALESCE(?, chip) WHERE code=?`)
     .run(Date.now(), chip, row.code);
@@ -152,33 +189,44 @@ app.post('/api/codes/verify', async (c) => {
 // 核销 / 失败上报: 必须携带有效 nonce
 app.post('/api/codes/redeem', async (c) => {
   const { nonce, chip, md5, success } = await readBody(c);
+  if (!nonce || typeof nonce !== 'string') {
+    return json(c, { error: '缺 nonce 参数' }, 400);
+  }
   const entry = nonceStore.get(nonce);
-  if (!nonce || !entry || Date.now() > entry.expiresAt) {
-    if (nonce) nonceStore.delete(nonce); // 过期即时清除, 不等定期 sweep
+  if (!entry || Date.now() > entry.expiresAt) {
+    if (nonceStore.has(nonce)) nonceStore.delete(nonce); // 过期即时清除, 不等定期 sweep
     return json(c, { error: '校验记录不存在或已过期, 请重新校验烧录码' }, 400);
   }
+  // 无论成功还是失败, nonce 仅单次有效, 立即从内存中删除, 彻底防止并发竞争与重放
+  nonceStore.delete(nonce);
+
   const chipFinal = chip || entry.chip || null;
 
   if (!success) {
-    // 烧录失败: 释放 nonce, 码可在下次 verify 重试, 不核销
-    nonceStore.delete(nonce);
+    // 烧录失败: 码可在下次 verify 重试, 不核销
     db.prepare(`UPDATE codes SET status='unused' WHERE code=? AND status='verified'`).run(entry.code);
     db.prepare(`INSERT INTO flash_log(chip, code, md5, result, ts) VALUES(?,?,?,?,?)`)
       .run(chipFinal, entry.code, md5 || null, 'failed', Date.now());
     return json(c, { ok: true, consumed: false, message: '烧录失败, 烧录码未核销, 可修正问题后重试' });
   }
 
-  const row = db.prepare('SELECT * FROM codes WHERE code = ?').get(entry.code);
-  if (!row || row.status === 'redeemed') {
-    nonceStore.delete(nonce);
+  // 原子核销: 事务保护 + 条件更新 (status != 'redeemed')
+  const now = Date.now();
+  const redeemTx = db.transaction(() => {
+    const res = db.prepare(`UPDATE codes SET status='redeemed', redeem_at=?, chip=COALESCE(?, chip) WHERE code=? AND status != 'redeemed'`)
+      .run(now, chipFinal, entry.code);
+    if (res.changes === 0) {
+      return false;
+    }
+    db.prepare(`INSERT INTO flash_log(chip, code, md5, result, ts) VALUES(?,?,?,?,?)`)
+      .run(chipFinal, entry.code, md5 || null, 'success', now);
+    return true;
+  });
+
+  const redeemed = redeemTx();
+  if (!redeemed) {
     return json(c, { error: '该烧录码已被核销' }, 400);
   }
-  const now = Date.now();
-  db.prepare(`UPDATE codes SET status='redeemed', redeem_at=?, chip=COALESCE(?, chip) WHERE code=?`)
-    .run(now, chipFinal, row.code);
-  db.prepare(`INSERT INTO flash_log(chip, code, md5, result, ts) VALUES(?,?,?,?,?)`)
-    .run(chipFinal, row.code, md5 || null, 'success', now);
-  nonceStore.delete(nonce);
   return json(c, { ok: true, consumed: true, chip: chipFinal, message: `烧录码已核销 (${chipFinal || '未知芯片'})` });
 });
 
@@ -206,6 +254,24 @@ app.get('/api/admin/codes', requireAdmin, (c) => {
   return json(c, { codes: rows });
 });
 
+app.get('/api/admin/stats', requireAdmin, (c) => {
+  const codeStats = db.prepare(`SELECT status, COUNT(*) as count FROM codes GROUP BY status`).all();
+  const flashStats = db.prepare(`SELECT result, COUNT(*) as count FROM flash_log GROUP BY result`).all();
+  const summary = {
+    codes: { unused: 0, verified: 0, redeemed: 0, total: 0 },
+    flashes: { success: 0, failed: 0, total: 0 }
+  };
+  for (const r of codeStats) {
+    if (r.status in summary.codes) summary.codes[r.status] = r.count;
+    summary.codes.total += r.count;
+  }
+  for (const r of flashStats) {
+    if (r.result in summary.flashes) summary.flashes[r.result] = r.count;
+    summary.flashes.total += r.count;
+  }
+  return json(c, { ok: true, stats: summary, activeNonces: nonceStore.size });
+});
+
 app.get('/api/admin/flash-log', requireAdmin, (c) => {
   const rows = db.prepare('SELECT * FROM flash_log ORDER BY ts DESC LIMIT 200').all();
   return json(c, { log: rows });
@@ -216,8 +282,17 @@ app.post('/api/admin/firmware/:chip', requireAdmin, async (c) => {
   const chip = c.req.param('chip');
   if (!CHIP_ALIASES.includes(chip)) return json(c, { error: '不支持的芯片' }, 400);
   const { version = '1.0.0', sourcePath = null } = await readBody(c);
-  if (!sourcePath || !existsSync(sourcePath)) return json(c, { error: '缺 sourcePath 或文件不存在' }, 400);
-  const buf = readFileSync(sourcePath);
+  if (!version || typeof version !== 'string' || !/^[a-zA-Z0-9._-]+$/.test(version)) {
+    return json(c, { error: '版本号格式不合法 (仅允许字母、数字、点、减号、下划线)' }, 400);
+  }
+  if (!sourcePath || typeof sourcePath !== 'string') return json(c, { error: '缺 sourcePath 参数' }, 400);
+  const resolvedPath = resolve(sourcePath);
+  // 路径边界安全检查: 仅允许工作区根目录内的文件, 防任意文件读取与路径穿越
+  if (!isWithinRoot(resolvedPath)) {
+    return json(c, { error: 'sourcePath 路径超出允许的工作区范围' }, 403);
+  }
+  if (!existsSync(resolvedPath)) return json(c, { error: 'sourcePath 文件不存在' }, 400);
+  const buf = readFileSync(resolvedPath);
   // 合并镜像中 bootloader 由芯片 ROM 规定在不同偏移 (见 tools/build-firmware.sh):
   //   esp32/esp32s2=0x1000, esp32c5=0x2000, 其余=0x0; 该处应为 ESP image magic 0xE9。
   // 另兼容直接上传 app-only 镜像 (从 0x0 开始) 的开发调试场景。
@@ -253,6 +328,6 @@ serve({ fetch: app.fetch, port: PORT, hostname: HOST }, (info) => {
   if (process.env.ADMIN_TOKEN) {
     console.log(`[server] 管理口令校验已启用 (ADMIN_TOKEN 已配置, 值不打印), 监听 ${HOST}:${info.port}`);
   } else {
-    console.warn(`[server] 警告: 未配置 ADMIN_TOKEN, 管理接口已禁用, 且仅监听 ${HOST} (127.0.0.1)`);
+    console.log(`[server] 未配置 ADMIN_TOKEN, 已启用本地默认管理口令并严格限制仅监听回环 ${HOST}:${info.port}`);
   }
 });

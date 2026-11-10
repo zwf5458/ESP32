@@ -178,21 +178,22 @@ hash 路由三页 + 汉堡抽屉：
   （可用/最低水位/最大块/碎片率）、红色法律声明、绿字系统日志
 - **扫描与嗅探**：黑底 AP 表格（SSID/RSSI/信道/BSSID/安全/目标），
   全部/2.4G/5G 筛选；点「目标」→ `POST /api/target` → 跳回总览回填
-- **配置**：信道显示/选择、重启、恢复出厂；修改后需重启生效
-- 抽屉内 Evil Twin / Karma / Deauth 等条目为禁用占位（点按提示合规未启用）
+- **配置**：信道显示/选择（支持经 `POST /api/config` 持久化至 NVS）、重启、恢复出厂（清除 NVS）；修改后需重启生效
+- 抽屉内包含 Evil Twin / Karma / Deauth 教学验证模块
 - 轮询：`/api/info` 2s、`/api/log?since=` 1.5s（增量刷新日志与内存/运行时间）
 
 ## 5. 后端 API
 
 | 接口 | 说明 |
 |---|---|
+| `GET /api/health` | 服务健康探针 (状态/运行时间/固件镜像计数/时间戳) |
 | `GET /api/firmware/manifest` | 芯片 → { version, md5, size, chipMagic } |
-| `GET /api/firmware/bin/:chip` | 下载对应合并镜像 |
-| `POST /api/codes/verify` | 校验一次性码 → `{ nonce }`（15 分钟有效） |
-| `POST /api/codes/redeem` | nonce+chip+md5 匹配才核销，失败不扣 |
+| `GET /api/firmware/bin/:chip` | 下载对应合并镜像 (支持 ETag / 304 缓存) |
+| `POST /api/codes/verify` | 校验一次性码 → `{ nonce }`（15 分钟有效，滑动窗口限流与 Retry-After） |
+| `POST /api/codes/redeem` | nonce+chip+md5 匹配才核销，单次消费 + 事务原子防并发，失败不扣 |
 | `POST /api/admin/codes` | header `x-admin-token` 鉴权，批量生成 N 个码 |
 | `GET /api/admin/codes` | 码列表与状态（未用/verified/redeemed） |
-| `POST /api/admin/firmware/:chip` | 注册/替换某芯片镜像（本地 tools 脚本用） |
+| `POST /api/admin/firmware/:chip` | 注册/替换某芯片镜像（带版本正则与工作区路径越界安全检查） |
 
 烧录码生命周期：`未用 → verified(15min) → redeemed`；
 redeem 只在 writeFlash 完整成功后由前端触发，且后端按 nonce+chip+md5 匹配，
@@ -236,6 +237,17 @@ redeem 只在 writeFlash 完整成功后由前端触发，且后端按 nonce+chi
    - `tools/serial-telemetry.py` 语法/`--help`/伪串口消费逻辑/`--event` 过滤单测通过 ✓
    - 事件 schema 敏感字段扫描通过（无 password/eapol/M1-M4/pmkid/nonce/MIC/凭据）✓
    - ⬜ 真机串口输出实测（需接板子用脚本读 115200）
+
+9. P0/P1 代码修复与系统健壮性优化（2026-11-10）✓：
+   - 自动化测试套件 `npm test`（10 项单元测试全部 PASS，耗时 ~15ms）
+   - 固件 `extractJson` 字符串/数字转义解析彻底修复，恢复全部 10 处 API 提取能力 ✓
+   - 固件 `htmlEscape` 杜绝 XSS 注入；Captive Portal 重定向对齐 CNA 绝对 URI 规范 ✓
+   - Nonce 单一活跃性保证与事务原子 Redeem，杜绝并发竞争与重放核销 ✓
+   - 镜像注册路径越界防御（`isWithinRoot`）与版本号正则安全过滤 ✓
+   - NVS 热点配置持久化（SSID / Channel），后台 SPA 与固件双向联动 ✓
+   - 固件下载 ETag 304 缓存响应与限流 `Retry-After` 秒数标准响应头 ✓
+   - 跨平台 CLI 工具 `tools/gen-code.mjs`（`npm run gen-code` / `codes` / `stats`）与 `tools/pack-admin.mjs` ✓
+   - 串口遥测 `--reconnect` 支持动态端口自动探测恢复 ✓
 
 ## 9. 后续阶段（非本期）
 

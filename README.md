@@ -13,17 +13,21 @@
 
 ```bash
 # 1. 启动后端（静态资源用绝对路径, 任意 cwd 均可启动）
-node server/src/index.js
+npm start   # 或 node server/src/index.js
 # → 烧录台: http://localhost:8787
 
-# 2. 生成测试烧录码
-sh tools/gen-code.sh 3
+# 2. 生成测试烧录码 (全平台通用)
+npm run gen-code -- 3   # 或 node tools/gen-code.mjs 3
+# 也支持查看列表与统计: npm run codes / npm run stats
 
-# 3. 浏览器 (Chrome/Edge) 打开 http://localhost:8787
+# 3. 运行自动化测试套件
+npm test
+
+# 4. 浏览器 (Chrome/Edge) 打开 http://localhost:8787
 #    选串口 → 输烧录码校验 → 勾条款 → 开始烧录
 
-# 4. 编译固件镜像并注册（环境搭建见下节）
-sh tools/build-firmware.sh 1.0.0
+# 5. 编译固件镜像并注册（环境搭建见下节）
+sh tools/build-firmware.sh 1.1.0
 ```
 
 烧录成功后：手机/电脑连接热点 `WiFi-xxxx`（密码 `00000000`），
@@ -215,6 +219,27 @@ unused ──verify──▶ verified(15min) ──烧录成功/pair nonce──
 - ⬜ 真机烧录 + 热点后台端到端（需要接一块 ESP32/S2/S3/C3/C6 板）
 
 ## 变更记录
+
+### 2026-11-10 代码审查修复 (P0/P1) 与全栈工程级优化 (v1.1.0)
+
+**Fixed (P0 / P1 安全与稳定性修复)**
+- **P0 固件 extractJson 键值解析错误**：修复 key 偏移算错导致的冒号前缀与数字解析为 0 的严重缺陷，所有 10 处 API 参数提取恢复正常。
+- **P0 服务端 Nonce 竞争与重放核销漏洞**：`registerNonce` 强制单一活跃映射；`redeem` 立即消费 Nonce 并通过 SQLite 事务与 `status != 'redeemed'` 条件原子核销，杜绝并发竞争。
+- **P0 本地管理口令回环兼容**：未指定 `ADMIN_TOKEN` 时严格绑定回环 `127.0.0.1` 并放行默认管理口令，避免本地 CLI 工具（`gen-code` / `build-firmware`）报 503 阻断开箱体验。
+- **P1 固件 XSS 漏洞**：钓鱼门户 `sendPortalPage()` 对克隆/目标 SSID 进行 `htmlEscape()` 转义，杜绝 XSS 注入。
+- **P1 Captive Portal 强制跳转**：`captiveRedirect()` 统一采用绝对 URI（`http://192.168.4.1/admin.html` 与 `/portal.html`），严格满足 iOS/macOS CNA 和 Android 的强制门户标准。
+- **P1 镜像注册路径越界防护**：`/api/admin/firmware/:chip` 增加版本号正则白名单与工作区绝对路径边界校验（`isWithinRoot`），防止任意文件读取与路径穿越。
+- **P1 握手包页面 DOM 刷新断连**：解耦后台 SPA 轮询与页面挂载，采用节点内联更新机制，彻底解决每秒重建 DOM 导致按钮无法点击的交互缺陷。
+- **P1 固件 Deauth 与时钟溢出计算**：添加帧率零除防崩溃保护，修复未捕获时跑包耗时算作系统总运行时间的计时漂移。
+
+**Added & Optimized (系统与工程优化)**
+- **跨平台烧录码命令行**：新增纯 Node.js 实现的 `tools/gen-code.mjs`，并在 `package.json` 集成 `npm run gen-code`、`npm run codes`、`npm run stats`，Windows/macOS/Linux 零配置即开即用。
+- **后台页面打包器**：新增 `tools/pack-admin.mjs`，将 `firmware/data/admin.html` 自动压缩（zlib level 9）输出为 `firmware/src/admin_page.h`，集成 `npm run pack-admin`。
+- **NVS 热点配置持久化**：固件与后台管理页面联动，支持在 Web 界面修改热点 SSID 与工作信道（1-13），自动存入 ESP32 NVS（Preferences），恢复出厂设置自动擦除。
+- **服务端健康与统计探针**：增强 `GET /api/health`（提供活跃 Nonce 与可用码指标），新增 `GET /api/admin/stats` 汇总烧录码与刷机历史。
+- **固件下载 ETag 缓存与限流响应**：`/api/firmware/bin/:chip` 支持 304 缓存降低网络开销；验证限流返回标准 `Retry-After` 秒数响应头。
+- **串口遥测动态重连**：`tools/serial-telemetry.py` 的 `--reconnect` 支持动态设备端口重探测，即使断开重插到不同 COM 端口也能自动无缝恢复。
+- **自动化测试套件**：新增 `server/test/index.test.js`，包含 10 项核心安全与逻辑单元测试（`npm test` 自动化验证）。
 
 ### 2026-11-09（四）Serial JSON 遥测（外部设备即插即用）
 

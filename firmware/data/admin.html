@@ -536,6 +536,31 @@ function renderDeauth() {
 }
 
 /* ---------- 5. 握手包与离线字典破解 ---------- */
+function updateHandshakeUI() {
+  const hs = state.handshakeStatus || {};
+  const pct = hs.total ? Math.min(100, (hs.progress / hs.total * 100)).toFixed(1) : '0.0';
+  const pill = $('#hsStatusPill');
+  if (pill) {
+    pill.className = `status-pill ${hs.capturing ? 'run' : 'idle'}`;
+    pill.textContent = hs.capturing ? '● 正在监听' : (hs.m4 ? '✓ 完整已捕获' : '○ 待命');
+  }
+  const m1 = $('#hsM1'); if (m1) m1.className = `step-node ${hs.m1 ? 'active' : ''}`;
+  const m2 = $('#hsM2'); if (m2) m2.className = `step-node ${hs.m2 ? 'active' : ''}`;
+  const m3 = $('#hsM3'); if (m3) m3.className = `step-node ${hs.m3 ? 'active' : ''}`;
+  const m4 = $('#hsM4'); if (m4) m4.className = `step-node ${hs.m4 ? 'active' : ''}`;
+  const pmkid = $('#hsPmkid');
+  if (pmkid) pmkid.innerHTML = hs.pmkid ? '<b style="color:#35c04a">已提取 PMKID</b>' : '未提取';
+  const btnStart = $('#btnStartHs'); if (btnStart) btnStart.disabled = !!hs.capturing;
+  const btnStop = $('#btnStopHs'); if (btnStop) btnStop.disabled = !hs.capturing;
+  const btnCrack = $('#btnCrack'); if (btnCrack) btnCrack.disabled = !!hs.cracking;
+  const pbar = $('#hsPbar'); if (pbar) pbar.style.width = pct + '%';
+  const ptext = $('#hsPtext'); if (ptext) ptext.textContent = `${hs.progress} / ${hs.total} (${pct}%)`;
+  const result = $('#crackResult');
+  if (result) {
+    result.innerHTML = hs.crackedPass ? `<div style="background:#b9f0ae;border:var(--bd);border-radius:10px;padding:12px;font-weight:900">🎉 破解命中! 密码凭据: <b style="font-size:18px;color:#d9534f">${esc(hs.crackedPass)}</b><br><small style="color:#333;font-weight:600">该密码属于常见弱密码字典，建议立即升级为强口令。</small></div>` : (hs.cracking ? '<span style="font-weight:800;color:#f39c12">正在高速比对字典哈希特征 …</span>' : '<span style="color:#888">点击上方按钮启动字典跑包</span>');
+  }
+}
+
 function renderHandshake() {
   const hs = state.handshakeStatus || {};
   const pct = hs.total ? Math.min(100, (hs.progress / hs.total * 100)).toFixed(1) : '0.0';
@@ -543,17 +568,17 @@ function renderHandshake() {
   <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
       <h3 style="margin:0">⬍ 4-Way Handshake 握手包与协议监听</h3>
-      <span class="status-pill ${hs.capturing ? 'run' : 'idle'}">${hs.capturing ? '● 正在监听' : (hs.m4 ? '✓ 完整已捕获' : '○ 待命')}</span>
+      <span class="status-pill ${hs.capturing ? 'run' : 'idle'}" id="hsStatusPill">${hs.capturing ? '● 正在监听' : (hs.m4 ? '✓ 完整已捕获' : '○ 待命')}</span>
     </div>
     <p class="note">展示 WPA/WPA2 四次握手过程中的 ANonce/SNonce/MIC 协商过程，演示如何捕获身份验证特征并进行离线安全性校验。</p>
     
     <div class="step-nodes">
-      <div class="step-node ${hs.m1 ? 'active' : ''}"><b>M1</b><small>AP ➜ STA (ANonce)</small></div>
-      <div class="step-node ${hs.m2 ? 'active' : ''}"><b>M2</b><small>STA ➜ AP (SNonce+MIC)</small></div>
-      <div class="step-node ${hs.m3 ? 'active' : ''}"><b>M3</b><small>AP ➜ STA (GTK+MIC)</small></div>
-      <div class="step-node ${hs.m4 ? 'active' : ''}"><b>M4</b><small>STA ➜ AP (ACK完成)</small></div>
+      <div class="step-node ${hs.m1 ? 'active' : ''}" id="hsM1"><b>M1</b><small>AP ➜ STA (ANonce)</small></div>
+      <div class="step-node ${hs.m2 ? 'active' : ''}" id="hsM2"><b>M2</b><small>STA ➜ AP (SNonce+MIC)</small></div>
+      <div class="step-node ${hs.m3 ? 'active' : ''}" id="hsM3"><b>M3</b><small>AP ➜ STA (GTK+MIC)</small></div>
+      <div class="step-node ${hs.m4 ? 'active' : ''}" id="hsM4"><b>M4</b><small>STA ➜ AP (ACK完成)</small></div>
     </div>
-    <div class="kv"><span class="k">PMKID 状态</span><span class="v">${hs.pmkid ? '<b style="color:#35c04a">已提取 PMKID</b>' : '未提取'}</span></div>
+    <div class="kv"><span class="k">PMKID 状态</span><span class="v" id="hsPmkid">${hs.pmkid ? '<b style="color:#35c04a">已提取 PMKID</b>' : '未提取'}</span></div>
     <div class="sub" style="margin-top:16px">
       <button class="btn green" id="btnStartHs" ${hs.capturing ? 'disabled' : ''}>⚡ 开始监听握手包</button>
       <button class="btn gray" id="btnStopHs" ${!hs.capturing ? 'disabled' : ''}>⏹ 停止监听</button>
@@ -564,8 +589,8 @@ function renderHandshake() {
     <h3>📖 本地内置弱口令字典安全审计 (7,153 条)</h3>
     <p class="note">模拟离线跑包校验。利用常用弱密码字典进行 HMAC-SHA1 校验，演示弱口令被秒级破解的风险。</p>
     <div class="pbar-wrap">
-      <div class="pbar-fill" style="width:${pct}%"></div>
-      <div class="pbar-text">${hs.progress} / ${hs.total} (${pct}%)</div>
+      <div class="pbar-fill" id="hsPbar" style="width:${pct}%"></div>
+      <div class="pbar-text" id="hsPtext">${hs.progress} / ${hs.total} (${pct}%)</div>
     </div>
     <div class="frow" style="justify-content:center;margin-top:10px">
       <button class="btn yellow" id="btnCrack" ${hs.cracking ? 'disabled' : ''}>⚡ 开始弱密码跑包校验</button>
@@ -581,20 +606,20 @@ function renderHandshake() {
     await api('/api/handshake/start', { method: 'POST' });
     toast('握手包监听已启动');
     state.handshakeStatus.capturing = true;
-    renderHandshake();
+    updateHandshakeUI();
   };
   $('#btnStopHs').onclick = async () => {
     await api('/api/handshake/stop', { method: 'POST' });
     toast('握手包监听已停止');
     state.handshakeStatus.capturing = false;
     state.handshakeStatus.cracking = false;
-    renderHandshake();
+    updateHandshakeUI();
   };
   $('#btnCrack').onclick = async () => {
     await api('/api/handshake/crack', { method: 'POST' });
     toast('弱口令字典跑包已启动');
     state.handshakeStatus.cracking = true;
-    renderHandshake();
+    updateHandshakeUI();
   };
 }
 
@@ -608,13 +633,17 @@ function renderCfg() {
   const i = state.info || {};
   $('#view').innerHTML = `
   <div class="card"><h3>接入点设置 (修改需重启生效)</h3>
-    <div class="frow"><label>热点 SSID</label><div class="val" id="cfgSsid">--</div></div>
+    <div class="frow">
+      <label>热点 SSID</label>
+      <input type="text" id="cfgSsid" style="max-width:220px;margin-right:8px" maxlength="32" placeholder="热点名称">
+      <button class="btn sm" id="btnSaveSsid">保存 SSID</button>
+    </div>
     <div class="frow"><label>默认密码</label><div class="val">00000000</div></div>
-    <div class="frow"><label>信道</label><select class="mini" id="cfgCh">
-      ${[1,2,3,4,5,6,7,8,9,10,11,12,13].map(c => `<option ${i.channel === c ? 'selected' : ''}>${c}</option>`).join('')}</select></div>
+    <div class="frow"><label>工作信道</label><select class="mini" id="cfgCh">
+      ${[1,2,3,4,5,6,7,8,9,10,11,12,13].map(c => `<option value="${c}" ${i.channel === c ? 'selected' : ''}>信道 ${c}</option>`).join('')}</select></div>
     <div class="frow"><label>MAC 地址</label><div class="val" id="cfgMac">--</div></div>
     <div class="frow"><label>固件版本</label><div class="val" id="cfgVer">--</div></div>
-    <div class="note">修改信道后需点「重启设备」生效（会短暂断开已连接客户端）。</div>
+    <div class="note">修改信道或 SSID 后会自动保存至 NVS，需点下方「重启设备」生效（会短暂断开已连接客户端）。</div>
   </div>
   <div class="card"><h3>系统操作</h3>
     <div class="frow">
@@ -627,9 +656,38 @@ function renderCfg() {
   <div class="attack-banner"><b>教学合规说明:</b> 本设备的所有功能（扫描、邪恶双子演示、Deauth、握手包跑包）仅设计用于局域网安全教学、协议分析与自检测试，严禁用于未授权网络。</div>
   ${legal()}
   <div class="logc" id="logc">[SYSTEM] 就绪。</div>`;
-  $('#cfgSsid').textContent = i.ssid || '--';
+  $('#cfgSsid').value = i.ssid || '';
   $('#cfgMac').textContent = i.mac || '--';
   $('#cfgVer').textContent = i.version || '--';
+
+  $('#btnSaveSsid').onclick = async () => {
+    const ssid = $('#cfgSsid').value.trim();
+    if (!ssid) { toast('SSID 不能为空'); return; }
+    try {
+      await api('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ssid })
+      });
+      toast(`SSID 已保存为 "${ssid}"，点击「重启设备」后生效`);
+    } catch (e) {
+      toast('保存失败: ' + e.message);
+    }
+  };
+
+  $('#cfgCh').onchange = async () => {
+    const ch = parseInt($('#cfgCh').value);
+    try {
+      await api('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ channel: ch })
+      });
+      toast(`信道已保存为信道 ${ch}，点击「重启设备」后生效`);
+    } catch (e) {
+      toast('保存失败: ' + e.message);
+    }
+  };
 }
 async function doReboot() { await act('/api/reset', '确定重启设备？'); }
 async function doFactory() { await act('/api/factory-reset', '确定恢复出厂设置？(清除配置并重启)'); }
@@ -666,11 +724,11 @@ async function pollModules() {
       if ($('#deCount')) $('#deCount').textContent = d.count;
       if ($('#deStatusVal')) $('#deStatusVal').textContent = d.running ? 'ACTIVE' : 'IDLE';
     }
-    // 轮询 握手包 状态
+    // 轮询 握手包 状态: 仅定向更新 DOM, 避免重构整页导致按钮与操作闪烁
     if (location.hash === '#handshake') {
       const h = await api('/api/handshake/status');
       state.handshakeStatus = h;
-      renderHandshake();
+      updateHandshakeUI();
     }
   } catch (e) {}
 }

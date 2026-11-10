@@ -151,6 +151,10 @@ function chipKeyFromDescription(desc) {
 
 // ---------- 串口连接 ----------
 $('btnChoosePort').onclick = async () => {
+  if (!window.isSecureContext) {
+    alert('Web Serial 需要安全上下文：请通过 http://localhost:8787 或 https 访问本页。');
+    return;
+  }
   if (!('serial' in navigator)) {
     alert('此浏览器不支持 Web Serial。请使用 Chrome / Edge 最新版 (localhost 访问本页)。');
     return;
@@ -165,6 +169,7 @@ $('btnChoosePort').onclick = async () => {
 
 const onSerialGone = () => {
   setStatus(false, '未连接');
+  state.consoleConn = false;
   state.port = state.transport = state.esploader = null;
   $('btnConnect').disabled = false;
   $('btnDisconnect').disabled = true;
@@ -258,6 +263,11 @@ $('flashCode').addEventListener('input', () => {
   state.nonce = null; state.code = null;
   $('btnVerify').disabled = $('flashCode').value.trim().length < 6;
   refreshFlashButton(); checkRedeemHint();
+});
+$('flashCode').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !$('btnVerify').disabled) {
+    $('btnVerify').click();
+  }
 });
 
 function refreshFlashButton() {
@@ -358,7 +368,8 @@ $('btnFlash').onclick = async () => {
       reportProgress: (_fi, written, total) => {
         const pct = 5 + (written / total) * 88;
         const kbs = (written / 1024).toFixed(0) + ' KB';
-        progress(pct, `烧录中 ${(written / total) * 100}% · ${kbs}`);
+        const pctNum = Math.round((written / total) * 100);
+        progress(pct, `烧录中 ${pctNum}% · ${kbs}`);
       },
       calculateMD5Hash: (image) => CryptoJS.MD5(CryptoJS.enc.Latin1.parse(image)).toString(),
     });
@@ -427,6 +438,10 @@ async function startConsole() {
       terminalAppend(typeof value === 'string' ? value : dec.decode(value, { stream: true }));
     }
   } catch { /* port closed */ }
+  finally {
+    state.consoleConn = false;
+    if (hintEl) hintEl.textContent = '控制台就绪 · 115200 输出文本日志 + NDJSON 遥测（以 { 开头的行为 JSON 事件）';
+  }
 }
 
 $('btnResetConsole').onclick = async () => {
@@ -452,7 +467,9 @@ $('btnTheme').onclick = () => {
   $('btnTheme').textContent = dark ? '🌙' : '☀️';
 };
 if (document.documentElement.classList.contains('dark')) $('btnTheme').textContent = '🌙';
-$('btnLang').onclick = () => {}; // 语言切换占位 (当前仅中文)
+$('btnLang').onclick = () => {
+  msg('多语言支持规划中，当前默认提供完整简体中文界面', 'hint');
+};
 
 bootBanner();
 setStatus(false, '未连接');
