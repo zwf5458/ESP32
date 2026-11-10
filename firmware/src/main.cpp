@@ -317,12 +317,12 @@ static HandshakeState sHandshake;
 static bool sHsLoggedM1 = false, sHsLoggedM2 = false, sHsLoggedDone = false;
 
 static String hexBytes(const uint8_t *p, size_t n) {
-  static const char *HEX = "0123456789abcdef";
+  static const char HEXD[] = "0123456789abcdef";
   String out;
   out.reserve((unsigned int)(n * 2));
   for (size_t i = 0; i < n; i++) {
-    out += HEX[(p[i] >> 4) & 0x0F];
-    out += HEX[p[i] & 0x0F];
+    out += HEXD[(p[i] >> 4) & 0x0F];
+    out += HEXD[p[i] & 0x0F];
   }
   return out;
 }
