@@ -1,0 +1,32 @@
+# 行尾与文本属性统一策略
+#
+# 背景: Windows 上 core.autocrlf=true 会把文件检出成 CRLF。shell 脚本一旦带 \r,
+# 在 Git Bash / WSL / Linux CI 里会报 "$'\r': command not found" 而直接失败,
+# 所以脚本类文件强制 LF。所有源文件本身是 UTF-8 (无 BOM), 这里只约束行尾。
+
+* text=auto
+/.gitattributes text eol=lf
+
+# 脚本: 一律 LF, 不随平台变化
+*.sh   text eol=lf
+*.mjs  text eol=lf
+*.js   text eol=lf
+*.py   text eol=lf
+*.cpp  text eol=lf
+*.h    text eol=lf
+*.ini  text eol=lf
+
+# Windows 专用脚本保持 CRLF
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# 二进制: 不做任何文本转换
+*.bin     binary
+*.hex     binary
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.ico     binary
+*.db      binary
+*.sqlite  binary
