@@ -5,22 +5,24 @@ import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { Hono } from 'hono';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
-import { dirname, join, resolve, sep } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
+import {
+  DEFAULT_ADMIN_TOKEN, CODE_TTL_MS, VERIFY_WINDOW_MS, VERIFY_LIMIT, CHIP_ALIASES, VERSION_RE,
+  makeIsWithinRoot, checkAdminToken, makeRegisterNonce, sweepExpired, makeVerifyLimiter,
+  etagResult, redeemCode, summarizeStats,
+} from './logic.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
-// 判断绝对路径是否在工作区根目录内 (必须带分隔符, 避免 E:\code\ESP32-other 这类兄弟目录被误判放行)
-const isWithinRoot = (absPath) => absPath === ROOT || absPath.startsWith(ROOT + sep);
+const isWithinRoot = makeIsWithinRoot(ROOT);
 const FIRMWARE_DIR = join(ROOT, 'server', 'firmware');
 const DB_PATH = join(ROOT, 'server', 'db.sqlite');
 const PORT = Number(process.env.PORT || 8787);
 // 安全策略: ADMIN_TOKEN 未显式配置时仅允许回环地址访问管理接口以外的功能太复杂,
 // 直接采用最简单可靠的方式 — 未配置则只绑定 127.0.0.1, 避免弱口令暴露到内网/公网。
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'local-admin-token-change-me';
 const HOST = process.env.ADMIN_TOKEN ? '0.0.0.0' : '127.0.0.1';
-const CODE_TTL_MS = 15 * 60 * 1000; // verify 后 nonce 有效期
 
 mkdirSync(FIRMWARE_DIR, { recursive: true });
 
@@ -51,29 +53,13 @@ CREATE TABLE IF NOT EXISTS flash_log(
 );
 `);
 
-// ---------- 常量 ----------
-const CHIP_ALIASES = ['esp32', 'esp32s2', 'esp32s3', 'esp32c3', 'esp32c5', 'esp32c6'];
-
 // nonce 内存表: nonce -> { code, chip, expiresAt }
 // 仅 verify 成功时写入; redeem(成功/失败) 时删除。为防止只 verify 不 redeem
 // 导致 Map 无限膨胀, 定期清理过期项 (unref 让计时器不阻止进程退出)。
 const nonceStore = new Map();
-const sweepNonces = () => {
-  const now = Date.now();
-  for (const [nonce, entry] of nonceStore) {
-    if (now > entry.expiresAt) nonceStore.delete(nonce);
-  }
-};
+const sweepNonces = () => sweepExpired(nonceStore);
 setInterval(sweepNonces, 5 * 60 * 1000).unref();
-const registerNonce = (code, chip) => {
-  // 撤销该 code 之前签发的所有未核销 nonce, 保证一码同时仅存在一个有效 nonce
-  for (const [nonce, entry] of nonceStore) {
-    if (entry.code === code) nonceStore.delete(nonce);
-  }
-  const nonce = crypto.randomUUID() + '.' + crypto.randomBytes(12).toString('hex');
-  nonceStore.set(nonce, { code, chip: chip || null, expiresAt: Date.now() + CODE_TTL_MS });
-  return nonce;
-};
+const registerNonce = makeRegisterNonce(nonceStore, CODE_TTL_MS);
 const readBody = async (c) => {
   try { return (await c.req.json()) ?? {}; } catch { return {}; }
 };
@@ -83,14 +69,8 @@ const app = new Hono();
 const json = (c, obj, status = 200) => c.json(obj, status);
 
 const requireAdmin = async (c, next) => {
-  const token = c.req.header('x-admin-token');
-  if (process.env.ADMIN_TOKEN) {
-    if (token !== ADMIN_TOKEN) return json(c, { error: '管理口令错误' }, 401);
-  } else {
-    // 未显式配置 ADMIN_TOKEN 时, 服务已只监听 127.0.0.1 阻断外网访问;
-    // 本地回环环境放行默认口令 local-admin-token-change-me (兼容 gen-code.sh 与 build-firmware.sh)
-    if (token !== ADMIN_TOKEN) return json(c, { error: '管理口令错误' }, 401);
-  }
+  const denial = checkAdminToken(process.env.ADMIN_TOKEN, c.req.header('x-admin-token'));
+  if (denial) return json(c, { error: denial.error }, denial.status);
   await next();
 };
 
@@ -125,8 +105,8 @@ app.get('/api/firmware/bin/:chip', (c) => {
   if (!CHIP_ALIASES.includes(chip)) return json(c, { error: '不支持的芯片' }, 400);
   const row = db.prepare('SELECT bin_path, version, md5 FROM firmwares WHERE chip = ?').get(chip);
   if (!row || !existsSync(row.bin_path)) return json(c, { error: '该芯片暂无固件镜像' }, 404);
-  const etag = `"${row.md5}"`;
-  if (c.req.header('if-none-match') === etag) {
+  const { status, etag } = etagResult(row.md5, c.req.header('if-none-match'));
+  if (status === 304) {
     return c.body(null, 304);
   }
   const buf = readFileSync(row.bin_path);
@@ -142,19 +122,7 @@ app.get('/api/firmware/bin/:chip', (c) => {
 // 轻量滑动窗口限流: 单 IP 每分钟最多 N 次 (防烧录码暴力枚举)
 // 仅内存态, 重启清零; 本地/内网使用足够, 云部署时应放到网关层 + 持久化
 const verifyHits = new Map(); // ip -> [ts, ...]
-const VERIFY_WINDOW_MS = 60 * 1000;
-const VERIFY_LIMIT = 10;
-const tooManyVerify = (ip) => {
-  const now = Date.now();
-  const hits = (verifyHits.get(ip) || []).filter(ts => now - ts < VERIFY_WINDOW_MS);
-  hits.push(now);
-  verifyHits.set(ip, hits);
-  if (hits.length > VERIFY_LIMIT) {
-    const retryAfterSec = Math.max(1, Math.ceil((hits[0] + VERIFY_WINDOW_MS - now) / 1000));
-    return { blocked: true, retryAfterSec };
-  }
-  return { blocked: false, retryAfterSec: 0 };
-};
+const tooManyVerify = makeVerifyLimiter(verifyHits, VERIFY_WINDOW_MS, VERIFY_LIMIT);
 setInterval(() => {
   const now = Date.now();
   for (const [ip, hits] of verifyHits) {
@@ -211,19 +179,7 @@ app.post('/api/codes/redeem', async (c) => {
   }
 
   // 原子核销: 事务保护 + 条件更新 (status != 'redeemed')
-  const now = Date.now();
-  const redeemTx = db.transaction(() => {
-    const res = db.prepare(`UPDATE codes SET status='redeemed', redeem_at=?, chip=COALESCE(?, chip) WHERE code=? AND status != 'redeemed'`)
-      .run(now, chipFinal, entry.code);
-    if (res.changes === 0) {
-      return false;
-    }
-    db.prepare(`INSERT INTO flash_log(chip, code, md5, result, ts) VALUES(?,?,?,?,?)`)
-      .run(chipFinal, entry.code, md5 || null, 'success', now);
-    return true;
-  });
-
-  const redeemed = redeemTx();
+  const redeemed = redeemCode(db, entry.code, chipFinal, md5);
   if (!redeemed) {
     return json(c, { error: '该烧录码已被核销' }, 400);
   }
@@ -254,23 +210,8 @@ app.get('/api/admin/codes', requireAdmin, (c) => {
   return json(c, { codes: rows });
 });
 
-app.get('/api/admin/stats', requireAdmin, (c) => {
-  const codeStats = db.prepare(`SELECT status, COUNT(*) as count FROM codes GROUP BY status`).all();
-  const flashStats = db.prepare(`SELECT result, COUNT(*) as count FROM flash_log GROUP BY result`).all();
-  const summary = {
-    codes: { unused: 0, verified: 0, redeemed: 0, total: 0 },
-    flashes: { success: 0, failed: 0, total: 0 }
-  };
-  for (const r of codeStats) {
-    if (r.status in summary.codes) summary.codes[r.status] = r.count;
-    summary.codes.total += r.count;
-  }
-  for (const r of flashStats) {
-    if (r.result in summary.flashes) summary.flashes[r.result] = r.count;
-    summary.flashes.total += r.count;
-  }
-  return json(c, { ok: true, stats: summary, activeNonces: nonceStore.size });
-});
+app.get('/api/admin/stats', requireAdmin, (c) =>
+  json(c, summarizeStats(db, nonceStore.size)));
 
 app.get('/api/admin/flash-log', requireAdmin, (c) => {
   const rows = db.prepare('SELECT * FROM flash_log ORDER BY ts DESC LIMIT 200').all();
@@ -282,7 +223,7 @@ app.post('/api/admin/firmware/:chip', requireAdmin, async (c) => {
   const chip = c.req.param('chip');
   if (!CHIP_ALIASES.includes(chip)) return json(c, { error: '不支持的芯片' }, 400);
   const { version = '1.0.0', sourcePath = null } = await readBody(c);
-  if (!version || typeof version !== 'string' || !/^[a-zA-Z0-9._-]+$/.test(version)) {
+  if (!version || typeof version !== 'string' || !VERSION_RE.test(version)) {
     return json(c, { error: '版本号格式不合法 (仅允许字母、数字、点、减号、下划线)' }, 400);
   }
   if (!sourcePath || typeof sourcePath !== 'string') return json(c, { error: '缺 sourcePath 参数' }, 400);
