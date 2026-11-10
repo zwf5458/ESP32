@@ -14,7 +14,10 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const FIRMWARE_DIR = join(ROOT, 'server', 'firmware');
 const DB_PATH = join(ROOT, 'server', 'db.sqlite');
 const PORT = Number(process.env.PORT || 8787);
+// 安全策略: ADMIN_TOKEN 未显式配置时仅允许回环地址访问管理接口以外的功能太复杂,
+// 直接采用最简单可靠的方式 — 未配置则只绑定 127.0.0.1, 避免弱口令暴露到内网/公网。
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'local-admin-token-change-me';
+const HOST = process.env.ADMIN_TOKEN ? '0.0.0.0' : '127.0.0.1';
 const CODE_TTL_MS = 15 * 60 * 1000; // verify 后 nonce 有效期
 
 mkdirSync(FIRMWARE_DIR, { recursive: true });
@@ -74,6 +77,9 @@ const app = new Hono();
 const json = (c, obj, status = 200) => c.json(obj, status);
 
 const requireAdmin = async (c, next) => {
+  if (!process.env.ADMIN_TOKEN) {
+    return json(c, { error: '服务端未配置 ADMIN_TOKEN, 管理接口已禁用 (请设置环境变量后重启)' }, 503);
+  }
   if (c.req.header('x-admin-token') !== ADMIN_TOKEN) return json(c, { error: '管理口令错误' }, 401);
   await next();
 };
@@ -241,8 +247,12 @@ app.use('/flasher/*', async (c, next) => { await next(); c.header('Cache-Control
 app.use('/flasher/*', serveStatic({ root: join(ROOT, 'flasher'), rewriteRequestPath: (p) => p.replace(/^\/flasher\/?/, '') || 'index.html' }));
 app.get('/', (c) => c.redirect('/flasher/index.html'));
 
-serve({ fetch: app.fetch, port: PORT }, (info) => {
+serve({ fetch: app.fetch, port: PORT, hostname: HOST }, (info) => {
   console.log(`[server] 烧录台:  http://localhost:${info.port}`);
   console.log(`[server] manifest: http://localhost:${info.port}/api/firmware/manifest`);
-  console.log(`[server] 管理口令校验已启用 (ADMIN_TOKEN 已配置, 值不打印)`);
+  if (process.env.ADMIN_TOKEN) {
+    console.log(`[server] 管理口令校验已启用 (ADMIN_TOKEN 已配置, 值不打印), 监听 ${HOST}:${info.port}`);
+  } else {
+    console.warn(`[server] 警告: 未配置 ADMIN_TOKEN, 管理接口已禁用, 且仅监听 ${HOST} (127.0.0.1)`);
+  }
 });

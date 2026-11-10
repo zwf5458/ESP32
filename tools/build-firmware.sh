@@ -3,12 +3,14 @@
 # 前置: PlatformIO (可用 ~/.venvs/platformio) + 工具链/框架包就位
 #   - 工具链: 已从 espressif/crosstool-NG 本地注入 (tools/install-toolchain.sh)
 #   - 框架包: tools/dl-resume.sh (自动, CDN 断流用断点续传)
-# 用法: tools/build-firmware.sh [版本号]   默认 1.0.0
+# 用法: tools/build-firmware.sh [版本号]   默认 1.1.0
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="${1:-1.0.0}"
+VERSION="${1:-1.1.0}"
 BASE="${BASE:-http://localhost:8787}"
 TOKEN="${ADMIN_TOKEN:-local-admin-token-change-me}"
+# 未配置 ADMIN_TOKEN 时服务端禁用管理接口且只监听 127.0.0.1 (见 server/src/index.js),
+# 因此本地默认 BASE 兼容; 远程部署必须 export ADMIN_TOKEN。
 OUT_DIR="$ROOT/server/firmware"
 # C5 需要 tools/install-c5-libs.sh 注入的本地 c5-libs 包 (espressif32 v8 registry 无此包)
 CHIPS=(esp32 esp32s2 esp32s3 esp32c3 esp32c5 esp32c6)
@@ -21,7 +23,8 @@ command -v pio >/dev/null 2>&1 || { echo "错误: 未安装 PlatformIO (python3.
 
 for CHIP in "${CHIPS[@]}"; do
   echo "=== 编译 env:$CHIP ==="
-  pio run -e "$CHIP" || { echo "[$CHIP] 编译失败, 跳过注册 (该芯片保留旧镜像)"; continue; }
+  pio run -e "$CHIP" --build-flag "-DFW_VERSION=\\\"$VERSION\\\"" \
+    || { echo "[$CHIP] 编译失败, 跳过注册 (该芯片保留旧镜像)"; continue; }
 
   APP_BIN=".pio/build/${CHIP}/firmware.bin"
   BOOTLOADER=".pio/build/${CHIP}/bootloader.bin"
