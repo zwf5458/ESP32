@@ -95,7 +95,7 @@ ESP32/
 | 已连客户端计数 | ✅ 实现 | `softAPgetStationNum()` 只读 |
 | 事件日志 | ✅ 实现 | 64 条环形缓冲，`/api/log?since=` |
 | 内存/运行诊断 | ✅ 实现 | 堆 / PSRAM / 信道 / uptime |
-| Evil Twin（邪恶双子） | ✅ 实现（教学验证） | 克隆 SSID 诱骗 AP + Captive Portal 弹窗，受测设备密码凭据捕获与查看 |
+| Evil Twin（邪恶双子） | ✅ 真实实现 | 攻击时热点真实改名为与主目标一模一样的 SSID（开放无密码、信道对齐 2.4G 主目标）→ 受害设备免密直连；同时自动对主目标持续注入 Deauth，并对双子目标（通常同路由 5G BSSID）每 2s 跳频连发 3 帧注入，使目标双频段都无法联网；Captive Portal 自动弹钓鱼页，捕获首条凭据后自动停止干扰，手动停止恢复原热点名/密码/信道 |
 | Deauth / 取消认证器 | ✅ 真实实现 | 经 `esp_wifi_80211_tx` 真实注入 Deauthentication 管理帧 (0x00c0)，广播踢出目标 AP 全部客户端；启动时经 `esp_wifi_set_channel` 自动对齐目标信道（临时切换、不写 NVS，已连设备短暂掉线后重连），停止时恢复配置信道 |
 | 握手包捕获与跑包 | ✅ 真实实现 | `esp_wifi_set_promiscuous` 真实空口捕获 4-Way Handshake（M1~M4 + PMKID KDE）；板载内置 7,153 条弱口令跑包（PBKDF2-HMAC-SHA1 4096 轮 → PTK → MIC 比对，keyver 1/2）；keyver 3（PMF）导出交服务端 `POST /api/wpa/crack`（SHA256-KDF + AES-CMAC） |
 
@@ -113,7 +113,8 @@ ESP32/
 （此时 Deauther 会返回 TX 错误码并在后台如实标注，不再计数）。
 Deauther 自 2026-11-10 起为**真实空口帧注入**；握手包模块自 2026-11-10 起为
 **真实空口抓包 + 真实离线跑包**（promiscuous 解析 EAPOL-Key 帧，MIC 校验与
-aircrack-ng 官方向量一致）；仅 Evil Twin 凭据捕获为**协议机制演示**。
+aircrack-ng 官方向量一致）；Evil Twin 自 2026-11-10 起为**真实实现**
+（热点真实改名 + 开放认证 + 联动 Deauth 双频段压制 + 真实凭据捕获）。
 UI 与法律声明页应明示「仅限授权教学」。
 
 ## 3.2 视觉规范（Neo-brutalism）
