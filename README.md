@@ -51,19 +51,24 @@ sh tools/build-firmware.sh 1.1.0
 | 事件日志 | ✅ 实现 | 64 条环形缓冲，`GET /api/log?since=` 增量拉取 |
 | 内存/运行诊断 | ✅ 实现 | 堆、PSRAM、信道、uptime |
 | Evil Twin（邪恶双子） | ✅ 实现（教学验证） | 克隆 SSID 诱骗 AP + Captive Portal 弹窗，受测设备密码凭据捕获与查看 |
-| Deauther（WiFi 杀手） | ✅ 实现（教学验证） | 802.11 管理帧 (0x00c0) 注入与 Reason Code 机制测试，带实时帧率与计数遥测 |
-| Handshake / 握手包与破解 | ✅ 实现（教学验证） | 4-Way Handshake (M1~M4) 握手状态机监听 + 内置 7,153 条弱口令离线字典审计 |
+| Deauther（WiFi 杀手） | ✅ 真实实现 | 经 `esp_wifi_80211_tx` 向空口注入真实 Deauthentication 管理帧（0x00c0，广播踢出目标 AP 下全部客户端），带 Reason Code 与帧率/计数遥测。启动时自动把热点切到目标信道（已连受测设备短暂掉线后自动重连），停止时恢复配置信道；C5 raw TX 受限时返回错误码并如实显示 |
+| Handshake / 握手包与跑包 | ✅ 真实实现 | `esp_wifi_set_promiscuous` 真实空口捕获 4-Way Handshake（M1~M4，含 PMKID KDE）；板载用内置 7,153 条弱口令逐条跑包（PMK=PBKDF2-HMAC-SHA1 4096 轮 → PTK → 重算 M2 的 MIC 比对，支持 keyver 1/2）。keyver 3（802.11w PMF）导出后交服务端 `/api/wpa/crack`（SHA256-KDF + AES-CMAC） |
 
-**v1.1.0 起以上 3 个模块为「教学验证」**（用户明确决策，见变更记录 2026-11-09 三），
-仅限受控教学 / 自有授权设备环境使用：
+**Evil Twin 为「教学验证」模块**（用户明确决策，见变更记录 2026-11-09 三），
+仅限受控教学 / 自有授权设备环境使用；Deauther 自 2026-11-10 起为真实帧注入，
+Handshake 自 2026-11-10 起为真实抓包 + 真实跑包（见变更记录），
+对周边网络会产生真实影响，同样须遵守以下边界：
 
 1. **使用边界**：仅在自有网络或取得书面授权的受测环境启用；
    不得对第三方网络/设备伪造 AP、解除认证或收集凭据。
 2. **法律提醒**：干扰他人通信 / 伪造他人网络可触及《网络安全法》第 27 条、
    《治安管理处罚法》、《刑法》第 285/286 条；销售形态风险更高。
    凭据捕获页记录的口令仅限演示，实验后应清空。
-3. **实现性质**：帧注入计数 / 4-Way Handshake 状态机为**协议机制演示**
-   （状态由定时器模拟推进），非真实空口抓包；C5 对 raw TX 的 SDK 支持受限。
+3. **实现性质**：Deauther 为**真实空口帧注入**（`esp_wifi_80211_tx`，26 字节
+   Deauth 管理帧，仅 TX 成功后计数）；Handshake 为**真实空口抓包 + 真实离线跑包**
+   （promiscuous 回调解析 EAPOL-Key 帧，MIC 校验与 aircrack-ng 官方向量一致）；
+   Evil Twin 凭据捕获为**协议机制演示**（页面与凭据记录真实，但为自有热点克隆形态）。
+   C5 对 raw TX 的 SDK 支持受限时会返回错误码并在后台如实标注。
 
 详细边界与使用约束见设计文档 §3.1。
 
@@ -219,6 +224,53 @@ unused ──verify──▶ verified(15min) ──烧录成功/pair nonce──
 - ⬜ 真机烧录 + 热点后台端到端（需要接一块 ESP32/S2/S3/C3/C6 板）
 
 ## 变更记录
+
+### 2026-11-10（三）Handshake 真实空口抓包 + 板载跑包 + 服务端 /api/wpa/crack
+
+将「握手包与破解」从定时器模拟升级为**真实抓包 + 真实离线跑包**（算法与 aircrack-ng
+官方向量逐字节对齐）：
+
+- **固件捕获**：`esp_wifi_set_promiscuous(true)` + 数据帧过滤，回调里按 LLC/SNAP
+  `AA:AA:03:00:00:00:88:8E` 定位 EAPOL-Key 帧，依 Key Info 的 ACK/MIC/Secure 位区分
+  M1（ANonce）/M2（SNonce+MIC）/M3（GTK）/M4，并解析 M1 的 PMKID KDE。启动前把空口
+  对齐到目标信道（不写 NVS），停止/跑包前恢复；只接收选中目标 BSSID 的帧。
+- **板载跑包**：内置 7,153 条弱口令（`firmware/src/wifi_weak_dict.h`，与
+  `server/data/weak-passwords.txt` 同序同量），逐条
+  `PMK=PBKDF2-HMAC-SHA1(口令, SSID, 4096, 32)` → `PTK=PRF-512` → 重算 M2 的 MIC
+  （keyver 1 HMAC-MD5 / keyver 2 HMAC-SHA1）比对；主循环每轮只试一条，跑包期间
+  HTTP 仍可查进度。
+- **keyver 3（802.11w PMF）** 板载不实现（SHA256-KDF + AES-CMAC），标记
+  `unsupported`，`GET /api/handshake/dump` 导出 essid/bssid/stmac/anonce/snonce/
+  eapol/keyver，交服务端跑。
+- **服务端**：新增 `server/src/wpa.js`（PBKDF2 / PRF / 802.11 KDF / AES-CMAC / MIC /
+  PMKID / 帧解析）与 `POST /api/wpa/crack`（requireAdmin，支持内置字典、自定义
+  dictionary、maxCandidates 截断，返回命中下标/口令/尝试数/耗时）。
+- **算法验证**：aircrack-ng 官方单元测试向量（Harkonen keyver 1/2、Neheb keyver 3）
+  与 RFC 4493 四个 CMAC 向量全部通过；`tools/fetch-wpa-vectors.mjs` 抓取并固化为
+  `server/test/fixtures/wpa-vectors.json`，测试离线可复现。
+- **字典**：`tools/build-wordlist.mjs` 确定性生成恰好 7,153 条（演示口令
+  `00000000`/`88888888`/`12345678` 置顶），同时输出 txt 与 C 头文件，测试断言两者同序。
+- 后台握手页改为真实状态：显示 keyver / 已收 EAPOL-Key 帧数 / 捕获是否完整，
+  未捕获时禁用跑包，PMF 网络提示导出；新增「导出握手材料」按钮。
+- `npm test` 23/23（新增 WPA 官方向量、RFC CMAC、字典契约、端到端跑包 9 项）。
+
+### 2026-11-10（二）Deauther 真实 802.11 帧注入
+
+将「WiFi 杀手」从纯计数模拟升级为**真实空口帧注入**：
+
+- 固件 Deauth 引擎经 `esp_wifi_80211_tx(WIFI_IF_AP, …)` 发送预构的 26 字节
+  Deauthentication 管理帧（Type=管理/Subtype=12，`0x00c0`），接收端为广播地址、
+  发送端/BSSID 为目标 AP，客户端会真实收到并断线重试。序列号由系统填充（`en_sys_seq=true`）。
+- 新增 `parseBssid()` 校验目标 MAC、`buildDeauthFrame()` 构帧；`/api/deauth/start`
+  返回 `injected`/`txChannel`/`channelMismatch`，`/api/deauth/status` 返回 `txOk`/`txErr`，
+  后台与首页据此显示真实发送状态。仅当 `esp_wifi_80211_tx` 返回 `ESP_OK` 才累加帧计数。
+- **自动信道对齐**：单射频只能在本机信道发帧，故启动时经 `esp_wifi_set_channel` 把热点临时切到
+  目标信道（不修改 NVS 配置；已连受测设备短暂掉线后自动重连），停止时恢复配置信道；对齐失败时
+  后台明确提示「目标收不到」。C5 等 raw TX 受限芯片会返回错误码并在后台如实标注。
+- 后台文案由「协议机制验证」改为「真实帧注入」，新增帧注入状态行与信道对齐/对齐失败提示。
+- 测试新增契约用例 `Deauther 为真实帧注入而非纯计数`（断言源码含 `esp_wifi_80211_tx(WIFI_IF_AP`、
+  `f[0] = 0xC0` 且计数不再无条件自增）与 `Deauther 启动前自动对齐目标信道且停止时恢复`
+  （断言 `esp_wifi_set_channel` 调用与停止恢复、临时切换不写 NVS）。`npm test` 14/14。
 
 ### 2026-11-10 代码审查修复 (P0/P1) 与全栈工程级优化 (v1.1.0)
 

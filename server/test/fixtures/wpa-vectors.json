@@ -1,0 +1,33 @@
+{
+  "source": "aircrack-ng master: test/cryptounittest/test-calc-mic.c (test-calc-mic), test/unit/test-wpapsk-cmac.c (test-wpapsk-cmac)",
+  "note": "The EAPOL-Key frames carry no 802.11/LLC header: byte 0 is the EAPOL packet type. The MIC field of the frame is zeroed in both vectors, which is exactly what the standard MACs over.",
+  "harkonen": {
+    "description": "WPA 4-way handshake M2. calc_mic() derives the PTK from the PMK and MACs the frame with HMAC-MD5 (key version 1) and HMAC-SHA1 (key version 2); the first 16 bytes of each digest are the expected MIC.",
+    "essid": "Harkonen",
+    "pmk": "6fe857c0b742dfc2da8a1fe8b1b4b4628d9fbbb060826b83cb43b64b13e103e8",
+    "bssid": "00146c7e4080",
+    "stmac": "001346fe320c",
+    "anonce": "225854b0444de3af06d1492b852984f04cf6274c0e3218b8681756864db7a055",
+    "snonce": "59168bc3a5df18d71efb6423f340088dab9e1ba2bbc58659e07b3764b0de8570",
+    "eapol": "0103007502010a0010000000000000000159168bc3a5df18d71efb6423f340088dab9e1ba2bbc58659e07b3764b0de8570000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001630140100000fac040100000fac040100000fac020100",
+    "eapolSize": 121,
+    "expectedPmk": "6fe857c0b742dfc2da8a1fe8b1b4b4628d9fbbb060826b83cb43b64b13e103e8",
+    "expectedPtk": "9a75ef0bde7c209ccae13f54b1b33ea3fa0166166e30811f1baaff8d1c1ac16382a49b50b86088c5cb793b542661a28a64693c72b86673e0a82d48c74768cbf9a1bf86cc30b9d63de8825925ec1f4d3f",
+    "expectedMicV1": "9cc3faa0c685961d8406bb657745135d",
+    "expectedMicV2": "6f0489cf7406acf0ae8fcb32bce57c37"
+  },
+  "neheb": {
+    "description": "WPA2 with 802.11w (key version 3): PBKDF2-HMAC-SHA1 derives the PMK, the 802.11 KDF (HMAC-SHA256) derives a 32-byte KCK, and AES-CMAC over the EAPOL-Key frame with the MIC field zeroed gives the MIC.",
+    "essid": "Neheb",
+    "passphrase": "bo$$password",
+    "bssid": "b0b98a568dea",
+    "stmac": "2cf0a2ddbcd0",
+    "anonce": "0218c7b64ecef40c4f15915fbceb19c8d62608387eb6b986d9599a8bd70dc85d",
+    "snonce": "6467233e730767c33e1df875c3ad0eb58a51ad704a3fae06b818c0c5fcebf3af",
+    "eapol": "0203007502010B001000000000000000036467233E730767C33E1DF875C3AD0EB58A51AD704A3FAE06B818C0C5FCEBF3AF000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001630140100000FAC040100000FAC040100000FAC068C00",
+    "eapolSize": 121,
+    "expectedPmk": "fb57668cd338374412c26208d79aa5c30ce40a110224f3cfb592a8f2e8bf53e8",
+    "expectedPtk": "2c76dc592c3b671bac230f6c9e38a062a0ddc98f4ab4d6129022fc7f45fe9264",
+    "expectedMic": "2e13c40ca1c2e4e2037f99a2da18a46b"
+  }
+}

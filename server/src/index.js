@@ -14,11 +14,13 @@ import {
   makeIsWithinRoot, checkAdminToken, makeRegisterNonce, sweepExpired, makeVerifyLimiter,
   etagResult, redeemCode, summarizeStats,
 } from './logic.js';
+import { crackHandshake, EAPOL_KEY_MIC_OFFSET, MIC_LEN, parseM2 } from './wpa.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const isWithinRoot = makeIsWithinRoot(ROOT);
 const FIRMWARE_DIR = join(ROOT, 'server', 'firmware');
 const DB_PATH = join(ROOT, 'server', 'db.sqlite');
+const WEAK_DICT_PATH = join(ROOT, 'server', 'data', 'weak-passwords.txt');
 const PORT = Number(process.env.PORT || 8787);
 // 安全策略: ADMIN_TOKEN 未显式配置时仅允许回环地址访问管理接口以外的功能太复杂,
 // 直接采用最简单可靠的方式 — 未配置则只绑定 127.0.0.1, 避免弱口令暴露到内网/公网。
@@ -216,6 +218,116 @@ app.get('/api/admin/stats', requireAdmin, (c) =>
 app.get('/api/admin/flash-log', requireAdmin, (c) => {
   const rows = db.prepare('SELECT * FROM flash_log ORDER BY ts DESC LIMIT 200').all();
   return json(c, { log: rows });
+});
+
+// ---------- 握手包跑包 (真实 PBKDF2 + PTK + MIC 校验) ----------
+// 固件负责在空中捕获 M1/M2 (见 firmware/src/main.cpp 的握手捕获), 本接口只做
+// 离线校验: 拿捕获到的 EAPOL-Key 帧 + M1 的 ANonce, 用弱口令字典逐条派生
+// PMK → KCK → MIC, 命中即返回口令与其字典下标。纯本地计算, 不联网不落盘。
+let weakDictCache = null;
+const loadWeakDict = () => {
+  if (!weakDictCache) {
+    weakDictCache = readFileSync(WEAK_DICT_PATH, 'utf-8')
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+  }
+  return weakDictCache;
+};
+
+// 十六进制字段解析: 容忍空格/冒号/短横线分隔, 便于直接粘贴抓包工具的输出
+const parseHexField = (value, expectedLen, label) => {
+  if (typeof value !== 'string') return { error: `${label} 必须是十六进制字符串` };
+  const clean = value.replace(/[\s:-]/g, '');
+  if (!clean || clean.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(clean)) {
+    return { error: `${label} 不是合法的十六进制串` };
+  }
+  const buf = Buffer.from(clean, 'hex');
+  if (expectedLen && buf.length !== expectedLen) {
+    return { error: `${label} 长度应为 ${expectedLen} 字节, 实际 ${buf.length} 字节` };
+  }
+  return { buf };
+};
+
+app.post('/api/wpa/crack', requireAdmin, async (c) => {
+  const body = await readBody(c);
+  const essid = typeof body.essid === 'string' ? body.essid : '';
+  if (!essid || Buffer.byteLength(essid, 'utf8') > 32) {
+    return json(c, { error: 'essid 必填, 且不超过 32 字节' }, 400);
+  }
+  const aa = parseHexField(body.bssid, 6, 'bssid');
+  if (aa.error) return json(c, { error: aa.error }, 400);
+  const spa = parseHexField(body.stmac, 6, 'stmac');
+  if (spa.error) return json(c, { error: spa.error }, 400);
+  const anonce = parseHexField(body.anonce, 32, 'anonce');
+  if (anonce.error) return json(c, { error: anonce.error }, 400);
+  const eapol = parseHexField(body.eapol, 0, 'eapol');
+  if (eapol.error) return json(c, { error: eapol.error }, 400);
+  if (eapol.buf.length < EAPOL_KEY_MIC_OFFSET + MIC_LEN) {
+    return json(c, { error: `eapol 至少 ${EAPOL_KEY_MIC_OFFSET + MIC_LEN} 字节` }, 400);
+  }
+
+  let keyver;
+  if (body.keyver !== undefined && body.keyver !== null) {
+    keyver = Number(body.keyver);
+    if (!Number.isInteger(keyver) || keyver < 1 || keyver > 3) {
+      return json(c, { error: 'keyver 只能是 1 / 2 / 3' }, 400);
+    }
+  }
+
+  let candidates;
+  let source;
+  if (Array.isArray(body.dictionary)) {
+    if (body.dictionary.length === 0) return json(c, { error: 'dictionary 不能为空' }, 400);
+    if (body.dictionary.length > 100000) return json(c, { error: 'dictionary 最多 100000 条' }, 400);
+    candidates = body.dictionary.map((p) => String(p));
+    source = 'request';
+  } else {
+    candidates = loadWeakDict();
+    source = 'builtin';
+  }
+
+  const maxCandidates = Number(body.maxCandidates) > 0 ? Math.floor(Number(body.maxCandidates)) : 0;
+  const parsed = parseM2(eapol.buf);
+
+  const startedAt = process.hrtime.bigint();
+  let result;
+  try {
+    result = crackHandshake({
+      essid,
+      candidates,
+      eapol: eapol.buf,
+      anonce: anonce.buf,
+      aa: aa.buf,
+      spa: spa.buf,
+      keyver,
+      maxCandidates,
+    });
+  } catch (err) {
+    return json(c, { error: `跑包失败: ${err.message}` }, 400);
+  }
+  const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+
+  return json(c, {
+    ok: true,
+    found: result.index >= 0,
+    index: result.index,
+    password: result.candidate,
+    attempts: result.attempts,
+    keyver: result.keyver,
+    source,
+    dictionarySize: candidates.length,
+    durationMs: Math.round(durationMs),
+    frame: {
+      keyver: parsed.keyver,
+      replay: parsed.replay,
+      keyDataLength: parsed.keyDataLength,
+      snonce: parsed.snonce.toString('hex'),
+    },
+    note: result.index >= 0
+      ? '命中: 该网络口令存在于弱口令字典中, 属可被离线暴力破解的弱口令'
+      : '未命中: 口令不在当前字典内 (不代表该网络一定安全)',
+  });
 });
 
 // 注册/替换镜像 (本地 tools 注册用): 二进制直接上传或给 sourcePath
