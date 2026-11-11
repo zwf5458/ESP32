@@ -124,30 +124,34 @@ MD5 与 manifest 不一致时**不要烧录**：重新运行 `sh tools/build-fir
 
 ```powershell
 # Windows（脚本会自动探测的 esptool 也可直接用完整路径）
-python -m esptool --chip esp32 -p COM3 -b 460800 write_flash 0x0 server\firmware\firmware-esp32-1.1.0.bin
+python -m esptool --chip esp32 -p COM3 -b 460800 write-flash 0x0 server\firmware\firmware-esp32-1.1.0.bin
 ```
 
 ```bash
 # macOS
 python3 -m esptool --chip esp32c3 -p /dev/cu.usbserial-0001 -b 460800 \
-  write_flash 0x0 server/firmware/firmware-esp32c3-1.1.0.bin
+  write-flash 0x0 server/firmware/firmware-esp32c3-1.1.0.bin
 
 # Linux
 python3 -m esptool --chip esp32s3 -p /dev/ttyUSB0 -b 460800 \
-  write_flash 0x0 server/firmware/firmware-esp32s3-1.1.0.bin
+  write-flash 0x0 server/firmware/firmware-esp32s3-1.1.0.bin
 ```
 
 说明：
 
+- 以上为 **esptool v5** 写法（子命令用连字符）；**v4 及更早版本**用下划线
+  （`write_flash` / `read_flash` / `erase_flash`），且可加 `--verify` 让写入后回读校验。
+  v5 默认会校验写入结果，但没有 `--verify` 选项。
+- 只装了 PlatformIO、没有 Python esptool 时，可把 `python -m esptool` 换成
+  `%USERPROFILE%\.platformio\packages\tool-esptool\esptool.exe`（macOS/Linux 为
+  `~/.platformio/packages/tool-esptool/esptool`）。
 - `--chip` 可填 `esp32` / `esp32s2` / `esp32s3` / `esp32c3` / `esp32c5` / `esp32c6`。
   `auto` 也可用，但显式指定更稳。
 - **必须从 `0x0` 写整片镜像**，不要写 `0x10000`：bootloader / 分区表 / app 已在镜像内按芯片偏移排好
   （见 README「合并镜像布局与 Bootloader 偏移」）。
-- 460800 失败时可降到 `115200`；成功后可加 `--after hard_reset` 自动复位。
-- Windows 上 PlatformIO 自带的 esptool 通常在
-  `%USERPROFILE%\.platformio\packages\tool-esptool\esptool.exe`。
+- 460800 失败时可降到 `115200`；成功后可加 `--after hard-reset` 自动复位。
 - 需要清空 NVS / 重新生成口令时，可先执行
-  `python -m esptool --chip <chip> -p <port> erase_flash`，再按上面命令写入。
+  `python -m esptool --chip <chip> -p <port> erase-flash`，再按上面命令写入。
 - Linux 串口权限：`sudo usermod -aG dialout $USER`，重新登录后生效。
 
 ---
@@ -165,7 +169,7 @@ python3 -m esptool --chip esp32s3 -p /dev/ttyUSB0 -b 460800 \
 | 烧完没有热点 | 未重新上电 / 板子 Flash 不足 4MB / 镜像芯片不匹配 | 断电重上电；确认 4MB Flash；看 115200 启动日志；按实际芯片重烧 |
 | 后台登录 401 | 口令错误、大小写/空格、已改过口令 | 使用串口首次打印的 12 位口令；确认无多余空格；改过则用新口令 |
 | 输入 `esp32admin` 无效 | 该值是旧版遗留默认值，仅用于升级识别 | 使用串口输出的随机初始口令 |
-| 忘记后台口令 | 口令只存 NVS，无物理重置入口 | 重新烧录整片镜像（或 `erase_flash`）→ 首次启动重新生成口令 |
+| 忘记后台口令 | 口令只存 NVS，无物理重置入口 | 重新烧录整片镜像（或 `erase-flash`）→ 首次启动重新生成口令 |
 | C5 部分功能报错 | C5 对 raw TX 的 SDK 支持受限（实验性） | 属预期行为，后台会显示错误码；刷写与后台本身不受影响 |
 
 ---
@@ -178,3 +182,93 @@ python3 -m esptool --chip esp32s3 -p /dev/ttyUSB0 -b 460800 \
 - 烧录码与设备后台口令是两套独立凭据：前者保护发码/注册，后者保护设备 `/api/*`；
 - 详细构建流程见 [README「快速开始」](../README.md#快速开始本地跑通)，
   API 清单见 [README「设备端 API」](../README.md#设备端-api19216841)。
+
+---
+
+## 5. 附：ESP32-C5N16R8 首刷检查清单
+
+C5N16R8 = **16MB Flash + 8MB PSRAM**，而本工程的 C5 镜像是 **4MB 整片镜像**：
+只使用前 4MB，剩余 12MB 空闲；固件未启用 PSRAM，不会因为 PSRAM 配置导致启动失败。
+C5 目前为实验性支持，建议首刷用命令行，先只读、再备份、最后写入。
+
+### 5.1 先只读，确认板子身份
+
+```powershell
+# esptool v5；v4 用 flash_id / read_mac
+esptool --chip esp32c5 -p COM5 flash-id
+esptool --chip esp32c5 -p COM5 read-mac
+```
+
+确认输出为 `Chip is ESP32-C5`、`Detected flash size: 16MB`。
+若只识别到 4MB，先换线/换口复核，不要急着写。
+
+> 若提示找不到 `esptool`，改用 `python -m esptool`，或使用 PlatformIO 自带的
+> `%USERPROFILE%\.platformio\packages\tool-esptool\esptool.exe`（见 2.2 节）。
+
+> 连接板子标注 **UART** 的 USB 口；固件未启用 USB CDC，只接原生 USB 口可能看不到启动日志。
+> 自动复位失败时：按住 **BOOT** → 点一下 **RST/EN** → 松开 BOOT，再执行命令。
+
+### 5.2 备份整片 16MB Flash（首刷最重要的一步）
+
+```powershell
+# v4 用 read_flash
+esptool --chip esp32c5 -p COM5 -b 460800 read-flash 0x0 0x1000000 c5n16r8-backup.bin
+```
+
+16MB 读取需要几分钟，中途不要拔线。保留这份备份，最坏情况可以整片恢复。
+网页烧录台目前**没有**读回/备份功能，备份必须走命令行。
+
+### 5.3 命令行首刷（460800，先不追求高速）
+
+```powershell
+# v4 用 write_flash；v5 无 --verify 选项
+esptool --chip esp32c5 -p COM5 -b 460800 write-flash 0x0 server\firmware\firmware-esp32c5-1.1.0.bin
+```
+
+- 必须从 `0x0` 写整片，**不要**写 `0x2000` 或 `0x10000`；
+- 保持 4MB 镜像原样，写到 16MB 板子的前 4MB 是安全的；
+- esptool **v5 没有 `--verify` 选项**，需要回读校验时用
+  `verify-flash 0x0 <镜像>`；v4 可在 `write_flash` 后加 `--verify`；
+- 不要加 `--erase-all`，也不要用 `--override-vddsdio` 之类电压覆盖；
+- 稳定后网页烧录台或 921600 都可以用。
+
+### 5.4 看启动日志
+
+```powershell
+# 运行应用；或直接用烧录台「串口控制台」(115200)
+esptool --chip esp32c5 -p COM5 -b 115200 run
+```
+
+重点确认：
+
+- `[wifi] AP 已启动: SSID=WiFi-xxxx ...`
+- `[admin] ===== 首次上电: 后台初始口令 (仅显示这一次) =====`
+- 没有反复出现 `rst:0x...` 重启
+
+### 5.5 启动失败 / 反复重启的恢复
+
+先抓一次完整串口日志，不要反复上电。进入下载模式后：
+
+```powershell
+# 1) 清空 Flash（会丢 NVS/口令）
+esptool --chip esp32c5 -p COM5 erase-flash
+
+# 2) 重刷 4MB 镜像
+esptool --chip esp32c5 -p COM5 -b 460800 write-flash 0x0 server\firmware\firmware-esp32c5-1.1.0.bin
+
+# 或彻底恢复到出厂备份（16MB，耗时较长）
+esptool --chip esp32c5 -p COM5 -b 460800 write-flash 0x0 c5n16r8-backup.bin
+```
+
+> 软件刷写不会永久变砖：即使 bootloader 被写坏，ROM 下载模式仍可通过
+> BOOT + RST 进入并重刷。真正不可逆的是 eFuse 安全启动/Flash 加密被启用，
+> 或硬件损坏；本项目镜像不涉及这两项。
+
+### 5.6 C5N16R8 首刷不要做的事
+
+- 不要把网页烧录台的型号手动改成其他芯片（自动识别优先，防烧错镜像）；
+- 不要往 4MB 镜像上强行套 16MB 分区表 / 改 bootloader 头；要用满 16MB 需重新
+  生成分区表并重建镜像，属于后续优化，不是首刷目标；
+- 不要因为 Deauth / raw TX 报错就判断板子坏：C5 对 raw TX 的 SDK 支持受限，
+  后台会如实显示错误码；
+- 不要用劣质 USB 线或供电不足的 Hub 刷写，写入中断虽可恢复，但会增加排查成本。
