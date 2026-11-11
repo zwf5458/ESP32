@@ -25,6 +25,7 @@ npm test
 
 # 4. 浏览器 (Chrome/Edge) 打开 http://localhost:8787
 #    选串口 → 输烧录码校验 → 勾条款 → 开始烧录
+#    完整刷机步骤 / 命令行 esptool / 常见问题: docs/firmware-flashing.md
 
 # 5. 编译固件镜像并注册（环境搭建见下节；需保持第 1 步的后端在运行）
 sh tools/build-firmware.sh 1.1.0
@@ -194,6 +195,7 @@ tools/              构建与运维脚本
 └── serial-telemetry.py     Serial JSON 遥测 PC 命令行消费端
 
 docs/plans/         设计文档（含固件 API、合规边界、视觉规范）
+docs/firmware-flashing.md  刷固件说明（网页烧录台 + 命令行 esptool + 常见问题）
 ```
 
 ## 合并镜像布局与 Bootloader 偏移（重要）
