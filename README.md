@@ -41,21 +41,24 @@ sh tools/build-firmware.sh 1.1.0
 烧录成功后：手机/电脑连接热点 `WiFi-xxxx`（密码 `00000000`），
 会自动弹出固件后台（Captive Portal 强制门户）；若未弹窗，手动访问
 `http://192.168.4.1/admin.html`
-（状态总览 / 扫描与嗅探 / 配置）。**首次上电时设备会用硬件 TRNG 生成一台一密的随机后台
+（9 页：状态总览 / 扫描与嗅探 / 邪恶双子 / Karma / 取消认证 / 数据包分析器 / Airodump /
+捕获凭据 / 配置）。**首次上电时设备会用硬件 TRNG 生成一台一密的随机后台
 初始口令**，仅在 115200 串口启动日志中打印一次（可用烧录台「串口控制台」查看），不出现在
 网页、NDJSON 遥测或 `/api/log` 里；首次登录会直接落到「配置」页引导修改口令。
 之后所有 `/api/*` 管理接口均需携带 `X-Admin-Token` 请求头。
 
 ## 功能范围与合规边界
 
-本项目固件是「AP 热点 + Web 管理后台」的**合规开发工具**，
-刻意不做成攻击固件（如 ESP32 Marauder / WatchDogsGo 一类形态）。
+本项目固件是面向**自有网络 / 书面授权受测环境**的无线教学验证工具：
+所有模块均需在后台显式启停、状态与计数如实回显，不做隐蔽驻留或规模化攻击形态
+（与 ESP32 Marauder / WatchDogsGo 一类成品攻击固件划清界限）。
 能力矩阵（6 颗芯片行为一致）：
 
 | 模块 | 状态 | 说明 |
 |---|---|---|
 | AP 热点 | ✅ 实现 | SSID `WiFi-xxxx`（MAC 尾 4 位）/ 密码 `00000000` / `192.168.4.1` |
-| Web 后台三页 | ✅ 实现 | 状态总览 / 扫描与嗅探 / 配置（内嵌 SPA） |
+| Web 后台 9 页 | ✅ 实现 | 状态总览 / 扫描与嗅探 / 邪恶双子 / Karma / 取消认证 / 数据包分析器 / Airodump / 捕获凭据 / 配置（内嵌 SPA） |
+| 后台口令鉴权 | ✅ 实现 | 每台设备随机初始口令（仅串口打印一次）；`/api/*` 需 `X-Admin-Token`（或 `?token=`），401 不执行业务逻辑 |
 | Captive Portal | ✅ 实现 | UDP 53 通配解析 + iOS/Android/Windows 探测路径 302 → 连热点自动弹后台 |
 | 周边 AP 扫描 | ✅ 实现 | `WiFi.scanNetworks()` 被动列出 SSID/RSSI/信道/加密方式 |
 | 已连客户端计数 | ✅ 实现 | `softAPgetStationNum()` 只读计数 |
@@ -88,6 +91,28 @@ Handshake 自 2026-11-10 起为真实抓包 + 真实跑包（见变更记录）�
 
 详细边界与使用约束见设计文档 §3.1。
 
+## 设备端 API（`192.168.4.1`）
+
+除强制门户使用的 `POST /api/portal/submit` 外，所有 `/api/*` 均需鉴权：
+请求头 `X-Admin-Token: <后台口令>`（兼容 `?token=<口令>`，方便 curl 调试），
+缺失或错误返回 `401` 且不执行业务逻辑。
+
+| 分组 | 接口 |
+|---|---|
+| 信息 / 配置 | `GET /api/info`、`GET /api/config`、`POST /api/config`、`POST /api/reset`、`POST /api/factory-reset` |
+| 扫描 / 目标 | `GET /api/scan`、`POST /api/target`（`role=primary` 或 `twin`）、`POST /api/twin`、`DELETE /api/twin` |
+| 日志 | `GET /api/log?since=`（64 条环形缓冲增量拉取） |
+| 邪恶双子 | `POST /api/eviltwin/start`、`POST /api/eviltwin/stop`、`GET /api/eviltwin/creds`、`DELETE /api/eviltwin/creds` |
+| 取消认证 | `POST /api/deauth/start`、`POST /api/deauth/stop`、`GET /api/deauth/status` |
+| 握手包 | `POST /api/handshake/start`、`POST /api/handshake/stop`、`POST /api/handshake/crack`、`GET /api/handshake/dump` |
+| 数据包分析器 | `POST /api/sniffer/start`、`POST /api/sniffer/stop`、`GET /api/sniffer/status` |
+| Airodump | `POST /api/airodump/start`、`POST /api/airodump/stop`、`GET /api/airodump/status` |
+| Karma | `POST /api/karma/start`、`POST /api/karma/stop`、`GET /api/karma/status` |
+
+> `/api/info` 已包含 `evilTwin` / `deauth` / `handshake` / `sniffer` / `airodump` / `karma`
+> 等模块状态，不再单独提供 `/api/handshake/status`；`/api/karma/crack` 别名已删除，
+> 统一走 `/api/handshake/crack`。
+
 ## PlatformIO 编译环境搭建
 
 espressif32 v8 平台要求的工具链/框架包从 PIO registry CDN 下载时
@@ -117,39 +142,54 @@ nohup zsh tools/dl-resume.sh framework-arduinoespressif32-4.30312.261024.tar.gz 
 sh tools/install-registry-pkg.sh ~/pio-dl/framework-*.tar.gz ~/pio-dl/tool-*.tar.gz
 
 # 3) 编译 + 合并镜像 + 注册后端
-sh tools/build-firmware.sh 1.0.0
+sh tools/build-firmware.sh 1.1.0
 ```
 
 已验证 6 个 env 全部 SUCCESS：
 `esp32 / esp32s2 / esp32s3 / esp32c3 / esp32c5 / esp32c6`；
 其中 `esp32c5` 由 `tools/install-c5-libs.sh` 注入本地 libs 包实现（实验性支持）。
 
+> **Windows（Git Bash）**：venv 的可执行文件在 `~/.venvs/platformio/Scripts/`，
+> 需把该目录加入 `PATH`（或安装全局 PlatformIO）让 `pio` 可被找到；`tools/build-firmware.sh`
+> 会自动探测 `esptool.exe` 并用 `cygpath -m` 转换路径，无需手工改脚本。
+
 ## 目录结构
 
 ```
 firmware/           PlatformIO 工程（Arduino 框架, espressif32 v8）
 ├── platformio.ini  可编 env: esp32/s2/s3/c3/c5/c6（c5 需本地注入 libs）
-├── src/main.cpp    共享固件逻辑（AP + admin API, 含日志环形缓冲/扫描/目标）
-├── src/admin_page.h     自动生成（勿手改）
-├── data/admin.html      固件后台 SPA（内嵌源文件；zlib deflate 压缩进固件）
-└── tools/embed_admin_page.py  预构建脚本: admin.html → admin_page.h
+├── src/main.cpp    共享固件逻辑（AP + 鉴权 API + 抓包/教学模块 + 日志/扫描/目标）
+├── src/admin_page.h       自动生成（勿手改）
+├── src/wifi_weak_dict.h   内置 7,153 条弱口令（由 build-wordlist.mjs 生成）
+├── data/admin.html        固件后台 SPA（内嵌源文件；zlib deflate 压缩进固件）
+├── tools/embed_admin_page.py   预构建脚本: admin.html → admin_page.h
+└── tools/patch-platformio-c5.py  espressif32 平台的 C5 补丁（幂等可重跑）
 
 flasher/            烧录台纯静态前端（Web Serial + esptool-js 0.5.1）
 ├── index.html      Neo-brutalism 布局（步骤卡 ①~④ + 控制台 + 条款/说明卡）
-├── app.js          Web Serial + esptool-js 流程
+├── app.js          Web Serial + esptool-js 流程（含镜像 MD5/大小校验）
 └── style.css       视觉规范见 docs/plans 设计文档 §3.2
 
 server/             Hono + better-sqlite3 后端（发码/校验/核销/固件分发）
 ├── src/index.js    入口（serveStatic 提供 /flasher/*，必须根目录启动）
+├── src/logic.js    纯逻辑（nonce / 限流 / 口令常量时间比较 / 路径边界）
+├── src/wpa.js      WPA 跑包（PBKDF2 / PRF / KDF / AES-CMAC / MIC / 帧解析）
+├── data/weak-passwords.txt  服务端字典（与固件同序同量）
+├── test/index.test.js       契约测试（38 项）
 └── firmware/       合并镜像 bin（每个芯片一个, manifest 注册处）
 
 tools/              构建与运维脚本
-├── gen-code.sh             生成本地测试烧录码
+├── gen-code.mjs            生成本地测试烧录码（跨平台, npm run gen-code）
+├── gen-code.sh             旧版 shell 发码脚本（保留）
 ├── build-firmware.sh       全 env 编译 → merge-bin → 注册
+├── pack-admin.mjs          admin.html → admin_page.h（zlib level 9）
+├── build-wordlist.mjs      生成 7,153 条字典（txt + C 头文件）
+├── fetch-wpa-vectors.mjs   固化 aircrack-ng 官方向量到测试夹具
 ├── install-toolchain.sh    工具链注入（espressif 官方源）
 ├── install-registry-pkg.sh registry 包安装（含 .piopm 生成）
 ├── dl-resume.sh            registry CDN 断点续传下载
 ├── install-c5-libs.sh      ESP32-C5 libs 本地注入
+├── patch-platformio-c5.py  espressif32 C5 平台补丁
 ├── esp32-c5-devkitc-1.json C5 板级定义副本
 └── serial-telemetry.py     Serial JSON 遥测 PC 命令行消费端
 
@@ -230,8 +270,12 @@ unused ──verify──▶ verified(15min) ──烧录成功/pair nonce──
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `PORT` | 8787 | 后端监听端口 |
-| `ADMIN_TOKEN` | local-admin-token-change-me | 管理接口口令（生成码 / 注册镜像） |
+| `ADMIN_TOKEN` | local-admin-token-change-me | 服务端管理接口口令（生成码 / 注册镜像）；未显式配置时服务端只绑定 `127.0.0.1` |
 | `TRUST_PROXY` | 0（忽略转发头） | 仅在服务部署于可信反向代理之后才置 `1`，此时 `verify` 限流采信 `X-Forwarded-For` 链尾地址；默认只取 TCP 对端 IP，杜绝伪造 XFF 绕过限流 |
+
+> 服务端 `ADMIN_TOKEN` 与设备端后台口令是**两套独立凭据**：前者保护发码/注册等管理接口，
+> 后者由固件首次上电随机生成并存入设备 NVS。另有构建脚本可识别的 `BASE` / `ESPTOOL` /
+> `BUILD_DIR`，见「快速开始」。
 
 ## 已验证（验收清单对照）
 
@@ -241,6 +285,12 @@ unused ──verify──▶ verified(15min) ──烧录成功/pair nonce──
 - ✅ 烧录台 UI：校验通过、错误提示、进度条、控制台渲染正常
 - ✅ 全 6 芯片镜像产出并注册（esp32/s2/s3/c3/c5/c6，C5 经本地 libs 注入支持）
 - ✅ 固件后台 SPA 已内嵌（/api/scan、/api/target、/api/log、扩展 /api/info 编译通过）
+- ✅ 2026-11-11 全量重建 6 芯片 v1.1.0 镜像并注册（4MB / 逐芯片），DB `md5`/`size`
+  与磁盘逐字节一致；镜像内嵌 `admin.html` 解压后与源文件逐字节相同
+- ✅ 后台鉴权回归：未带口令的 `/api/*` 返回 401，随机初始口令仅串口输出一次，
+  旧版 `esp32admin` 升级后自动轮换
+- ✅ 抓包模块回归：Sniffer / Airodump / Karma 共用 promiscuous 回调抓真实帧，
+  握手状态并入 `/api/info`，冗余路由不再注册
 - ⬜ 真机烧录 + 热点后台端到端（需要接一块 ESP32/S2/S3/C3/C6 板）
 
 ## 变更记录
@@ -257,6 +307,20 @@ unused ──verify──▶ verified(15min) ──烧录成功/pair nonce──
 - **服务端**：`verify` 限流默认只采信 TCP 对端 IP（只有 `TRUST_PROXY=1` 才认可信代理的
   XFF 链尾），杜绝伪造 XFF 绕过限流；`checkAdminToken` 改用定长 SHA-256 摘要 +
   `timingSafeEqual`；修正注册接口「支持二进制直传」的注释漂移。
+- **三块抓包模块真实化**：Sniffer / Airodump / Karma 共用同一个 promiscuous 回调抓真实
+  802.11 帧（替换此前的 `rand()` 模拟计数）；Karma 监听真实 Probe Request 并复用握手
+  捕获链路；修复 Karma 启停双响应。
+- **后台收尾**：邪恶双子页新增「克隆 SSID」输入框（留空跟随目标 SSID，攻击中禁用，草稿
+  跨页面重建保留）；首次登录若仍是初始口令，面板顶部提示并直达改密；`/api/info` 的
+  `handshake` 字段统一承载握手状态。
+- **接口清理**：删除 `/api/handshake/status` 与 `/api/karma/crack`，握手/模块状态并入
+  `/api/info`，跑包统一走 `/api/handshake/crack`；契约测试补「不得回退」断言。
+- **构建链路**：`build-firmware.sh` 改为经 `PLATFORMIO_BUILD_FLAGS` 注入版本宏（PlatformIO
+  6.2 无 `--build-flag`）、自动探测 esptool、Git Bash 路径经 `cygpath -m` 转换、增加
+  `/api/health` 预检与独立 `firmware/.pio/build-release` 目录；本次据此全量重建 6 芯片
+  v1.1.0 镜像并重新注册。
+- **测试**：`npm test` 38/38 通过（覆盖鉴权、限流、路径边界、WPA 官方向量、字典契约、
+  三模块真实抓包与冗余路由回归）。
 
 ### 2026-11-10（四）Evil Twin 真实化：同名克隆热点 + 主/双子目标 + 双频段压制
 
@@ -406,6 +470,7 @@ EAPOL/握手材料（M1~M4、PMKID、nonce、MIC）、凭据或密码字段。
 - 烧录台「开发板型号」下拉支持手动预选（自动识别仍优先，防选错芯片烧错镜像）
 - **功能范围与合规边界章节**（README + 设计文档 §3.1）：能力矩阵表 +
   不做主动攻击模块的三点依据（法律/产品定位/技术），与外部攻击固件形态划清界限
+  （注：2026-11-09 初版定位；v1.1.0 起改为「授权教学验证」模块，见后续变更记录）
 - 编译工具链三件套：`tools/install-toolchain.sh`、`tools/dl-resume.sh`、
   `tools/install-registry-pkg.sh`
 
