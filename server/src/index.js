@@ -3,6 +3,7 @@
 // 运行: node server/src/index.js   (静态资源用绝对路径, 任意 cwd 均可)
 import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
+import { getConnInfo } from '@hono/node-server/conninfo';
 import { Hono } from 'hono';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -11,7 +12,7 @@ import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
 import {
   DEFAULT_ADMIN_TOKEN, CODE_TTL_MS, VERIFY_WINDOW_MS, VERIFY_LIMIT, CHIP_ALIASES, VERSION_RE,
-  makeIsWithinRoot, checkAdminToken, makeRegisterNonce, sweepExpired, makeVerifyLimiter,
+  makeIsWithinRoot, checkAdminToken, resolveClientIp, makeRegisterNonce, sweepExpired, makeVerifyLimiter,
   etagResult, redeemCode, summarizeStats,
 } from './logic.js';
 import { crackHandshake, EAPOL_KEY_MIC_OFFSET, MIC_LEN, parseM2 } from './wpa.js';
@@ -25,6 +26,8 @@ const PORT = Number(process.env.PORT || 8787);
 // 安全策略: ADMIN_TOKEN 未显式配置时仅允许回环地址访问管理接口以外的功能太复杂,
 // 直接采用最简单可靠的方式 — 未配置则只绑定 127.0.0.1, 避免弱口令暴露到内网/公网。
 const HOST = process.env.ADMIN_TOKEN ? '0.0.0.0' : '127.0.0.1';
+// 仅在确实位于可信反向代理之后时才置 1; 直连/内网部署保持默认, 杜绝 XFF 伪造绕过限流
+const TRUST_PROXY = process.env.TRUST_PROXY === '1';
 
 mkdirSync(FIRMWARE_DIR, { recursive: true });
 
@@ -64,6 +67,16 @@ setInterval(sweepNonces, 5 * 60 * 1000).unref();
 const registerNonce = makeRegisterNonce(nonceStore, CODE_TTL_MS);
 const readBody = async (c) => {
   try { return (await c.req.json()) ?? {}; } catch { return {}; }
+};
+// 限流客户端标识: 取 TCP 对端地址 (不可伪造); 无 socket 上下文时安全降级为 local
+const clientIp = (c) => {
+  let remoteAddress = '';
+  try { remoteAddress = getConnInfo(c)?.remote?.address || ''; } catch { /* 非 node-server 上下文 */ }
+  return resolveClientIp({
+    forwardedFor: c.req.header('x-forwarded-for'),
+    realIp: c.req.header('x-real-ip'),
+    remoteAddress,
+  }, TRUST_PROXY);
 };
 
 // ---------- App ----------
@@ -135,8 +148,7 @@ setInterval(() => {
 
 // 校验: 一次性码 → 发一次性 nonce (烧录成功核销, 失败不扣)
 app.post('/api/codes/verify', async (c) => {
-  const ip = c.req.header('x-forwarded-for')?.split(',')[0]?.trim()
-    || c.req.header('x-real-ip') || 'local';
+  const ip = clientIp(c);
   const limitCheck = tooManyVerify(ip);
   if (limitCheck.blocked) {
     c.header('Retry-After', String(limitCheck.retryAfterSec));
@@ -330,7 +342,7 @@ app.post('/api/wpa/crack', requireAdmin, async (c) => {
   });
 });
 
-// 注册/替换镜像 (本地 tools 注册用): 二进制直接上传或给 sourcePath
+// 注册/替换镜像 (本地 tools 注册用): 从工作区内的 sourcePath 读取镜像文件 (不支持二进制直传)
 app.post('/api/admin/firmware/:chip', requireAdmin, async (c) => {
   const chip = c.req.param('chip');
   if (!CHIP_ALIASES.includes(chip)) return json(c, { error: '不支持的芯片' }, 400);
@@ -348,7 +360,7 @@ app.post('/api/admin/firmware/:chip', requireAdmin, async (c) => {
   const buf = readFileSync(resolvedPath);
   // 合并镜像中 bootloader 由芯片 ROM 规定在不同偏移 (见 tools/build-firmware.sh):
   //   esp32/esp32s2=0x1000, esp32c5=0x2000, 其余=0x0; 该处应为 ESP image magic 0xE9。
-  // 另兼容直接上传 app-only 镜像 (从 0x0 开始) 的开发调试场景。
+  // 另兼容 app-only 镜像 (从 0x0 开始) 的开发调试场景。
   const BOOTLOADER_OFFSET = { esp32: 0x1000, esp32s2: 0x1000, esp32c5: 0x2000 };
   const expected = BOOTLOADER_OFFSET[chip] ?? 0x0;
   const hasMagic = (buf.length > expected && buf[expected] === 0xE9)

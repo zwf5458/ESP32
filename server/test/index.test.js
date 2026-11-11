@@ -11,10 +11,11 @@ import test from 'node:test';
 import Database from 'better-sqlite3';
 import { resolve, join } from 'node:path';
 import { readFileSync } from 'node:fs';
+import { inflateSync, inflateRawSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import {
   DEFAULT_ADMIN_TOKEN, CODE_TTL_MS, VERIFY_WINDOW_MS, VERIFY_LIMIT, VERSION_RE,
-  makeIsWithinRoot, checkAdminToken, makeRegisterNonce, sweepExpired, makeVerifyLimiter,
+  makeIsWithinRoot, checkAdminToken, resolveClientIp, makeRegisterNonce, sweepExpired, makeVerifyLimiter,
   etagResult, redeemCode, summarizeStats, parseChannel, validateSsid,
 } from '../src/logic.js';
 import {
@@ -429,5 +430,119 @@ test('WPA(契约): 用内置字典跑通端到端 (演示密码命中)', () => {
     assert.equal(dict[result.index], demo);
     assert.equal(result.attempts, result.index + 1);
   }
+});
+
+// ---------------- 5. 本轮修复: 安全加固 / 工程闭环 ----------------
+test('P1: 限流客户端 IP 默认不可被 XFF 伪造 (真实 resolveClientIp)', () => {
+  const headers = {
+    forwardedFor: '9.9.9.9, 8.8.8.8',
+    realIp: '7.7.7.7',
+    remoteAddress: '::ffff:127.0.0.1',
+  };
+  assert.equal(resolveClientIp(headers), '::ffff:127.0.0.1', '默认必须忽略所有转发头');
+  assert.equal(resolveClientIp(headers, true), '8.8.8.8',
+    '可信代理模式取链尾, 而非客户端可伪造的链首');
+  assert.equal(resolveClientIp({ realIp: '7.7.7.7', remoteAddress: '10.0.0.1' }, true), '7.7.7.7');
+  assert.equal(resolveClientIp({ forwardedFor: '', remoteAddress: '' }, true), 'local');
+  assert.equal(resolveClientIp(), 'local');
+});
+
+test('P1: 管理口令为常量时间比较且空值被拒 (真实 checkAdminToken)', () => {
+  assert.equal(checkAdminToken('s3cret', 's3cret'), null);
+  for (const bad of [undefined, null, '', 's3cre', 's3creT', DEFAULT_ADMIN_TOKEN]) {
+    assert.equal(checkAdminToken('s3cret', bad)?.status, 401);
+  }
+  assert.equal(checkAdminToken(undefined, DEFAULT_ADMIN_TOKEN), null);
+  const logicJs = readFileSync(join(ROOT, 'server', 'src', 'logic.js'), 'utf-8');
+  assert.ok(logicJs.includes('crypto.timingSafeEqual('), '必须使用定长摘要的常量时间比较');
+  assert.ok(!logicJs.includes('headerToken !== expected'), '不得回退为普通字符串比较');
+});
+
+test('固件(契约): 后台初始口令一机一密且不经遥测', () => {
+  assert.ok(mainCpp.includes('#include "esp_random.h"'), '必须使用硬件 TRNG');
+  assert.ok(mainCpp.includes('makeRandomAdminToken()'), '初始口令必须随机生成');
+  assert.ok(mainCpp.includes('sPrefs.putString("adminToken", sAdminToken)'), '必须持久化到 NVS');
+  assert.ok(mainCpp.includes('sPrefs.putBool("tokenChanged", true)'), '改密后必须标记已修改');
+  assert.ok(mainCpp.includes('mustChangeToken'), '/api/info 必须暴露首次改密标志');
+  assert.ok(mainCpp.includes('tokenEquals('), '口令比较必须走常量时间实现');
+  assert.ok(!mainCpp.includes('ADMIN_TOKEN_DEFAULT'), '不得再使用全局静态默认口令');
+  assert.ok(!/log\([^\n]*出厂默认口令/.test(mainCpp), '不得把初始口令写进 log()/遥测');
+  assert.ok(mainCpp.includes('Serial.println("[admin]   " + sAdminToken)'),
+    '初始口令只经物理串口直出一次');
+});
+
+test('服务端(契约): verify 限流不直接采信 XFF, 注册注释与实现一致', () => {
+  const indexJs = readFileSync(join(ROOT, 'server', 'src', 'index.js'), 'utf-8');
+  assert.ok(indexJs.includes('const ip = clientIp(c);'));
+  assert.ok(indexJs.includes('getConnInfo(c)?.remote?.address'), '必须取 TCP 对端地址');
+  assert.ok(!indexJs.includes("const ip = c.req.header('x-forwarded-for')"), '不得回退为直读 XFF');
+  assert.ok(!indexJs.includes('二进制直接上传'), '注册接口注释不得声称支持二进制直传');
+});
+
+test('后台(契约): 一次导航只渲染一次且首次登录引导改密', () => {
+  const html = readFileSync(join(ROOT, 'firmware', 'data', 'admin.html'), 'utf-8');
+  assert.ok(html.includes('let lastRoutedPage'), '必须有路由去重状态');
+  assert.ok(html.includes('if (p === lastRoutedPage) return;'), 'hashchange 必须跳过 go() 自己触发的那次');
+  assert.ok(html.includes("mustChangeToken ? 'cfg'"), '首次登录必须落到配置页');
+  assert.ok(html.includes('id="tokenNotice"'), '配置页必须有改密提示条');
+});
+
+test('烧录台(契约): 下载镜像后校验 manifest md5 / size', () => {
+  const appJs = readFileSync(join(ROOT, 'flasher', 'app.js'), 'utf-8');
+  assert.ok(appJs.includes('CryptoJS.MD5(CryptoJS.enc.Latin1.parse(bstr))'), '必须算下载镜像的 MD5');
+  assert.ok(appJs.includes('if (actual !== expected)'), '必须与 manifest.md5 比对');
+  assert.ok(appJs.includes('镜像 MD5 不一致'), '不一致必须抛错阻止烧录');
+  assert.ok(appJs.includes('u8.length !== fw.size'), '必须同时校验镜像大小');
+  assert.ok(appJs.includes('const bstr = state.binStr;'), 'writeFlash 复用同一份 latin1 串');
+});
+
+test('工程闭环(契约): admin_page.h 内嵌页与 admin.html 完全同步', () => {
+  const html = readFileSync(join(ROOT, 'firmware', 'data', 'admin.html'));
+  const header = readFileSync(join(ROOT, 'firmware', 'src', 'admin_page.h'), 'utf-8');
+  const lenMatch = header.match(/ADMIN_PAGE_LEN\s*=\s*(\d+)/);
+  assert.ok(lenMatch, '头文件必须声明 ADMIN_PAGE_LEN');
+  const bytes = [...header.matchAll(/0x([0-9A-Fa-f]{2})/g)].map((m) => parseInt(m[1], 16));
+  assert.equal(bytes.length, Number(lenMatch[1]), '压缩字节数必须与声明长度一致');
+  const blob = Buffer.from(bytes);
+  let inflated;
+  try { inflated = inflateSync(blob); }       // PlatformIO pre 脚本 (Python zlib.compress)
+  catch { inflated = inflateRawSync(blob); }  // 兼容 node tools/pack-admin.mjs 的 raw deflate
+  assert.ok(inflated.equals(html),
+    '内嵌压缩流解压后必须逐字节等于 admin.html; 改了 HTML 请重新编译固件或运行 npm run pack-admin');
+});
+
+test('后台(契约): 克隆 SSID 可显式覆盖且留空回退主目标', () => {
+  const html = readFileSync(join(ROOT, 'firmware', 'data', 'admin.html'), 'utf-8');
+  assert.ok(html.includes('id="etCloneSsid"'), '邪恶双子页必须有克隆 SSID 输入框');
+  assert.ok(html.includes('state.etCloneSsid'), '输入草稿必须在页面重建时保留');
+  assert.ok(!html.includes("const cloneSsid = '';"), '不得再把 cloneSsid 写死为空串');
+  assert.ok(mainCpp.includes('sEvilTwin.cloneSsid = ssid.length() ? ssid : sTarget.ssid'),
+    '留空必须回退主目标 SSID, 不能沿用上次的自定义名');
+  assert.ok(mainCpp.includes('克隆 SSID 最长 32 字节'), '固件必须校验 SSID 长度');
+});
+
+test('固件(契约): 面板未用的冗余 API 已清理', () => {
+  assert.ok(!mainCpp.includes('onAdmin("/api/handshake/status"'), '不得注册未用的握手状态路由');
+  assert.ok(!mainCpp.includes('onAdmin("/api/karma/crack"'), '不得注册跑包别名路由');
+  assert.ok(mainCpp.includes('onAdmin("/api/handshake/crack"'), '统一跑包路由必须保留');
+});
+
+test('文档(契约): 遥测事件表已登记 eviltwin', () => {
+  const readme = readFileSync(join(ROOT, 'README.md'), 'utf-8');
+  assert.ok(readme.includes('| `eviltwin` | Evil Twin'), '遥测事件表必须列出 eviltwin 事件');
+});
+
+test('工程闭环(契约): 后台 API 与固件路由严格一一对应', () => {
+  const html = readFileSync(join(ROOT, 'firmware', 'data', 'admin.html'), 'utf-8');
+  const pats = [
+    /api\(\s*'(\/api\/[^'\s]+)'/g,
+    /fetch\(\s*'(\/api\/[^'\s]+)'/g,
+    /act\(\s*'(\/api\/[^'\s]+)'/g,
+  ];
+  const calls = new Set(pats.flatMap((p) => [...html.matchAll(p)].map((m) => m[1].split('?')[0])));
+  const routes = new Set([...mainCpp.matchAll(/onAdmin\("(\/api\/[^"]+)"/g)].map((m) => m[1]));
+  assert.ok(calls.size > 20, '至少应覆盖 20 个面板 API');
+  assert.deepEqual([...calls].filter((p) => !routes.has(p)), [], '不得存在面板调用但未注册的悬空 API');
+  assert.deepEqual([...routes].filter((p) => !calls.has(p)), [], '不得存在固件注册但面板未用的冗余路由');
 });
 

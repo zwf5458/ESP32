@@ -276,6 +276,7 @@ const state = {
   snifferStatus: { running: false, channel: 6, hopping: false, total: 0, mgmt: 0, ctrl: 0, data: 0, fps: 0, packets: [] },
   airodumpStatus: { running: false, channel: 1, hopping: true, aps: [], stations: [] },
   karmaStatus: { running: false, probesCaptured: 0, probesBaited: 0, probes: [] },
+  etCloneSsid: '',  // 邪恶双子页「克隆 SSID」输入框草稿 (页面重建时保留)
   creds: []
 };
 
@@ -307,7 +308,7 @@ function showLogin(msg) {
     mask.innerHTML = `
       <div class="card" style="max-width:430px;width:100%;margin:0">
         <h3 style="margin-top:0">🔐 后台登录</h3>
-        <p class="note">请输入后台访问口令。出厂默认口令见 README 或串口启动日志，登录后可在「配置」页修改。</p>
+        <p class="note">请输入后台访问口令。首次上电时设备会生成随机初始口令，<b>仅在串口启动日志中打印一次</b>（不会显示在网页或遥测里）；登录后请立即在「配置」页修改。</p>
         <input type="password" id="loginTok" placeholder="后台口令" autocomplete="current-password"
                style="width:100%;box-sizing:border-box;margin:10px 0">
         <div id="loginMsg" style="min-height:20px;color:#d33;font-weight:800"></div>
@@ -376,8 +377,12 @@ const pages = {
   creds: '捕获的凭据',
   cfg: '配置'
 };
+// 记录 go() 主动设置的路由; hashchange 到达时同目标直接跳过, 避免一次导航渲染两次
+let lastRoutedPage = '';
 function go(p) {
-  location.hash = p;
+  if (!pages[p]) p = 'dash';
+  if (location.hash !== '#' + p) location.hash = p;
+  lastRoutedPage = p;
   $('#pageTitle').textContent = pages[p] || pages.dash;
   $$('#drawer .dr-item').forEach(el => {
     el.classList.toggle('on', el.dataset.page === p);
@@ -949,6 +954,13 @@ function renderEvilTwin() {
       </select>
     </div>
     <div class="sub" style="font-size:12px;color:#8a7f6d">攻击准备 = 受害者连上克隆热点后弹出的钓鱼门户话术</div>
+    <div class="frow"><label>克隆 SSID</label>
+      <input type="text" id="etCloneSsid" maxlength="32" ${active ? 'disabled' : ''}
+             value="${esc(active ? (et.cloneSsid || '') : (state.etCloneSsid || ''))}"
+             placeholder="留空 = 与主目标同名 (推荐)"
+             style="flex:1;padding:8px 10px;border:var(--bd);border-radius:10px;font-weight:800;background:#fff">
+    </div>
+    <div class="sub" style="font-size:12px;color:#8a7f6d">可显式覆盖克隆热点名称；留空则自动与主目标 SSID 完全一致（推荐，受害设备更难分辨）。最长 32 字节。</div>
   </div>
 
   <div class="card solid-orange">
@@ -1110,8 +1122,12 @@ function renderEvilTwin() {
     await pollInfo(); paintTwins();
   };
 
+  const cloneInput = $('#etCloneSsid');
+  if (cloneInput) cloneInput.oninput = (e) => { state.etCloneSsid = e.target.value; };
+
   $('#btnStartET').onclick = async () => {
-    const cloneSsid = '';
+    const cloneSsid = (state.etCloneSsid || '').trim();
+    if (cloneSsid.length > 32) { toast('克隆 SSID 最长 32 字节'); return; }
     const template = parseInt($('#etTpl').value) || 1;
     try {
       await api('/api/eviltwin/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cloneSsid, template }) });
@@ -1120,7 +1136,7 @@ function renderEvilTwin() {
       toast('发起失败: ' + msg); log('[eviltwin] 发起失败: ' + msg, 't-warn');
       return;
     }
-    toast('攻击已发起: 同名克隆热点 + 双频段压制');
+    toast(cloneSsid ? '攻击已发起: 克隆热点「' + cloneSsid + '」' : '攻击已发起: 同名克隆热点 + 双频段压制');
     log('[eviltwin] 攻击已发起, 等待目标设备接入钓鱼热点…', 't-ok');
     await pollInfo(); renderEvilTwin();
   };
@@ -1504,6 +1520,7 @@ async function act(url, msg) {
 function renderCfg() {
   const i = state.info || {};
   $('#view').innerHTML = `
+  ${i.mustChangeToken ? `<div class="card" id="tokenNotice" style="border-left:4px solid #d33"><b>⚠ 首次使用：请立即修改后台口令</b><div class="note">当前仍在使用出厂随机初始口令（仅在串口启动日志中显示一次）。请在下方「后台口令」处设置自己的口令，改完本提示自动消失。</div></div>` : ''}
   <div class="card"><h3>接入点设置 (修改需重启生效)</h3>
     <div class="frow">
       <label>热点 SSID</label>
@@ -1578,6 +1595,8 @@ function renderCfg() {
       });
       localStorage.setItem('adminToken', t);
       $('#cfgToken').value = '';
+      if (state.info) state.info.mustChangeToken = false;
+      const notice = $('#tokenNotice'); if (notice) notice.remove();
       toast('后台口令已更新 (立即生效)');
     } catch (e) {
       toast('修改口令失败: ' + e.message);
@@ -1686,7 +1705,9 @@ async function boot() {
   log('[SYSTEM] 无线网络安全教学与管理后台已连接');
   // 先取一次状态再渲染页面, 否则首屏的目标/双子列表会是空的 (要等 2s 轮询才补上)
   await pollInfo();
-  go(((location.hash || '').replace('#', '')) || 'dash');
+  const initialPage = ((location.hash || '').replace('#', '')) || 'dash';
+  // 仍在使用出厂初始口令 → 直接落到配置页引导改密 (不硬阻断其余 API, 避免忘口令锁死设备)
+  go(state.info && state.info.mustChangeToken ? 'cfg' : initialPage);
   pollLog();
   setInterval(pollInfo, 2000);
   setInterval(pollModules, 1000);
@@ -1694,7 +1715,10 @@ async function boot() {
 }
 window.addEventListener('hashchange', () => {
   const p = location.hash.slice(1);
-  if (pages[p]) go(p);
+  if (!pages[p]) return;
+  // go() 自己改的 hash: 页面已经渲染过; 只有用户手动改地址/前进后退才需要再渲染
+  if (p === lastRoutedPage) return;
+  go(p);
 });
 boot();
 </script>

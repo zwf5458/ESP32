@@ -26,15 +26,25 @@ npm test
 # 4. 浏览器 (Chrome/Edge) 打开 http://localhost:8787
 #    选串口 → 输烧录码校验 → 勾条款 → 开始烧录
 
-# 5. 编译固件镜像并注册（环境搭建见下节）
+# 5. 编译固件镜像并注册（环境搭建见下节；需保持第 1 步的后端在运行）
 sh tools/build-firmware.sh 1.1.0
 ```
+
+`build-firmware.sh` 会先探测后端与 `esptool`（PlatformIO venv 脚本 → 工具链自带
+`esptool.exe` → `PATH`），再逐个 env 编译、`merge-bin` 合并、注册到后端。版本号经
+`PLATFORMIO_BUILD_FLAGS` 注入（`pio run` 并无 `--build-flag` 选项）；直接 `pio run`
+时由 `main.cpp` 的 `#ifndef FW_VERSION` 兜底。可用环境变量 `BASE` / `ADMIN_TOKEN` /
+`ESPTOOL` / `BUILD_DIR` 覆盖默认值。发布构建默认落在独立的 `firmware/.pio/build-release`
+（与开发态 `pio run` 的 `.pio/build` 隔离，后续重跑为增量构建）；`BUILD_DIR` 另指向一个
+全新目录可做不覆写旧对象文件的干净全量构建。
 
 烧录成功后：手机/电脑连接热点 `WiFi-xxxx`（密码 `00000000`），
 会自动弹出固件后台（Captive Portal 强制门户）；若未弹窗，手动访问
 `http://192.168.4.1/admin.html`
-（状态总览 / 扫描与嗅探 / 配置；首次登录口令 `esp32admin`，登录后可在「配置」页修改，
-之后所有 `/api/*` 管理接口均需携带 `X-Admin-Token` 请求头）。
+（状态总览 / 扫描与嗅探 / 配置）。**首次上电时设备会用硬件 TRNG 生成一台一密的随机后台
+初始口令**，仅在 115200 串口启动日志中打印一次（可用烧录台「串口控制台」查看），不出现在
+网页、NDJSON 遥测或 `/api/log` 里；首次登录会直接落到「配置」页引导修改口令。
+之后所有 `/api/*` 管理接口均需携带 `X-Admin-Token` 请求头。
 
 ## 功能范围与合规边界
 
@@ -184,10 +194,12 @@ esptool `BOOTLOADER_FLASH_OFFSET`）：
 | `scan_result` | 扫描时每个周边 AP | ssid / rssi / ch / bssid / auth |
 | `client_join` / `client_leave` | softAP 客户端数变化 | clients |
 | `lab_state` | 教学模块启停 | module / running |
+| `eviltwin` | Evil Twin 首次捕获到门户提交 | caught / client（客户端 IP，不含口令） |
 
 > 遥测只镜像**已有只读状态**：不含 Probe Request/Response、802.11 管理帧、
 > EAPOL / 握手材料（M1~M4、PMKID、nonce、MIC）、凭据或任何密码字段。
 > 捕获到的凭据在文本日志中只记录密码长度，明文仅保留在受后台口令保护的凭据表 API 中。
+> 后台初始口令只经 `Serial` 直出一次，不经过 `log()`，因此不会被镜像成 `log` 事件。
 > 文本日志与 JSON 事件并存，以 `{` 开头即视为 JSON，消费者按行判断即可。
 
 消费端示例（PC 命令行，即插即用）：
@@ -219,6 +231,7 @@ unused ──verify──▶ verified(15min) ──烧录成功/pair nonce──
 |---|---|---|
 | `PORT` | 8787 | 后端监听端口 |
 | `ADMIN_TOKEN` | local-admin-token-change-me | 管理接口口令（生成码 / 注册镜像） |
+| `TRUST_PROXY` | 0（忽略转发头） | 仅在服务部署于可信反向代理之后才置 `1`，此时 `verify` 限流采信 `X-Forwarded-For` 链尾地址；默认只取 TCP 对端 IP，杜绝伪造 XFF 绕过限流 |
 
 ## 已验证（验收清单对照）
 
@@ -231,6 +244,19 @@ unused ──verify──▶ verified(15min) ──烧录成功/pair nonce──
 - ⬜ 真机烧录 + 热点后台端到端（需要接一块 ESP32/S2/S3/C3/C6 板）
 
 ## 变更记录
+
+### 2026-11-11（三）安全加固与工程闭环
+
+- **后台口令**：移除全局静态 `esp32admin` 及其串口明文日志；改为每台设备首次上电用
+  `esp_random()` 生成 12 位随机口令并存入 NVS，仅物理串口打印一次（不进遥测 / `/api/log`），
+  旧版静态口令在升级时自动轮换。`/api/info` 增加 `mustChangeToken`，面板首次登录直达
+  「配置」页引导改密；口令比较改为常量时间实现。
+- **后台 SPA**：`go()` 与 `hashchange` 去重，一次导航只渲染一次。
+- **烧录台**：下载镜像后本地比对 `manifest.md5` 与镜像大小，不一致直接阻止烧录；
+  latin1 串只转换一次，MD5 校验与 `writeFlash` 共用。
+- **服务端**：`verify` 限流默认只采信 TCP 对端 IP（只有 `TRUST_PROXY=1` 才认可信代理的
+  XFF 链尾），杜绝伪造 XFF 绕过限流；`checkAdminToken` 改用定长 SHA-256 摘要 +
+  `timingSafeEqual`；修正注册接口「支持二进制直传」的注释漂移。
 
 ### 2026-11-10（四）Evil Twin 真实化：同名克隆热点 + 主/双子目标 + 双频段压制
 

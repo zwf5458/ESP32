@@ -18,6 +18,7 @@ const state = {
   esploader: null,
   chip: null,          // manifest 键: esp32 / esp32s3 ...
   bin: null,           // ArrayBuffer
+  binStr: null,        // 同一份镜像的 latin1 串 (writeFlash 入参, 下载时生成一次复用)
   binMd5: null,
   flashVersion: null,
   code: null,          // 已校验的烧录码
@@ -126,12 +127,12 @@ $('chipLabel').onchange = () => {
   const v = $('chipLabel').value;
   if (v.startsWith('exp:')) { $('chipLabel').value = ''; return; }
   if (!v) {
-    state.chip = null; state.chipManual = false; state.bin = null;
+    state.chip = null; state.chipManual = false; state.bin = null; state.binStr = null;
   } else {
     if (state.chip && state.chip !== v && state.esploader) {
       terminalAppend(`${nowTs()} [chip] 远端设备已连接, 手动切换型号可能烧错镜像 — 建议先断开再切换\n`);
     }
-    state.chip = v; state.chipManual = true; state.bin = null;
+    state.chip = v; state.chipManual = true; state.bin = null; state.binStr = null;
     terminalAppend(`${nowTs()} [chip] 已手动指定开发板型号: ${chipDisplayName(v)}\n`);
   }
   updateChipUI();
@@ -282,7 +283,7 @@ $('btnVerify').onclick = async () => {
   const code = $('flashCode').value.trim().toUpperCase();
   // 非手动指定的型号随轮次重置; 手动指定的保留 (用户明确意图)
   if (!state.chipManual) state.chip = null;
-  state.bin = null;
+  state.bin = null; state.binStr = null;
   updateChipUI();
   // verify 时可先不带芯片
   try {
@@ -304,17 +305,42 @@ $('btnVerify').onclick = async () => {
 
 $('agreeTerms').onchange = refreshFlashButton;
 
-// fetch 镜像
+// fetch 镜像 + 本地完整性校验: manifest.md5 是注册镜像时写入 DB 的可信摘要,
+// 下载后必须与之比对, 防止镜像被替换/传输损坏后仍被烧进设备。
 async function loadFwBinary(key) {
+  const fw = state.manifest.chips[key];
   const r = await fetch(`/api/firmware/bin/${key}`);
   if (!r.ok) {
     const j = await r.json().catch(() => ({}));
     throw new Error(j.error || `镜像加载失败 (${r.status})`);
   }
   const ab = await r.arrayBuffer();
+  const u8 = new Uint8Array(ab);
+  // latin1 串既是 esptool-js writeFlash 的入参, 也是 MD5 的输入; 只转换一次避免重复开销
+  let bstr = '';
+  for (let i = 0; i < u8.length; i += 0x8000) {
+    bstr += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  }
+  const expected = String(fw?.md5 || '').toLowerCase();
+  if (expected) {
+    if (typeof CryptoJS === 'undefined') {
+      throw new Error('镜像完整性校验不可用: CryptoJS 未加载 (请检查网络后刷新页面)');
+    }
+    const actual = CryptoJS.MD5(CryptoJS.enc.Latin1.parse(bstr)).toString().toLowerCase();
+    if (actual !== expected) {
+      throw new Error(`镜像 MD5 不一致 (manifest=${expected}, 实际=${actual}); 文件可能损坏或被替换, 已阻止烧录`);
+    }
+    if (fw.size && u8.length !== fw.size) {
+      throw new Error(`镜像大小不一致 (manifest=${fw.size}, 实际=${u8.length}), 已阻止烧录`);
+    }
+    terminalAppend(`${nowTs()} [fw] 完整性校验通过: md5=${actual}, ${u8.length} bytes\n`);
+  } else {
+    terminalAppend(`${nowTs()} [fw] 警告: manifest 未提供 md5, 跳过完整性校验\n`);
+  }
   state.bin = ab;
-  state.binMd5 = state.manifest.chips[key].md5;
-  state.flashVersion = state.manifest.chips[key].version;
+  state.binStr = bstr;
+  state.binMd5 = fw?.md5 || null;
+  state.flashVersion = fw?.version || null;
 }
 
 // ---------- 烧录主流程 ----------
@@ -345,12 +371,8 @@ $('btnFlash').onclick = async () => {
     // 3. 写入 (单镜像 offset 0x0)
     $('btnFlash').disabled = true;
     progress(5, '烧录开始…');
-    // binary string (latin1)
-    const u8 = new Uint8Array(state.bin);
-    let bstr = '';
-    for (let i = 0; i < u8.length; i += 0x8000) {
-      bstr += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
-    }
+    // binary string (latin1): 下载镜像时已转换并完成 MD5 校验, 此处直接复用
+    const bstr = state.binStr;
 
     await state.esploader.writeFlash({
       fileArray: [{ data: bstr, address: 0 }],

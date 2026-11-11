@@ -35,6 +35,7 @@
 #include <Preferences.h>
 #include <nvs_flash.h>
 #include "esp_wifi.h"           // esp_wifi_80211_tx: 802.11 raw 帧注入 (Deauther 真实发送)
+#include "esp_random.h"         // esp_random(): 硬件 TRNG, 用于生成设备唯一的出厂后台口令
 #include "admin_page.h"
 #include "wifi_weak_dict.h"     // 内置 7,153 条弱口令 (与 server/data/weak-passwords.txt 同序)
 #include "mbedtls/md.h"         // PBKDF2-HMAC-SHA1 / HMAC-SHA1 / HMAC-MD5 (板载跑包)
@@ -58,7 +59,9 @@ static String apSsid;
 static uint8_t apChannel = AP_CHANNEL_DEFAULT;
 static uint8_t apChannelActive = AP_CHANNEL_DEFAULT; // 空口当前实际工作信道 (攻击期间临时切至目标信道; 配置值 apChannel 不变)
 static String sAdminToken;                            // 后台访问口令 (NVS: adminToken)
-static const char *ADMIN_TOKEN_DEFAULT = "esp32admin"; // 首次上电默认口令, 可在配置页修改
+static bool sMustChangeToken = false;                 // 仍在使用出厂初始口令, 需引导用户修改
+// 旧版固件的全局静态口令: 升级后自动轮换为设备唯一随机口令 (不保留可用弱口令)
+static const char *LEGACY_DEFAULT_TOKEN = "esp32admin";
 
 /* ---------------- 日志环形缓冲 (供后台绿字日志) ---------------- */
 struct LogEntry {
@@ -1200,7 +1203,9 @@ static void sendInfo() {
             ",\"fakeAp\":" + String(sTwins[i].fakeAp ? "true" : "false") +
             ",\"active\":" + String((sEvilTwin.hopCurrent == (int8_t)i) ? "true" : "false") + "}";
   }
-  json += "]";
+  json += "],";
+  // 仍在使用出厂初始口令时提示面板引导用户立即改密 (口令本身绝不下发)
+  json += "\"mustChangeToken\":" + String(sMustChangeToken ? "true" : "false");
   json += "}";
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", json);
@@ -1356,14 +1361,21 @@ static void handleTwinRemove() {
 
 /* ---------------- 1. 邪恶双子 API ---------------- */
 static void handleEvilTwinStart() {
+  String ssid;
   if (server.hasArg("plain")) {
     String body = server.arg("plain");
-    String ssid = extractJson(body, "cloneSsid");
-    if (ssid.length()) sEvilTwin.cloneSsid = ssid;
+    ssid = extractJson(body, "cloneSsid");
     // 攻击准备 = 钓鱼门户模板 (1=固件升级 2=认证过期 3=网络拥堵重连)
     int tpl = extractJson(body, "template").toInt();
     if (tpl >= 1 && tpl <= 3) sEvilTwin.templateId = tpl;
   }
+  if (ssid.length() > 32) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"克隆 SSID 最长 32 字节\"}");
+    return;
+  }
+  // 后台「克隆 SSID」输入框: 有值 = 显式覆盖; 留空 = 跟随主目标 SSID,
+  // 避免沿用上一次攻击留下的自定义名称
+  sEvilTwin.cloneSsid = ssid.length() ? ssid : sTarget.ssid;
   if (sEvilTwin.cloneSsid.length() == 0 && sTarget.ssid.length()) {
     sEvilTwin.cloneSsid = sTarget.ssid;
   }
@@ -1630,31 +1642,8 @@ static void handleHandshakeCrack() {
               String("{\"ok\":true,\"cracking\":true,\"total\":") + String(sHandshake.crackTotal) + "}");
 }
 
-static void handleHandshakeStatus() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  String json;
-  json.reserve(420);
-  json = "{";
-  json += "\"capturing\":" + String(sHandshake.capturing ? "true" : "false") + ",";
-  json += "\"m1\":" + String(sHandshake.m1 ? "true" : "false") + ",";
-  json += "\"m2\":" + String(sHandshake.m2 ? "true" : "false") + ",";
-  json += "\"m3\":" + String(sHandshake.m3 ? "true" : "false") + ",";
-  json += "\"m4\":" + String(sHandshake.m4 ? "true" : "false") + ",";
-  json += "\"pmkid\":" + String(sHandshake.pmkid ? "true" : "false") + ",";
-  json += "\"captured\":" + String(sHandshake.captured ? "true" : "false") + ",";
-  json += "\"unsupported\":" + String(sHandshake.unsupported ? "true" : "false") + ",";
-  json += "\"keyver\":" + String(sHandshake.keyver) + ",";
-  json += "\"essid\":\"" + jsonEscape(sHandshake.essid) + "\",";
-  json += "\"frames\":" + String(sHandshake.frameCount) + ",";
-  json += "\"cracking\":" + String(sHandshake.cracking ? "true" : "false") + ",";
-  json += "\"progress\":" + String(sHandshake.crackProgress) + ",";
-  json += "\"attempts\":" + String(sHandshake.crackAttempts) + ",";
-  json += "\"total\":" + String(sHandshake.crackTotal) + ",";
-  json += "\"channel\":" + String(apChannelActive) + ",";
-  json += "\"crackedPass\":\"" + jsonEscape(sHandshake.crackedPass) + "\"";
-  json += "}";
-  server.send(200, "application/json", json);
-}
+// 握手状态已由 /api/info 的 handshake 字段统一提供 (面板按 2s 轮询),
+// 不再单独维护 /api/handshake/status 这条无人调用的冗余路由。
 
 // 导出捕获到的握手材料 (十六进制), 可直接 POST 给服务端 /api/wpa/crack
 static void handleHandshakeDump() {
@@ -1890,6 +1879,18 @@ static void handleLog() {
 }
 
 /* ---------------- 4. 系统配置与持久化 (NVS Preferences) ---------------- */
+// 出厂初始口令: 每台设备首次上电用硬件 TRNG 随机生成并写入 NVS, 各设备互不相同。
+// 仅在物理串口启动日志中打印一次 (Serial 直出, 不经 log() → 不进入 NDJSON 遥测与 /api/log)。
+// 生成时机必须在 WiFi.softAP() 之后: RF 已开启, esp_random() 的熵才充足。
+static const char TOKEN_ALPHABET[] =
+    "23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"; // 剔除 0/O/1/l/I 等易混淆字符
+static String makeRandomAdminToken() {
+  String t;
+  t.reserve(13);
+  for (int i = 0; i < 12; i++) t += TOKEN_ALPHABET[esp_random() % (sizeof(TOKEN_ALPHABET) - 1)];
+  return t;
+}
+
 static void handleGetConfig() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   String json = "{";
@@ -1927,6 +1928,8 @@ static void handleConfig() {
   if (tokStr.length() >= 4 && tokStr.length() <= 32) {
     sAdminToken = tokStr;
     sPrefs.putString("adminToken", sAdminToken);
+    sPrefs.putBool("tokenChanged", true);
+    sMustChangeToken = false;
     changed = true;
     log("[config] 后台访问口令已更新 (立即生效)");
   }
@@ -1958,14 +1961,26 @@ static void redirectToAdmin() {
 }
 
 /* ---------------- 后台简易鉴权 ----------------
- * 所有 /api/* 管理接口需携带 X-Admin-Token 请求头 (或 ?token= 查询参数)。
+ * 所有 /api/ 管理接口均需携带 X-Admin-Token 请求头 (或 ?token= 查询参数)。
  * admin.html 只含登录壳与界面代码, 真正的数据边界在 API;
  * 钓鱼门户 /api/portal/submit 保持开放 (凭据捕获流程所需)。
  */
+// 常量时间比较: 长度不提前返回, 避免通过响应耗时推测口令长度或前缀
+static bool tokenEquals(const String &a, const String &b) {
+  size_t n = (a.length() > b.length()) ? a.length() : b.length();
+  uint8_t diff = (uint8_t)(a.length() ^ b.length());
+  for (size_t i = 0; i < n; i++) {
+    uint8_t x = (i < a.length()) ? (uint8_t)a[i] : 0;
+    uint8_t y = (i < b.length()) ? (uint8_t)b[i] : 0;
+    diff |= (uint8_t)(x ^ y);
+  }
+  return diff == 0;
+}
+
 static bool adminAuthorized() {
   String t = server.header("X-Admin-Token");
   if (t.length() == 0) t = server.arg("token");
-  return t.length() > 0 && t == sAdminToken;
+  return t.length() > 0 && tokenEquals(t, sAdminToken);
 }
 
 static bool requireAdmin() {
@@ -2027,8 +2042,7 @@ void setup() {
   sPrefs.begin("esp32-cfg", false);
   apChannel = sPrefs.getUChar("channel", AP_CHANNEL_DEFAULT);
   if (apChannel < 1 || apChannel > 13) apChannel = AP_CHANNEL_DEFAULT;
-  sAdminToken = sPrefs.getString("adminToken", ADMIN_TOKEN_DEFAULT);
-  if (sAdminToken.length() == 0) sAdminToken = ADMIN_TOKEN_DEFAULT;
+  sAdminToken = sPrefs.getString("adminToken", "");   // 空串 = 尚未初始化, 待 RF 开启后生成随机口令
 
   uint8_t apMac[6];
   WiFi.softAPmacAddress(apMac);
@@ -2047,11 +2061,19 @@ void setup() {
   log("[wifi] AP 已启动: SSID=" + apSsid + "  密码=" + AP_PASSWORD + "  信道=" + String(apChannel));
   log("[wifi] 后台: " + String(ADMIN_HTML_C));
   log("[system] 芯片: " + detectChipKey() + "  FreeHeap: " + String(ESP.getFreeHeap()) + " bytes");
-  if (sAdminToken == ADMIN_TOKEN_DEFAULT) {
-    log("[admin] 后台口令保护已启用, 出厂默认口令: " + String(ADMIN_TOKEN_DEFAULT) + " (请登录后在「配置」页修改)");
-  } else {
-    log("[admin] 后台口令保护已启用 (自定义口令)");
+  // 首次上电 / 恢复出厂 / 从旧版静态口令升级 → 轮换为设备唯一随机口令。
+  // 只经 Serial 直出一次: 不走 log(), 因此不进入 NDJSON 遥测、不进入 /api/log 日志缓冲。
+  if (sAdminToken.length() < 4 || sAdminToken == LEGACY_DEFAULT_TOKEN) {
+    sAdminToken = makeRandomAdminToken();   // 此时 RF 已启动, esp_random() 熵充足
+    sPrefs.putString("adminToken", sAdminToken);
+    sPrefs.putBool("tokenChanged", false);
+    Serial.println(F("[admin] ===== 首次上电: 后台初始口令 (仅显示这一次) ====="));
+    Serial.println("[admin]   " + sAdminToken);
+    Serial.println(F("[admin] 请登录后立即在「配置」页修改并妥善保存; 恢复出厂会重新生成"));
   }
+  sMustChangeToken = !sPrefs.getBool("tokenChanged", false);
+  log("[admin] 后台口令保护已启用" +
+      String(sMustChangeToken ? " (初始口令, 请尽快在「配置」页修改)" : " (自定义口令)"));
 
   // 上电遥测: 设备身份 (只读)
   emitJson("boot",
@@ -2061,7 +2083,7 @@ void setup() {
            "\",\"mac\":\"" + formatMac(apMac) +
            "\",\"channel\":" + String(apChannel));
 
-  // 后台口令保护: 默认口令 esp32admin, 首次登录后请在「配置」页修改
+  // 后台口令保护: 每台设备的初始口令由硬件 TRNG 生成并存 NVS, 首次登录引导改密
   static const char *adminHeaders[] = {"X-Admin-Token", "Content-Type"};
   server.collectHeaders(adminHeaders, 2);
 
@@ -2090,7 +2112,6 @@ void setup() {
   onAdmin("/api/handshake/start", HTTP_POST, handleHandshakeStart);
   onAdmin("/api/handshake/stop", HTTP_POST, handleHandshakeStop);
   onAdmin("/api/handshake/crack", HTTP_POST, handleHandshakeCrack);
-  onAdmin("/api/handshake/status", HTTP_GET, handleHandshakeStatus);
   onAdmin("/api/handshake/dump", HTTP_GET, handleHandshakeDump);
 
   // 数据包分析器、Airodump侦察与 Karma 攻击路由
@@ -2105,7 +2126,7 @@ void setup() {
   onAdmin("/api/karma/start", HTTP_POST, handleKarmaStart);
   onAdmin("/api/karma/stop", HTTP_POST, handleKarmaStop);
   onAdmin("/api/karma/status", HTTP_GET, handleKarmaStatus);
-  onAdmin("/api/karma/crack", HTTP_POST, handleHandshakeCrack);
+  // 跑包统一走 /api/handshake/crack, 不再保留 /api/karma/crack 别名
 
   onAdmin("/api/log", HTTP_GET, handleLog);
   onAdmin("/api/reset", HTTP_POST, doReset);

@@ -15,11 +15,26 @@ export const makeIsWithinRoot = (root) =>
   (absPath) => absPath === root || absPath.startsWith(root + sep);
 
 // 管理口令校验: 返回 null 表示通过, 否则返回 { status, error }
-// envToken 显式传入 (而非直接读 process.env), 便于测试且保持纯函数语义
+// envToken 显式传入 (而非直接读 process.env), 便于测试且保持纯函数语义。
+// 用定长 SHA-256 摘要做常量时间比较, 避免字符串比较按字节早退导致的时序侧信道。
 export const checkAdminToken = (envToken, headerToken) => {
   const expected = envToken || DEFAULT_ADMIN_TOKEN;
-  if (headerToken !== expected) return { status: 401, error: '管理口令错误' };
-  return null;
+  const a = crypto.createHash('sha256').update(String(expected)).digest();
+  const b = crypto.createHash('sha256').update(typeof headerToken === 'string' ? headerToken : '').digest();
+  const equal = crypto.timingSafeEqual(a, b);
+  const provided = typeof headerToken === 'string' && headerToken.length > 0;
+  return (equal && provided) ? null : { status: 401, error: '管理口令错误' };
+};
+
+// 限流用的客户端标识: 默认只采信 TCP 对端地址 (客户端不可伪造), 忽略一切转发头。
+// 仅当部署在会覆盖 XFF 的可信反向代理之后并显式设置 TRUST_PROXY=1 时才采信转发头,
+// 且取链尾 (由最近的可信代理追加) 而非客户端可随意伪造的链首。
+export const resolveClientIp = ({ forwardedFor, realIp, remoteAddress } = {}, trustProxy = false) => {
+  const fallback = String(remoteAddress || '').trim() || 'local';
+  if (!trustProxy) return fallback;
+  const chain = String(forwardedFor || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (chain.length) return chain[chain.length - 1];
+  return String(realIp || '').trim() || fallback;
 };
 
 // nonce 内存表: 一码同时仅保留一个活跃 nonce
