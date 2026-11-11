@@ -115,7 +115,7 @@ v1.1.0 起，教学验证模块（Evil Twin / Deauther / 握手包 / Sniffer / A
 | 已连客户端计数 | ✅ 实现 | `softAPgetStationNum()` 只读 |
 | 事件日志 | ✅ 实现 | 64 条环形缓冲，`/api/log?since=` |
 | 内存/运行诊断 | ✅ 实现 | 堆 / PSRAM / 信道 / uptime |
-| Evil Twin（邪恶双子） | ✅ 真实实现 | 攻击时热点真实改名为与主目标一模一样的 SSID（开放无密码、信道对齐 2.4G 主目标）→ 受害设备免密直连；同时自动对主目标持续注入 Deauth，并对双子目标（通常同路由 5G BSSID）每 2s 跳频连发 3 帧注入，使目标双频段都无法联网；Captive Portal 自动弹钓鱼页，捕获首条凭据后自动停止干扰，手动停止恢复原热点名/密码/信道 |
+| Evil Twin（邪恶双子） | ✅ 真实实现 | 攻击时热点真实改名为与主目标一模一样的 SSID（开放无密码、信道对齐主目标，2.4G 或 5G 非 DFS）→ 受害设备免密直连；同时自动对主目标持续注入 Deauth，并对双子目标（通常同路由 5G BSSID，可含 DFS）每 2s 跳频连发 3 帧注入，使目标双频段都无法联网；Captive Portal 自动弹钓鱼页，捕获首条凭据后自动停止干扰，手动停止恢复原热点名/密码/信道 |
 | Deauth / 取消认证器 | ✅ 真实实现 | 经 `esp_wifi_80211_tx` 真实注入 Deauthentication 管理帧 (0x00c0)，广播踢出目标 AP 全部客户端；启动时经 `esp_wifi_set_channel` 自动对齐目标信道（临时切换、不写 NVS，已连设备短暂掉线后重连），停止时恢复配置信道 |
 | 握手包捕获与跑包 | ✅ 真实实现 | `esp_wifi_set_promiscuous` 真实空口捕获 4-Way Handshake（M1~M4 + PMKID KDE）；板载内置 7,153 条弱口令跑包（PBKDF2-HMAC-SHA1 4096 轮 → PTK → MIC 比对，keyver 1/2）；keyver 3（PMF）导出交服务端 `POST /api/wpa/crack`（SHA256-KDF + AES-CMAC） |
 | 数据包分析器 (Sniffer) | ✅ 真实实现 | 共用 promiscuous 回调抓管理/控制/数据帧，解析类型、源/目的 MAC、SSID、Deauth Reason；支持单信道停驻与 1-13 跳频，实时帧率统计 |
@@ -324,8 +324,9 @@ redeem 只在 writeFlash 完整成功后由前端触发，且后端按 nonce+chi
 - Web 发码管理页（当前仅 `tools/gen-code.mjs` CLI 发码 + `POST /api/admin/codes`）
 - **C5 5GHz / BLE 5 / 802.15.4 能力扩展**：差距与改造清单见
   [C5 5GHz / BLE 5 / 802.15.4 能力差距与改造清单](./2026-11-11-c5-5ghz-ble-802154-roadmap.md)。
-  当前 AP / 取消认证 / 双子仍限 2.4GHz；**P0 已实现 5G 抓包**（Sniffer / Airodump
-  可停驻与跳频 5G，待 C5 真机验证）；BLE 与 802.15.4 无代码
+  当前 AP / 取消认证 / 双子的 5G 路径已实现（**P0** 5G 抓包停驻与跳频；
+  **P1** 5G AP（非 DFS）、5G 取消认证/双子（含 DFS 跳频注入），均待 C5 真机验证）；
+  BLE 与 802.15.4 无代码
 - ~~CDN 本地化~~（已完成）：`flasher/vendor/` 内置 esptool-js 0.7.1 + crypto-js 4.2.0，
   烧录台不再依赖 unpkg，支持断网/内网，同时获得 C5 识别与整片 Flash 备份能力
 - 异步 WiFi 扫描：把同步 `scanNetworks` 改为异步启动 + 轮询，
@@ -341,4 +342,5 @@ redeem 只在 writeFlash 完整成功后由前端触发，且后端按 nonce+chi
 | 2026-11-11 | 后台扩为 9 页并加口令鉴权（设备唯一随机初始口令）；Sniffer / Airodump / Karma 改为真实抓包；删除冗余路由；补 `eviltwin` 遥测；6 芯片镜像全量重建并注册；修正「主动攻击模块不实现」「后台三页」等描述漂移 |
 | 2026-11-11 | 新增 [C5 5GHz / BLE 5 / 802.15.4 能力差距与改造清单](./2026-11-11-c5-5ghz-ble-802154-roadmap.md)；§9 标记录 CDN 本地化已完成（esptool-js 0.7.1 + crypto-js 4.2.0 内置） |
 | 2026-11-11 | P0 实现：C5 Sniffer / Airodump 支持 5G 停驻与跳频（含跳过 DFS、`band` 状态字段与 UI 分段），6 芯片编译回归通过，待真机验证 |
+| 2026-11-11 | P1 实现：5G AP（非 DFS 36–48/149–165）与 5G 取消认证 / 双子（含 DFS 跳频注入）；主目标「2.4G 或 5G 非 DFS」，DFS 明确引导改用双子；状态 JSON 加 `band`；esp32c5/s3 编译通过，`npm test` 40/40，待真机验证 |
 

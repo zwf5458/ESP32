@@ -477,17 +477,17 @@ function renderTarget() {
       : `<div class="kv"><span class="v" style="color:#8a7f6d">未设置 — 请前往「扫描与嗅探」设置</span></div>`;
     const empty = '<div class="kv"><span class="v" style="color:#8a7f6d">无目标 — 请前往「扫描与嗅探」设置</span></div>';
     const twinHtml = twins.length
-      ? twins.map(x => `<div class="kv"><span class="k">${esc(x.ssid || '(隐藏)')}${x.fakeAp ? ' · 假AP' : ''}</span><span class="v mono">ch${x.channel}</span></div>`).join('')
-      : `<div class="kv"><span class="v" style="color:#8a7f6d">未添加 — 攻击将只压制 2.4G, 5G 频段不受影响</span></div>`;
+      ? twins.map(x => `<div class="kv"><span class="k">${esc(x.ssid || '(隐藏)')}${x.fakeAp ? ' · 假AP' : ''}</span><span class="v mono">ch${x.channel}${is5gCh(x.channel) ? (isDfs5g(x.channel) ? ' (5G DFS)' : ' (5G)') : ''}</span></div>`).join('')
+      : `<div class="kv"><span class="v" style="color:#8a7f6d">未添加 — 攻击将只压制主目标所在频段</span></div>`;
     $('#tgtBox').innerHTML = `
-      <div class="sub" style="margin:0 0 4px">🎯 主目标 <small style="color:#8a7f6d">(2.4G · 克隆热点与持续 Deauth 的对象)</small></div>${t ? kv(t) : empty}
+      <div class="sub" style="margin:0 0 4px">🎯 主目标 <small style="color:#8a7f6d">(克隆热点与持续 Deauth 的对象 · 2.4G${has5g() ? ' 或 5G 非 DFS' : ''})</small></div>${t ? kv(t) : empty}
       <div class="sub" style="margin:12px 0 4px">👥 双子目标 <small style="color:#8a7f6d">(共 ${twins.length} 条 · 跳频注入/假 AP)</small></div>${twinHtml}`;
   }
   if ($('#apBox') && i) {
     $('#apBox').innerHTML = `
       <div class="kv"><span class="k">热点 SSID</span><span class="v">${esc(i.ssid)}</span></div>
       <div class="kv"><span class="k">MAC</span><span class="v mono">${esc(i.mac)}</span></div>
-      <div class="kv"><span class="k">当前信道</span><span class="v mono">${i.channel}</span></div>
+      <div class="kv"><span class="k">当前信道</span><span class="v mono">${i.channel}${is5gCh(i.channel) ? ' (5G)' : ' (2.4G)'}</span></div>
       <div class="kv"><span class="k">客户端数</span><span class="v mono">${i.clients} 台</span></div>`;
   }
   if ($('#capBox') && i) {
@@ -507,7 +507,7 @@ function renderTarget() {
       <div class="kv"><span class="k">Deauth 发送</span><span class="v mono">${de.count || 0} 帧</span></div>
       <div class="kv"><span class="k">4次握手包</span><span class="v">${hs.m4 ? '<b style="color:#35c04a">已捕获完整</b>' : '未捕获'}</span></div>`;
     $('#sysState').textContent = i.ssid ? '系统就绪 · ' + i.ssid : '系统空闲';
-    $('#mScan').textContent = '就绪 · 信道 ' + i.channel;
+    $('#mScan').textContent = '就绪 · 信道 ' + i.channel + (is5gCh(i.channel) ? ' (5G)' : '');
     $('#mAP').textContent = i.ssid + ' · ' + i.clients + ' 客户端';
   }
 }
@@ -593,7 +593,7 @@ function paintScan() {
       <td class="mono" style="font-size:12px">${esc(n.auth || 'OPEN')}</td>
       <td style="white-space:nowrap">
         <button class="tbtn pink" ${state.target && state.target.bssid === n.bssid ? 'disabled' : ''}
-          title="设为主目标 (2.4G · 克隆热点与持续 Deauth)"
+          title="设为主目标 (${is5gCh(n.channel) ? (has5g() ? (isDfs5g(n.channel) ? '5G DFS · 不能克隆, 请用双子' : '5G · 克隆热点与持续 Deauth') : '本芯片不支持 5G') : '2.4G · 克隆热点与持续 Deauth'})"
           onclick='pickTarget(${JSON.stringify({ssid:n.ssid,bssid:n.bssid,channel:n.channel,rssi:n.rssi,auth:n.auth}).replace(/'/g,"&#39;")}, "primary")'>目标</button>
         <button class="tbtn yellow" style="margin-left:6px" ${(state.info?.twins || []).some(x => x.bssid === n.bssid) ? 'disabled' : ''}
           title="设为双子 (5G/多频 · 跳频注入/假 AP)"
@@ -617,7 +617,7 @@ function renderScan() {
     <div class="st" id="scanStatus" style="width:100%;margin-top:2px">${state.scan.length ? state.scan.length + ' 个 AP 点击列表标题排序' : '就绪 · 点击开始扫描'}</div>
   </div>
   <div class="card" style="padding:10px 14px;margin:0 0 12px;font-size:13px">
-    操作顺序: <b>③ 点击开始扫描 → ④ 先把 5G 目标设为「+双子」 → ⑤ 最后把 2.4G 设为「目标」</b> → ⑥ 进入「邪恶双子攻击」点击「发起攻击」
+    操作顺序: <b>③ 点击开始扫描 → ④ 把其它频段/同名目标设为「+双子」 → ⑤ 把主目标设为「目标」(2.4G${has5g() ? ' 或 5G 非 DFS' : ''}; 5G DFS 只能做双子)</b> → ⑥ 进入「邪恶双子攻击」点击「发起攻击」
   </div>
   <div class="table-wrap"><table style="background:#1b1b1b">
     <thead id="scanThead"></thead>
@@ -634,10 +634,19 @@ function renderScan() {
 }
 async function pickTarget(t, role) {
   role = role || 'primary';
-  if (role === 'primary' && t.channel > 14) {
-    toast('主目标必须是 2.4G 频段 — 5G 信号请点「设为双子」');
-    log('[target] 拒绝: ' + (t.ssid || t.bssid) + ' 在 5G 信道 ' + t.channel + ', 不能作为主目标', 't-warn');
-    return;
+  // 主目标要起同名克隆热点: 2.4G 1-14 (全芯片) 或 5G 非 DFS (仅 C5)。
+  // DFS 信道 (52-144) 需雷达检测 (CAC), softAP 无法驻留 → 引导改用双子跳频压制。
+  if (role === 'primary' && is5gCh(t.channel)) {
+    if (!has5g()) {
+      toast('本芯片仅支持 2.4G — 5G 信号请点「+双子」');
+      log('[target] 拒绝: ' + (t.ssid || t.bssid) + ' 在 5G 信道 ' + t.channel + ', 本芯片不支持 5G', 't-warn');
+      return;
+    }
+    if (isDfs5g(t.channel)) {
+      toast('主目标在 5G DFS 信道 (52-144): 克隆热点无法驻留 DFS — 请点「+双子」改用跳频压制');
+      log('[target] 拒绝: ' + (t.ssid || t.bssid) + ' 在 5G DFS 信道 ' + t.channel + ', 不能作为主目标', 't-warn');
+      return;
+    }
   }
   try {
     if (role === 'twin') {
@@ -943,7 +952,7 @@ function etUpdateLive() {
   if (cur) {
     const list = i.twins || [];
     const k = list.find(x => x.active);
-    cur.textContent = k ? ((k.ssid || '(隐藏)') + ' · ch' + k.channel) : '--';
+    cur.textContent = k ? ((k.ssid || '(隐藏)') + ' · ch' + k.channel + (k.channel > 14 ? (k.channel >= 52 && k.channel <= 144 ? ' ·5G DFS' : ' ·5G') : '')) : '--';
   }
   const hs = i.handshake || {};
   const hsTxt = $('#etHsStatus');
@@ -957,14 +966,14 @@ function paintTwins() {
   const tb = $('#twinList'); if (!tb) return;
   const list = state.info?.twins || [];
   if (!list.length) {
-    tb.innerHTML = `<div style="color:#8a7f6d;padding:8px 2px;font-size:13px">未添加双子目标 — 攻击将只压制 2.4G 主目标频段</div>`;
+    tb.innerHTML = `<div style="color:#8a7f6d;padding:8px 2px;font-size:13px">未添加双子目标 — 攻击将只压制主目标所在频段</div>`;
     return;
   }
   tb.innerHTML = list.map(x => `
     <div class="twin-row">
       <span class="mono tr-ssid">${esc(x.ssid || '(隐藏)')}${x.fakeAp ? ' <b class="tag-fake">假AP</b>' : ''}</span>
       <span class="mono tr-mac">${esc(x.bssid || '(自动 MAC)')}</span>
-      <span class="mono tr-ch">CH ${x.channel}${x.channel > 14 ? ' ·5G' : ''}</span>
+      <span class="mono tr-ch">CH ${x.channel}${x.channel > 14 ? (x.channel >= 52 && x.channel <= 144 ? ' ·5G DFS' : ' ·5G') : ''}</span>
       <button class="btn sm red" data-twin="${esc(x.bssid)}">删除</button>
     </div>`).join('');
   tb.querySelectorAll('button[data-twin]').forEach(b => {
@@ -1011,7 +1020,7 @@ function renderEvilTwin() {
     <div class="grid g4">
       <div><label class="flbl">SSID</label><input type="text" id="etTgtSsid" value="${esc(t.ssid || '')}" placeholder="目标 Wi-Fi 名称"></div>
       <div><label class="flbl">RSSID (BSSID)</label><input type="text" id="etTgtBssid" value="${esc(t.bssid || '')}" placeholder="AA:BB:CC:DD:EE:FF"></div>
-      <div><label class="flbl">信道</label><input type="number" id="etTgtCh" value="${t.channel || ''}" min="1" max="14" placeholder="1-14 (2.4G)"></div>
+      <div><label class="flbl">信道</label><input type="number" id="etTgtCh" value="${t.channel || ''}" min="1" max="${has5g() ? 165 : 14}" placeholder="${has5g() ? '1-14 (2.4G) / 36-165 (5G 非 DFS)' : '1-14 (2.4G)'}"></div>
       <div><label class="flbl">认证</label>
         <select id="etTgtAuth">
           ${['WPA2-PSK','WPA/WPA2','WPA3','WPA2/WPA3','OPEN'].map(a => `<option value="${a}" ${((t.auth || 'WPA2-PSK').toUpperCase().indexOf(a.toUpperCase()) === 0) ? 'selected' : ''}>${a}</option>`).join('')}
@@ -1019,18 +1028,18 @@ function renderEvilTwin() {
       </div>
     </div>
     <div class="sub" style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:10px">
-      <span id="etCurSel" style="font-weight:800">当前选择: ${t.ssid ? esc(t.ssid) + ' - ' + esc(t.bssid) + ' - 信道 ' + t.channel : '<span style="color:#c0392b">未设置 (主目标必须是 2.4G)</span>'}</span>
+      <span id="etCurSel" style="font-weight:800">当前选择: ${t.ssid ? esc(t.ssid) + ' - ' + esc(t.bssid) + ' - 信道 ' + t.channel + (is5gCh(t.channel) ? ' (5G)' : ' (2.4G)') : `<span style="color:#c0392b">未设置 (主目标须为 2.4G${has5g() ? ' 或 5G 非 DFS' : ''})</span>`}</span>
       <button class="btn sm purplebg" id="btnApplyTgt">应用</button>
     </div>
   </div>
 
   <div class="card solid-orange">
-    <h3 style="margin:0 0 6px">额外双子目标 (不同频段不可克隆)</h3>
-    <p class="note" style="margin:0 0 12px;font-size:13px">添加攻击时要额外压制/伪造的 AP (例如同路由 5G 频段，或不同 OUI 的同名目标)。列表最多 4 条，攻击时按周期轮询跳频。</p>
+    <h3 style="margin:0 0 6px">额外双子目标 (可跨频段, 含 5G DFS)</h3>
+    <p class="note" style="margin:0 0 12px;font-size:13px">添加攻击时要额外压制/伪造的 AP (例如同路由 5G 频段，或不同 OUI 的同名目标)。双子只跳频注入/广播假信标、不起热点，因此 5G DFS 信道 (52-144) 也可用。列表最多 4 条，攻击时按周期轮询跳频。</p>
     <div class="grid g4">
       <div><label class="flbl">BSSID</label><input type="text" id="twBssid" placeholder="AA:BB:CC:DD:EE:FF"></div>
       <div><label class="flbl">SSID</label><input type="text" id="twSsid" placeholder="WiFi-5G"></div>
-      <div><label class="flbl">信道</label><input type="number" id="twCh" value="36" min="1" max="177"></div>
+      <div><label class="flbl">信道</label><input type="number" id="twCh" value="36" min="1" max="165" placeholder="1-14 / 36-165 (含 DFS)"></div>
       <div style="display:flex;align-items:flex-end;gap:6px">
         <button class="btn sm green" id="btnTwinAdd">+ 添加</button>
         <button class="btn sm yellow" id="btnTwinScan">扫描相似AP</button>
@@ -1240,9 +1249,10 @@ function renderDeauth() {
       <h3 style="margin:0">⛔ 取消认证器 (Deauther 真实帧注入)</h3>
       <span class="status-pill ${de.running ? 'run' : 'idle'}">${de.running ? '● 发送中' : '○ 待命'}</span>
     </div>
-    <p class="note" style="margin-bottom:14px">真实注入 IEEE 802.11 Deauthentication 管理帧 (0x00c0)，讲解其明文脆弱性与防御机制 (802.11w PMF)。单射频对齐机制：启动时热点自动切到目标所在信道（已连接的受测设备会短暂掉线、重扫后自动重连），停止后自动恢复配置信道。</p>
+    <p class="note" style="margin-bottom:14px">真实注入 IEEE 802.11 Deauthentication 管理帧 (0x00c0)，讲解其明文脆弱性与防御机制 (802.11w PMF)。单射频对齐机制：启动时热点自动切到目标所在信道（已连接的受测设备会短暂掉线、重扫后自动重连），停止后自动恢复配置信道。${has5g() ? '目标在 5G 时热点会跟随切到 5G 信道（含 DFS 驻留可能失败，面板会提示对齐结果）。' : ''}</p>
     <div class="frow"><label>目标 BSSID</label><input type="text" id="deBssid" value="${esc(t.bssid || 'FF:FF:FF:FF:FF:FF')}" placeholder="目标路由器 MAC 地址"></div>
-    <div class="frow"><label>工作信道</label><select id="deCh" style="width:120px">${[1,2,3,4,5,6,7,8,9,10,11,12,13].map(c => `<option value="${c}" ${t.channel === c ? 'selected' : ''}>信道 ${c}</option>`).join('')}</select></div>
+    <div class="frow"><label>工作信道</label><select id="deCh" style="width:140px"><optgroup label="2.4GHz">${[1,2,3,4,5,6,7,8,9,10,11,12,13].map(c => `<option value="${c}" ${t.channel === c ? 'selected' : ''}>信道 ${c}</option>`).join('')}</optgroup>
+      ${has5g() ? `<optgroup label="5GHz (C5)">${CHANNELS_5G.map(c => `<option value="${c}" ${t.channel === c ? 'selected' : ''}>信道 ${c}${isDfs5g(c) ? ' (DFS)' : ''}</option>`).join('')}</optgroup>` : ''}</select></div>
     <div class="frow"><label>原因代码 (Reason)</label><select id="deReason">
       <option value="1">1: Unspecified Reason (未指定原因)</option>
       <option value="2">2: Previous authentication invalid (先前认证失效)</option>
@@ -1265,7 +1275,7 @@ function renderDeauth() {
     <div class="diag">
       <div class="dg o"><b id="deCount">${de.count || 0}</b><small>成功注入帧数</small></div>
       <div class="dg v"><b id="deRateVal">${de.rate || 10}</b><small>帧率 (fps)</small></div>
-      <div class="dg y"><b id="deChVal">${de.channel || 6}</b><small>当前信道</small></div>
+      <div class="dg y"><b id="deChVal">${de.channel || 6}${(de.channel || 0) > 14 ? ' ·5G' : ''}</b><small>当前信道</small></div>
       <div class="dg p"><b id="deStatusVal">${de.running ? 'ACTIVE' : 'IDLE'}</b><small>引擎状态</small></div>
     </div>
     <div class="sub" style="margin-top:10px" id="deTxMode">${deTxModeText(de)}</div>
@@ -1572,7 +1582,10 @@ function renderCfg() {
     </div>
     <div class="frow"><label>默认密码</label><div class="val">00000000</div></div>
     <div class="frow"><label>工作信道</label><select class="mini" id="cfgCh">
-      ${[1,2,3,4,5,6,7,8,9,10,11,12,13].map(c => `<option value="${c}" ${i.channel === c ? 'selected' : ''}>信道 ${c}</option>`).join('')}</select></div>
+      <optgroup label="2.4GHz">${[1,2,3,4,5,6,7,8,9,10,11,12,13].map(c => `<option value="${c}" ${i.channel === c ? 'selected' : ''}>信道 ${c}</option>`).join('')}</optgroup>
+      ${has5g() ? `<optgroup label="5GHz (非 DFS)">${CHANNELS_5G.filter(c => !isDfs5g(c)).map(c => `<option value="${c}" ${i.channel === c ? 'selected' : ''}>信道 ${c}</option>`).join('')}</optgroup>` : ''}
+      </select></div>
+    ${has5g() ? '<div class="note">5G 热点仅开放非 DFS 信道 (36-48 / 149-165); DFS 信道 (52-144) 需雷达检测 (CAC), softAP 不支持。切到 5G 后仅 5G 客户端可见。</div>' : ''}
     <div class="frow">
       <label>后台口令</label>
       <input type="password" id="cfgToken" placeholder="留空则不修改" autocomplete="new-password"
@@ -1629,7 +1642,7 @@ function renderCfg() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ channel: ch })
       });
-      toast(`信道已保存为信道 ${ch}，点击「重启设备」后生效`);
+      toast(`信道已保存为信道 ${ch} (${ch > 14 ? '5G' : '2.4G'})，点击「重启设备」后生效`);
     } catch (e) {
       toast('保存失败: ' + e.message);
     }

