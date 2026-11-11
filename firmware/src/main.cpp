@@ -35,6 +35,7 @@
 #include <Preferences.h>
 #include <nvs_flash.h>
 #include "esp_wifi.h"           // esp_wifi_80211_tx: 802.11 raw 帧注入 (Deauther 真实发送)
+#include "soc/soc_caps.h"       // SOC_WIFI_SUPPORT_5G: 双频芯片 (ESP32-C5) 的编译期能力门控
 #include "esp_random.h"         // esp_random(): 硬件 TRNG, 用于生成设备唯一的出厂后台口令
 #include "admin_page.h"
 #include "wifi_weak_dict.h"     // 内置 7,153 条弱口令 (与 server/data/weak-passwords.txt 同序)
@@ -359,6 +360,83 @@ static uint16_t buildBeaconFrame(const String &ssidIn, const String &bssidIn, ui
   return i;
 }
 
+/* ---------------- 双频信道模型 (P0: 5GHz 仅 C5) ----------------
+ * 2.4G: ch 1..14; 5G: ch 36..165。两组信道号不重叠, 因此 band 可由信道号推导,
+ * 不必在 API/状态里重复传 band (API 仍接受可选 band 字段以指定跳频起点)。
+ * DFS 信道 52..144 受雷达检测影响, 抓包跳频时默认跳过。
+ * 非 C5 芯片在编译期裁掉 5G 表与校验, 行为与改造前完全一致。 */
+#if SOC_WIFI_SUPPORT_5G
+static const uint8_t kChannels5G[] = {
+  36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128,
+  132, 136, 140, 144, 149, 153, 157, 161, 165
+};
+static const uint8_t kChannels5GCount = sizeof(kChannels5G) / sizeof(kChannels5G[0]);
+static bool isDfs5G(uint8_t ch) { return ch >= 52 && ch <= 144; }
+static bool isValid5GChannel(int ch) {
+  for (uint8_t i = 0; i < kChannels5GCount; i++) {
+    if (kChannels5G[i] == ch) return true;
+  }
+  return false;
+}
+#endif
+
+// 是否 5GHz 信道 (非 C5 恒为 false)
+static bool isBand5G(uint8_t ch) {
+#if SOC_WIFI_SUPPORT_5G
+  return ch >= 32;
+#else
+  (void)ch;
+  return false;
+#endif
+}
+
+// P0 抓包/侦察允许的信道: 2.4G 1..14; 5G 需 C5 且在信道表内
+static bool isValidSniffChannel(int ch) {
+  if (ch >= 1 && ch <= 14) return true;
+#if SOC_WIFI_SUPPORT_5G
+  return isValid5GChannel(ch);
+#else
+  return false;
+#endif
+}
+
+// 解析可选 band 字段: 5=5GHz, 2=2.4GHz, 0=未指定
+static uint8_t parseBandArg(const String &s) {
+  if (s == "5" || s == "5G" || s == "5g") return 5;
+  if (s == "24" || s == "2" || s == "2.4" || s == "2.4G") return 2;
+  return 0;
+}
+
+// 取下一个跳频信道: 2.4G 1..13 循环; 5G 在信道表内循环 (skipDfs 时跳过 DFS)
+static uint8_t nextHopChannel(uint8_t ch, bool skipDfs) {
+#if SOC_WIFI_SUPPORT_5G
+  if (isBand5G(ch)) {
+    int cur = -1;
+    for (uint8_t i = 0; i < kChannels5GCount; i++) {
+      if (kChannels5G[i] == ch) { cur = i; break; }
+    }
+    for (uint8_t step = 1; step <= kChannels5GCount; step++) {
+      int idx = (cur + step + kChannels5GCount) % kChannels5GCount;
+      uint8_t c = kChannels5G[idx];
+      if (!skipDfs || !isDfs5G(c)) return c;
+    }
+    return ch;
+  }
+#else
+  (void)skipDfs;
+#endif
+  return (ch >= 13) ? 1 : (uint8_t)(ch + 1);
+}
+
+// 跳频起点: 按目标 band 选一个合法起始信道
+static uint8_t hopStartChannel(uint8_t band, uint8_t fallback) {
+#if SOC_WIFI_SUPPORT_5G
+  if (band == 5) return isBand5G(fallback) ? fallback : 36;
+#endif
+  if (band == 2 && isBand5G(fallback)) return 1;
+  return fallback;
+}
+
 // 临时切换 AP 空口信道到 ch (不修改 NVS 配置); 成功返回 true。ch 支持 2.4G(1-14) 与 5G(32-177, 仅双频芯片)。
 // 目的: 单射频只能在本机信道上发帧 → 先对齐目标信道, Deauth 才能真实到达目标。
 // 副作用: 已连热点的受测设备会短暂掉线 (未发 CSA 公告), 重新扫描后自动重连, Captive Portal 仍生效。
@@ -468,6 +546,7 @@ struct SnifferState {
   bool running = false;
   uint8_t channel = 6;
   bool hopping = false;
+  bool skipDfs = true;   // 5G 跳频时跳过 DFS (52-144), 避免雷达检测打断驻留
   uint32_t totalPackets = 0;
   uint32_t mgmtCount = 0;
   uint32_t ctrlCount = 0;
@@ -513,6 +592,7 @@ struct AirodumpStation {
 struct AirodumpState {
   bool running = false;
   bool hopping = true;
+  bool skipDfs = true;   // 5G 跳频时跳过 DFS (52-144)
   uint8_t currentChannel = 1;
   uint32_t lastHopTime = 0;
   AirodumpStation stations[8];
@@ -1135,6 +1215,11 @@ static void sendInfo() {
   json.reserve(640);
   json = "{";
   json += "\"chip\":\"" + jsonEscape(detectChipKey()) + "\",";
+#if SOC_WIFI_SUPPORT_5G
+  json += "\"band5g\":true,";
+#else
+  json += "\"band5g\":false,";
+#endif
   json += "\"version\":\"" FW_VERSION "\",";
   uint8_t macAddressBytes[6];
   WiFi.softAPmacAddress(macAddressBytes);
@@ -1181,6 +1266,7 @@ static void sendInfo() {
           ",\"total\":" + String(sSniffer.totalPackets) + "},";
   json += "\"airodump\":{\"running\":" + String(sAirodump.running ? "true" : "false") +
           ",\"channel\":" + String(sAirodump.currentChannel) +
+          ",\"band\":" + String(isBand5G(sAirodump.currentChannel) ? 5 : 2) +
           ",\"stations\":" + String(sAirodump.stationCount) + "},";
   json += "\"karma\":{\"running\":" + String(sKarma.running ? "true" : "false") +
           ",\"probes\":" + String(sKarma.probesCaptured) +
@@ -1670,13 +1756,38 @@ static void handleHandshakeDump() {
 static void handleSnifferStart() {
   if (server.hasArg("plain")) {
     String body = server.arg("plain");
+    uint8_t band = parseBandArg(extractJson(body, "band"));
+#if !SOC_WIFI_SUPPORT_5G
+    if (band == 5) {
+      server.sendHeader("Access-Control-Allow-Origin", "*");
+      server.send(400, "application/json", "{\"ok\":false,\"error\":\"本芯片仅支持 2.4GHz\"}");
+      return;
+    }
+#endif
     String chStr = extractJson(body, "channel");
     if (chStr.length()) {
       int ch = chStr.toInt();
-      if (ch >= 1 && ch <= 13) sSniffer.channel = ch;
+      if (!isValidSniffChannel(ch)) {
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+#if SOC_WIFI_SUPPORT_5G
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"无效信道: 2.4G 用 1-14, 5G 用 36-165\"}");
+#else
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"无效信道: 本芯片仅支持 2.4G 信道 1-14\"}");
+#endif
+        return;
+      }
+      sSniffer.channel = (uint8_t)ch;
     }
     String hopStr = extractJson(body, "hopping");
     sSniffer.hopping = (hopStr == "true" || hopStr == "1");
+    String dfsStr = extractJson(body, "skipDfs");
+    if (dfsStr.length()) sSniffer.skipDfs = (dfsStr != "false" && dfsStr != "0");
+    // 跳频模式: band 决定起点频段 (未指定时沿用当前信道所在频段)
+    if (sSniffer.hopping) {
+      sSniffer.channel = hopStartChannel(band, sSniffer.channel);
+      // 显式指定频段时立即对齐起点, 避免「状态已切 5G、空口还在 2.4G」的短暂不一致
+      if (band && !sHandshake.capturing) applyApChannel(sSniffer.channel);
+    }
   }
   if (!sSniffer.hopping && !sHandshake.capturing) applyApChannel(sSniffer.channel);
   sSniffer.running = true;
@@ -1690,7 +1801,9 @@ static void handleSnifferStart() {
     server.send(500, "application/json", "{\"ok\":false,\"error\":\"promiscuous 启动失败\"}");
     return;
   }
-  log("[sniffer] 数据包分析器已启动! 信道=" + String(sSniffer.channel) + (sSniffer.hopping ? " (全信道跳频)" : ""));
+  log("[sniffer] 数据包分析器已启动! 信道=" + String(sSniffer.channel) +
+      (isBand5G(sSniffer.channel) ? " (5G)" : " (2.4G)") +
+      (sSniffer.hopping ? (sSniffer.skipDfs ? " (跳频, 跳过 DFS)" : " (跳频)") : ""));
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", "{\"ok\":true,\"running\":true}");
 }
@@ -1710,7 +1823,9 @@ static void handleSnifferStatus() {
   json.reserve(1024);
   json = "{\"running\":" + String(sSniffer.running ? "true" : "false") + ",";
   json += "\"channel\":" + String(sSniffer.channel) + ",";
+  json += "\"band\":" + String(isBand5G(sSniffer.channel) ? 5 : 2) + ",";
   json += "\"hopping\":" + String(sSniffer.hopping ? "true" : "false") + ",";
+  json += "\"skipDfs\":" + String(sSniffer.skipDfs ? "true" : "false") + ",";
   json += "\"total\":" + String(sSniffer.totalPackets) + ",";
   json += "\"mgmt\":" + String(sSniffer.mgmtCount) + ",";
   json += "\"ctrl\":" + String(sSniffer.ctrlCount) + ",";
@@ -1736,10 +1851,38 @@ static void handleSnifferStatus() {
 static void handleAirodumpStart() {
   if (server.hasArg("plain")) {
     String body = server.arg("plain");
+    uint8_t band = parseBandArg(extractJson(body, "band"));
+#if !SOC_WIFI_SUPPORT_5G
+    if (band == 5) {
+      server.sendHeader("Access-Control-Allow-Origin", "*");
+      server.send(400, "application/json", "{\"ok\":false,\"error\":\"本芯片仅支持 2.4GHz\"}");
+      return;
+    }
+#endif
     String hopStr = extractJson(body, "hopping");
     sAirodump.hopping = (hopStr != "false" && hopStr != "0");
-    int ch = extractJson(body, "channel").toInt();
-    if (ch >= 1 && ch <= 13) sAirodump.currentChannel = ch;
+    String chStr = extractJson(body, "channel");
+    if (chStr.length()) {
+      int ch = chStr.toInt();
+      if (!isValidSniffChannel(ch)) {
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+#if SOC_WIFI_SUPPORT_5G
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"无效信道: 2.4G 用 1-14, 5G 用 36-165\"}");
+#else
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"无效信道: 本芯片仅支持 2.4G 信道 1-14\"}");
+#endif
+        return;
+      }
+      sAirodump.currentChannel = (uint8_t)ch;
+    }
+    String dfsStr = extractJson(body, "skipDfs");
+    if (dfsStr.length()) sAirodump.skipDfs = (dfsStr != "false" && dfsStr != "0");
+    // 跳频模式: band 决定起点频段 (未指定时沿用当前信道所在频段)
+    if (sAirodump.hopping) {
+      sAirodump.currentChannel = hopStartChannel(band, sAirodump.currentChannel);
+      // 显式指定频段时立即对齐起点, 避免「状态已切 5G、空口还在 2.4G」的短暂不一致
+      if (band && !sHandshake.capturing) applyApChannel(sAirodump.currentChannel);
+    }
   }
   sAirodump.stationCount = 0;
   if (!sAirodump.hopping && !sHandshake.capturing) applyApChannel(sAirodump.currentChannel);
@@ -1751,7 +1894,9 @@ static void handleAirodumpStart() {
     server.send(500, "application/json", "{\"ok\":false,\"error\":\"promiscuous 启动失败\"}");
     return;
   }
-  log("[airodump] Airodump侦察已启动! 初始信道=" + String(sAirodump.currentChannel) + (sAirodump.hopping ? " (自动跳频)" : ""));
+  log("[airodump] Airodump侦察已启动! 初始信道=" + String(sAirodump.currentChannel) +
+      (isBand5G(sAirodump.currentChannel) ? " (5G)" : " (2.4G)") +
+      (sAirodump.hopping ? (sAirodump.skipDfs ? " (自动跳频, 跳过 DFS)" : " (自动跳频)") : ""));
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", "{\"ok\":true,\"running\":true}");
 }
@@ -1771,7 +1916,9 @@ static void handleAirodumpStatus() {
   json.reserve(2048);
   json = "{\"running\":" + String(sAirodump.running ? "true" : "false") + ",";
   json += "\"channel\":" + String(sAirodump.currentChannel) + ",";
+  json += "\"band\":" + String(isBand5G(sAirodump.currentChannel) ? 5 : 2) + ",";
   json += "\"hopping\":" + String(sAirodump.hopping ? "true" : "false") + ",";
+  json += "\"skipDfs\":" + String(sAirodump.skipDfs ? "true" : "false") + ",";
   json += "\"stations\":[";
   for (int i = 0; i < sAirodump.stationCount; i++) {
     if (i) json += ",";
@@ -2255,7 +2402,7 @@ void loop() {
     if (sSniffer.hopping && !sHandshake.capturing && !sDeauth.running && !sEvilTwin.active &&
         now - sSniffer.lastHopTime >= 400) {
       sSniffer.lastHopTime = now;
-      uint8_t next = (sSniffer.channel >= 13) ? 1 : (uint8_t)(sSniffer.channel + 1);
+      uint8_t next = nextHopChannel(sSniffer.channel, sSniffer.skipDfs);
       if (applyApChannel(next)) sSniffer.channel = next;
     }
     if (now - sSniffer.lastFpsCalc >= 1000) {
@@ -2270,7 +2417,7 @@ void loop() {
     if (sAirodump.hopping && !sHandshake.capturing && !sDeauth.running && !sEvilTwin.active &&
         now - sAirodump.lastHopTime >= 700) {
       sAirodump.lastHopTime = now;
-      uint8_t next = (sAirodump.currentChannel >= 13) ? 1 : (uint8_t)(sAirodump.currentChannel + 1);
+      uint8_t next = nextHopChannel(sAirodump.currentChannel, sAirodump.skipDfs);
       if (applyApChannel(next)) sAirodump.currentChannel = next;
     }
   }

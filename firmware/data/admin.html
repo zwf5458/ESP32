@@ -273,12 +273,44 @@ const state = {
   scanSort: { key: 'rssi', asc: false }, logId: 0,
   deauthStatus: { running: false, count: 0, rate: 10, channel: 6, reason: 1 },
   handshakeStatus: { capturing: false, m1: false, m2: false, m3: false, m4: false, pmkid: false, captured: false, unsupported: false, keyver: 0, frames: 0, cracking: false, progress: 0, total: 7153, crackedPass: '' },
-  snifferStatus: { running: false, channel: 6, hopping: false, total: 0, mgmt: 0, ctrl: 0, data: 0, fps: 0, packets: [] },
-  airodumpStatus: { running: false, channel: 1, hopping: true, aps: [], stations: [] },
+  snifferStatus: { running: false, channel: 6, band: 2, hopping: false, skipDfs: true, total: 0, mgmt: 0, ctrl: 0, data: 0, fps: 0, packets: [] },
+  airodumpStatus: { running: false, channel: 1, band: 2, hopping: true, skipDfs: true, aps: [], stations: [] },
   karmaStatus: { running: false, probesCaptured: 0, probesBaited: 0, probes: [] },
   etCloneSsid: '',  // 邪恶双子页「克隆 SSID」输入框草稿 (页面重建时保留)
   creds: []
 };
+
+/* ---------- 双频信道 (P0: 5GHz 仅 C5) ---------- */
+const CHANNELS_5G = [36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,144,149,153,157,161,165];
+const is5gCh = ch => Number(ch) > 14;
+const isDfs5g = ch => ch >= 52 && ch <= 144;
+const has5g = () => !!(state.info && state.info.band5g);
+
+// Sniffer / Airodump 共用的信道下拉: 跳频项 + 2.4G / 5G 分组 (5G 仅在 C5 显示)
+function channelSelectOptions(cur, hopping, hopBand) {
+  const c = Number(cur) || 6;
+  const h24 = hopping && hopBand !== 5;
+  let h = `<option value="hop24" ${h24 ? 'selected' : ''}>全信道跳频 (2.4G 1-13)</option>`;
+  if (has5g()) h += `<option value="hop5" ${hopping && hopBand === 5 ? 'selected' : ''}>全信道跳频 (5G)</option>`;
+  h += `<optgroup label="2.4GHz">` + Array.from({ length: 13 }, (_, i) => i + 1).map(ch =>
+    `<option value="${ch}" ${(!hopping && c === ch) ? 'selected' : ''}>信道 ${ch}</option>`).join('') + `</optgroup>`;
+  if (has5g()) {
+    h += `<optgroup label="5GHz (C5)">` + CHANNELS_5G.map(ch =>
+      `<option value="${ch}" ${(!hopping && c === ch) ? 'selected' : ''}>信道 ${ch}${isDfs5g(ch) ? ' (DFS)' : ''}</option>`).join('') + `</optgroup>`;
+  }
+  return h;
+}
+
+// 从下拉值生成启动请求体; hop24/hop5 表示跳频, 数字表示停驻
+function channelStartBody(val, skipDfs) {
+  if (val === 'hop24') return { hopping: true, band: '24', skipDfs };
+  if (val === 'hop5') return { hopping: true, band: '5', skipDfs };
+  return { channel: parseInt(val, 10), hopping: false, skipDfs };
+}
+
+const band5gNote = () => has5g()
+  ? `<div class="note" style="color:#e67e22;font-weight:700">5G 仅 C5 支持: 抓包驻留/跳频 5G 时单射频热点会同步切到 5G 或短暂离线, 浏览器可能掉线; 串口控制台始终可用。</div>`
+  : '';
 
 async function api(path, opts = {}) {
   const r = await fetch(path, withAdminAuth(opts));
@@ -650,7 +682,7 @@ function updatePacketUI() {
       const typeStyle = (p.type === 'EAPOL') ? 'style="color:#d9534f;font-weight:900"' : (p.type === 'Deauth' ? 'style="color:#e67e22;font-weight:900"' : (p.type === 'Beacon' ? 'style="color:#35c04a;font-weight:800"' : ''));
       return `<tr>
         <td class="mono small">${fmtUp(Math.floor(p.ts / 1000))}</td>
-        <td class="mono">ch${p.ch}</td>
+        <td class="mono">ch${p.ch}${p.ch > 14 ? ' (5G)' : ''}</td>
         <td class="mono">${p.rssi} dBm</td>
         <td ${typeStyle}>${esc(p.type)}</td>
         <td class="mono small">${esc(p.src)}</td>
@@ -670,13 +702,16 @@ function renderPacket() {
       <span class="status-pill ${s.running ? 'run' : 'idle'}" id="sniffPill">${s.running ? '● 正在抓包' : '○ 待命'}</span>
     </div>
     <p class="note">实时嗅探空中 802.11 射频数据包，按管理帧 (Beacon / Probe / Deauth)、控制帧 (RTS / CTS / ACK)、数据帧 (EAPOL / 数据载荷) 分类解析与吞吐遥测。</p>
+    ${band5gNote()}
 
     <div class="frow" style="gap:10px;align-items:center;margin:14px 0">
       <label style="width:auto">监听信道:</label>
-      <select class="mini" id="sniffCh" style="max-width:140px">
-        <option value="0" ${s.hopping ? 'selected' : ''}>全信道跳频轮询</option>
-        ${[1,2,3,4,5,6,7,8,9,10,11,12,13].map(c => `<option value="${c}" ${(!s.hopping && s.channel===c)?'selected':''}>信道 ${c}</option>`).join('')}
+      <select class="mini" id="sniffCh" style="max-width:180px">
+        ${channelSelectOptions(s.channel || 6, !!s.hopping, is5gCh(s.channel || 6) ? 5 : 2)}
       </select>
+      <label style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;font-weight:800" title="5G 跳频时跳过 52-144 的 DFS 信道">
+        <input type="checkbox" id="sniffSkipDfs" ${s.skipDfs !== false ? 'checked' : ''}> 跳过 DFS
+      </label>
       <button class="btn green sm" id="btnStartSniff" ${s.running ? 'disabled' : ''}>▶ 开始抓包</button>
       <button class="btn gray sm" id="btnStopSniff" ${!s.running ? 'disabled' : ''}>⏹ 停止抓包</button>
       <button class="btn pink sm" id="btnClearSniff">🗑️ 清空统计</button>
@@ -707,8 +742,9 @@ function renderPacket() {
   <div class="logc" id="logc">[SYSTEM] 就绪。</div>`;
 
   $('#btnStartSniff').onclick = async () => {
-    const val = parseInt($('#sniffCh').value);
-    const body = (val === 0) ? { hopping: true } : { channel: val, hopping: false };
+    const val = $('#sniffCh').value;
+    const skipDfs = $('#sniffSkipDfs') ? $('#sniffSkipDfs').checked : true;
+    const body = channelStartBody(val, skipDfs);
     try {
       await api('/api/sniffer/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       toast('数据包分析器已启动');
@@ -746,7 +782,7 @@ function updateAirodumpUI() {
   }
   const btnStart = $('#btnStartAd'); if (btnStart) btnStart.disabled = !!a.running;
   const btnStop = $('#btnStopAd'); if (btnStop) btnStop.disabled = !a.running;
-  const chTxt = $('#adChText'); if (chTxt) chTxt.textContent = `当前停驻: ch${a.channel || 1}`;
+  const chTxt = $('#adChText'); if (chTxt) chTxt.textContent = `当前停驻: ch${a.channel || 1}${is5gCh(a.channel || 1) ? ' (5G)' : ''}`;
 
   const apTb = $('#adApBody');
   if (apTb) {
@@ -788,12 +824,17 @@ function renderAirodump() {
       <span class="status-pill ${a.running ? 'run' : 'idle'}" id="adPill">${a.running ? '● 侦察中' : '○ 待命'}</span>
     </div>
     <p class="note">全信道跳频被动侦察空中无线接入点及其关联的客户端 Station。实时拦截手机、平板等客户端寻找历史已存网络的探针请求 (Probes)，用于网络指纹分析与目标定向。</p>
+    ${band5gNote()}
 
     <div class="frow" style="gap:10px;align-items:center;margin:14px 0">
       <button class="btn green sm" id="btnStartAd" ${a.running ? 'disabled' : ''}>▶ 开始侦察</button>
       <button class="btn gray sm" id="btnStopAd" ${!a.running ? 'disabled' : ''}>⏹ 停止侦察</button>
-      <label style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;margin-left:10px;font-weight:800">
-        <input type="checkbox" id="adHop" ${a.hopping ? 'checked' : ''}> 自动信道跳频 (1-13)
+      <label style="width:auto">侦察信道:</label>
+      <select class="mini" id="adCh" style="max-width:180px">
+        ${channelSelectOptions(a.channel || 1, !!a.hopping, is5gCh(a.channel || 1) ? 5 : 2)}
+      </select>
+      <label style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;font-weight:800" title="5G 跳频时跳过 52-144 的 DFS 信道">
+        <input type="checkbox" id="adSkipDfs" ${a.skipDfs !== false ? 'checked' : ''}> 跳过 DFS
       </label>
       <span class="mono" style="margin-left:auto;font-weight:900" id="adChText">当前停驻: ch${a.channel || 1}</span>
     </div>
@@ -830,9 +871,11 @@ function renderAirodump() {
   <div class="logc" id="logc">[SYSTEM] 就绪。</div>`;
 
   $('#btnStartAd').onclick = async () => {
-    const hop = $('#adHop').checked;
+    const val = $('#adCh').value;
+    const skipDfs = $('#adSkipDfs') ? $('#adSkipDfs').checked : true;
+    const body = channelStartBody(val, skipDfs);
     try {
-      await api('/api/airodump/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hopping: hop }) });
+      await api('/api/airodump/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       toast('Airodump 侦察已启动');
       state.airodumpStatus.running = true;
       updateAirodumpUI();

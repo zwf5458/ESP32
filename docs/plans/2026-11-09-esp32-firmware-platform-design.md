@@ -324,7 +324,8 @@ redeem 只在 writeFlash 完整成功后由前端触发，且后端按 nonce+chi
 - Web 发码管理页（当前仅 `tools/gen-code.mjs` CLI 发码 + `POST /api/admin/codes`）
 - **C5 5GHz / BLE 5 / 802.15.4 能力扩展**：差距与改造清单见
   [C5 5GHz / BLE 5 / 802.15.4 能力差距与改造清单](./2026-11-11-c5-5ghz-ble-802154-roadmap.md)。
-  当前只使用 2.4GHz；5G 仅扫描可见，抓包/取消认证/双子均限 2.4GHz；BLE 与 802.15.4 无代码
+  当前 AP / 取消认证 / 双子仍限 2.4GHz；**P0 已实现 5G 抓包**（Sniffer / Airodump
+  可停驻与跳频 5G，待 C5 真机验证）；BLE 与 802.15.4 无代码
 - ~~CDN 本地化~~（已完成）：`flasher/vendor/` 内置 esptool-js 0.7.1 + crypto-js 4.2.0，
   烧录台不再依赖 unpkg，支持断网/内网，同时获得 C5 识别与整片 Flash 备份能力
 - 异步 WiFi 扫描：把同步 `scanNetworks` 改为异步启动 + 轮询，
@@ -339,4 +340,5 @@ redeem 只在 writeFlash 完整成功后由前端触发，且后端按 nonce+chi
 | 2026-11-10 | 补 Deauther 真实帧注入、握手包真实抓包 + 跑包、Evil Twin 真实化（同名克隆 + 双频段压制） |
 | 2026-11-11 | 后台扩为 9 页并加口令鉴权（设备唯一随机初始口令）；Sniffer / Airodump / Karma 改为真实抓包；删除冗余路由；补 `eviltwin` 遥测；6 芯片镜像全量重建并注册；修正「主动攻击模块不实现」「后台三页」等描述漂移 |
 | 2026-11-11 | 新增 [C5 5GHz / BLE 5 / 802.15.4 能力差距与改造清单](./2026-11-11-c5-5ghz-ble-802154-roadmap.md)；§9 标记录 CDN 本地化已完成（esptool-js 0.7.1 + crypto-js 4.2.0 内置） |
+| 2026-11-11 | P0 实现：C5 Sniffer / Airodump 支持 5G 停驻与跳频（含跳过 DFS、`band` 状态字段与 UI 分段），6 芯片编译回归通过，待真机验证 |
 
