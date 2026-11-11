@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ESP32无线网络开发固件烧录台 · WEB SERIAL FLASHER</title>
   <link rel="stylesheet" href="/flasher/style.css">
-  <script src="https://unpkg.com/crypto-js@4.2.0/index.js"></script>
+  <script src="/flasher/vendor/crypto-js-4.2.0.js"></script>
 </head>
 <body>
 
@@ -87,6 +87,16 @@
       </label>
       <button class="btn pale-red big" id="btnFlash" disabled>⚡ 开始烧录</button>
       <p class="hint">烧录会覆写设备上原有固件。整片镜像从地址 <b>0x0</b> 写入，烧录完成后设备自动复位。</p>
+
+      <div class="backup-box">
+        <h3>💾 一键备份</h3>
+        <p class="hint">备份是<b>只读</b>操作，不消耗烧录码，也不会改动设备现有固件。按 Flash ID 自动识别容量并整片读回（16MB 约需 3–5 分钟）；过程中会短暂断开串口控制台并进入下载模式，请勿拔线。</p>
+        <div class="progress-wrap">
+          <div id="backupBar"></div>
+          <div class="bar-label" id="backupLabel">待命</div>
+        </div>
+        <button class="btn yellow wide" id="btnBackup">💾 备份固件</button>
+      </div>
     </section>
 
     <!-- ④ 当前固件版本 -->

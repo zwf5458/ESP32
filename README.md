@@ -25,6 +25,7 @@ npm test
 
 # 4. 浏览器 (Chrome/Edge) 打开 http://localhost:8787
 #    选串口 → 输烧录码校验 → 勾条款 → 开始烧录
+#    首刷前可先用「💾 备份固件」只读整片 Flash（不消耗烧录码）
 #    完整刷机步骤 / 命令行 esptool / 常见问题: docs/firmware-flashing.md
 
 # 5. 编译固件镜像并注册（环境搭建见下节；需保持第 1 步的后端在运行）
@@ -166,10 +167,11 @@ firmware/           PlatformIO 工程（Arduino 框架, espressif32 v8）
 ├── tools/embed_admin_page.py   预构建脚本: admin.html → admin_page.h
 └── tools/patch-platformio-c5.py  espressif32 平台的 C5 补丁（幂等可重跑）
 
-flasher/            烧录台纯静态前端（Web Serial + esptool-js 0.5.1）
+flasher/            烧录台纯静态前端（Web Serial + esptool-js 0.7.1）
 ├── index.html      Neo-brutalism 布局（步骤卡 ①~④ + 控制台 + 条款/说明卡）
-├── app.js          Web Serial + esptool-js 流程（含镜像 MD5/大小校验）
-└── style.css       视觉规范见 docs/plans 设计文档 §3.2
+├── app.js          Web Serial + esptool-js 流程（镜像 MD5/大小校验、整片 Flash 备份）
+├── style.css       视觉规范见 docs/plans 设计文档 §3.2
+└── vendor/         本地固定依赖（esptool-js 0.7.1 / crypto-js 4.2.0，含许可证）
 
 server/             Hono + better-sqlite3 后端（发码/校验/核销/固件分发）
 ├── src/index.js    入口（serveStatic 提供 /flasher/*，必须根目录启动）

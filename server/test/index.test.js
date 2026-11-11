@@ -493,7 +493,22 @@ test('烧录台(契约): 下载镜像后校验 manifest md5 / size', () => {
   assert.ok(appJs.includes('if (actual !== expected)'), '必须与 manifest.md5 比对');
   assert.ok(appJs.includes('镜像 MD5 不一致'), '不一致必须抛错阻止烧录');
   assert.ok(appJs.includes('u8.length !== fw.size'), '必须同时校验镜像大小');
-  assert.ok(appJs.includes('const bstr = state.binStr;'), 'writeFlash 复用同一份 latin1 串');
+  assert.ok(appJs.includes('fileArray: [{ data: image, address: 0 }]'),
+    'esptool-js 0.7.x 的 writeFlash 必须传 Uint8Array (字符串入参已废弃)');
+});
+
+test('烧录台(契约): 整片 Flash 备份走本地固定版本依赖', () => {
+  const appJs = readFileSync(join(ROOT, 'flasher', 'app.js'), 'utf-8');
+  const html = readFileSync(join(ROOT, 'flasher', 'index.html'), 'utf-8');
+  assert.ok(appJs.includes('detectFlashSize()'), '备份容量必须按 Flash ID 实测, 不能按镜像大小');
+  assert.ok(appJs.includes('readFlash(off, n'), '必须调用 readFlash 分块读回整片');
+  assert.ok(appJs.includes('URL.createObjectURL'), '读回后必须触发浏览器下载');
+  assert.ok(html.includes('id="btnBackup"'), '页面必须有「备份固件」按钮');
+  assert.ok(appJs.includes('import { ESPLoader, Transport } from "./vendor/esptool-js-0.7.1.js"'),
+    'esptool-js 必须用本地 0.7.x (0.5.x 无 C5 目标与读 Flash 能力)');
+  assert.ok(html.includes('/flasher/vendor/crypto-js-4.2.0.js'), 'crypto-js 必须用本地 UMD 构建');
+  assert.ok(!appJs.includes('unpkg.com') && !html.includes('unpkg.com'),
+    '前端不得依赖公网 CDN (离线/内网也要能烧录)');
 });
 
 test('工程闭环(契约): admin_page.h 内嵌页与 admin.html 完全同步', () => {

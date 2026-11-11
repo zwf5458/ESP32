@@ -1,9 +1,18 @@
-// 烧录台前端主逻辑: Web Serial + esptool-js 0.5.1 (ESM CDN)
-import { ESPLoader, Transport } from "https://unpkg.com/esptool-js@0.5.1/bundle.js";
+// 烧录台前端主逻辑: Web Serial + esptool-js 0.7.1 (本地固定版本, 见 vendor/README.md)
+// 0.7.x 才有 ESP32-C5 目标与 detectFlashSize(); 0.5.x 既不能识别 C5, 也没有读 Flash 能力
+import { ESPLoader, Transport } from "./vendor/esptool-js-0.7.1.js";
 
 const $ = (id) => document.getElementById(id);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const two = (n) => String(n).padStart(2, "0");
+// Uint8Array → latin1 串: CryptoJS 只能吃字符串入参, 分块避免超长参数爆栈
+function u8ToLatin1(u8) {
+  let s = "";
+  for (let i = 0; i < u8.length; i += 0x8000) {
+    s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  }
+  return s;
+}
 const nowTs = () => {
   const d = new Date();
   return `[${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}]`;
@@ -17,13 +26,15 @@ const state = {
   transport: null,
   esploader: null,
   chip: null,          // manifest 键: esp32 / esp32s3 ...
-  bin: null,           // ArrayBuffer
-  binStr: null,        // 同一份镜像的 latin1 串 (writeFlash 入参, 下载时生成一次复用)
+  bin: null,           // Uint8Array 镜像 (writeFlash 入参)
+  binStr: null,        // 同一份镜像的 latin1 串 (仅供 CryptoJS 计算 MD5, 下载时生成一次复用)
   binMd5: null,
   flashVersion: null,
   code: null,          // 已校验的烧录码
   nonce: null,
   consoleConn: false,  // 是否处于控制台读取模式
+  backingUp: false,    // 是否正在备份 Flash
+  flashing: false,     // 是否正在烧录
 };
 
 const BAUD_FLASH = 921600;
@@ -64,6 +75,7 @@ function bootBanner() {
     `${nowTs()} ESP32无线网络开发固件烧录台就绪\n` +
     `${nowTs()} 流程: ①选择串口（自动连接） → ②输入并校验烧录码 → ③选择开发板 → ④勾选免责声明 → ⑤烧录\n` +
     `${nowTs()} 波特率固定: 烧录 ${BAUD_FLASH / 1000} / 控制台 ${BAUD_CONSOLE / 1000}\n` +
+    `${nowTs()} 备份: ③ 卡片「💾 备份固件」可整片读回 Flash (只读, 不消耗烧录码)\n` +
     `${nowTs()} 注意: 每个烧录码只能成功烧录一次；烧录失败不消耗烧录码。\n`;
 }
 
@@ -185,7 +197,7 @@ async function connect() {
   $('btnConnect').disabled = true;
   try {
     setStatus(true, '连接中… (尝试进入下载模式)');
-    state.transport = new Transport(state.port, true);
+    state.transport = new Transport(state.port, false);
     state.esploader = new ESPLoader({
       transport: state.transport,
       baudrate: BAUD_FLASH,
@@ -316,11 +328,8 @@ async function loadFwBinary(key) {
   }
   const ab = await r.arrayBuffer();
   const u8 = new Uint8Array(ab);
-  // latin1 串既是 esptool-js writeFlash 的入参, 也是 MD5 的输入; 只转换一次避免重复开销
-  let bstr = '';
-  for (let i = 0; i < u8.length; i += 0x8000) {
-    bstr += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
-  }
+  // latin1 串只用于 CryptoJS 计算 MD5; esptool-js 0.7.x 的 writeFlash 直接收 Uint8Array
+  const bstr = u8ToLatin1(u8);
   const expected = String(fw?.md5 || '').toLowerCase();
   if (expected) {
     if (typeof CryptoJS === 'undefined') {
@@ -337,7 +346,7 @@ async function loadFwBinary(key) {
   } else {
     terminalAppend(`${nowTs()} [fw] 警告: manifest 未提供 md5, 跳过完整性校验\n`);
   }
-  state.bin = ab;
+  state.bin = u8;
   state.binStr = bstr;
   state.binMd5 = fw?.md5 || null;
   state.flashVersion = fw?.version || null;
@@ -347,17 +356,17 @@ async function loadFwBinary(key) {
 $('btnFlash').onclick = async () => {
   if (!$('agreeTerms').checked) return;
   if (!state.nonce) { msg('请先校验烧录码', 'warn'); return; }
+  if (state.backingUp) { msg('正在备份 Flash, 请等备份完成后再烧录', 'warn'); return; }
   const nonce = state.nonce; // 本轮使用, 无论成败轮次结束都作废
   state.nonce = null;
+  state.flashing = true;
   refreshFlashButton();
 
   try {
-    // 1. 串口就绪 + 芯片识别 (若尚未连接就先走连接流程)
-    if (!state.esploader) {
-      let sock;
+    // 1. 串口就绪 + 芯片识别 (若尚未连接, 或还停在 115200 控制台模式, 先回到下载模式)
+    if (!state.esploader || state.consoleConn) {
       setStatus(true, '连接中…');
-      try { sock = await connect(); } catch (e) { throw new Error('串口连接失败: ' + e.message); }
-      if (!sock) throw new Error('串口连接失败');
+      try { await enterDownloadMode(); } catch (e) { throw new Error('串口连接失败: ' + e.message); }
     }
     const chipKey = state.chip;
     if (!chipKey) throw new Error('无法识别芯片, 或服务端没有该芯片的镜像');
@@ -371,11 +380,11 @@ $('btnFlash').onclick = async () => {
     // 3. 写入 (单镜像 offset 0x0)
     $('btnFlash').disabled = true;
     progress(5, '烧录开始…');
-    // binary string (latin1): 下载镜像时已转换并完成 MD5 校验, 此处直接复用
-    const bstr = state.binStr;
+    // esptool-js 0.7.x: fileArray.data 必须是 Uint8Array (0.5.x 的 latin1 字符串入参已废弃)
+    const image = state.bin;
 
     await state.esploader.writeFlash({
-      fileArray: [{ data: bstr, address: 0 }],
+      fileArray: [{ data: image, address: 0 }],
       flashSize: 'keep',
       flashMode: 'keep',
       flashFreq: 'keep',
@@ -387,7 +396,7 @@ $('btnFlash').onclick = async () => {
         const pctNum = Math.round((written / total) * 100);
         progress(pct, `烧录中 ${pctNum}% · ${kbs}`);
       },
-      calculateMD5Hash: (image) => CryptoJS.MD5(CryptoJS.enc.Latin1.parse(image)).toString(),
+      calculateMD5Hash: (img) => CryptoJS.MD5(CryptoJS.enc.Latin1.parse(u8ToLatin1(img))).toString(),
     });
 
     // 4. 成功 → 核销 → 提示
@@ -403,6 +412,8 @@ $('btnFlash').onclick = async () => {
     progress(0, '✗ 烧录失败 (烧录码未核销, 可重试)');
     msg('✗ 烧录失败: ' + (e.message || e) + '。烧录码未核销, 请重新校验烧录码再试。', 'err');
     reportRedeem(nonce, false);
+  } finally {
+    state.flashing = false;
   }
 };
 
@@ -421,6 +432,109 @@ async function reportRedeem(nonce, success) {
     terminalAppend('[server] 上报失败: ' + e.message + '\n');
   }
 }
+
+// ---------- 一键备份整片 Flash ----------
+// 备份是只读操作, 不消耗烧录码; 但 readFlash 走 flasher stub, 必须先进入下载模式。
+const BACKUP_CHUNK = 0x100000; // 1MB/次: 分段读可避免 esptool-js 内部把 16MB 反复拼接的拷贝开销
+
+function backupSetProgress(read, total, label) {
+  const pct = total ? Math.min(100, (read / total) * 100) : 0;
+  $('backupBar').style.width = pct.toFixed(1) + '%';
+  $('backupLabel').textContent = label ||
+    `读取中 ${Math.round(pct)}% · ${(read / 0x100000).toFixed(1)} / ${(total / 0x100000).toFixed(1)} MB`;
+}
+
+// 备份需要 stub 下载模式: 先停掉控制台读取循环, 再重建 transport 与 loader
+async function enterDownloadMode() {
+  if (state.consoleConn) {
+    state.consoleConn = false;
+    await sleep(300);
+  }
+  if (state.transport) {
+    try { await state.transport.disconnect(); } catch { /* ignore */ }
+    state.transport = state.esploader = null;
+    await sleep(200);
+  }
+  if (!state.port) throw new Error('请先在「① 串口连接」选择并授权串口');
+  await connect();
+}
+
+$('btnBackup').onclick = async () => {
+  if (state.backingUp) return;
+  if (state.flashing) { msg('正在烧录, 请等烧录完成后再备份', 'warn'); return; }
+  if (!('serial' in navigator)) {
+    alert('此浏览器不支持 Web Serial。请使用 Chrome / Edge 最新版 (localhost 访问本页)。');
+    return;
+  }
+  state.backingUp = true;
+  $('btnBackup').disabled = true;
+  backupSetProgress(0, 0, '准备中…');
+  let done = false;
+  try {
+    if (!state.esploader || state.consoleConn) {
+      msg('备份需进入下载模式, 正在连接…', '');
+      await enterDownloadMode();
+    }
+
+    // 容量以 Flash ID 实测为准: 4MB 镜像的板子也可能是 16MB Flash, 必须读满整片才能恢复
+    const sizeStr = await state.esploader.detectFlashSize();
+    if (!sizeStr) throw new Error('无法读取 Flash ID, 识别不到容量 (请检查供电/连接, 或改用命令行 read-flash)');
+    const size = state.esploader.flashSizeBytes(sizeStr);
+    if (!(size > 0)) throw new Error(`无法解析 Flash 容量: ${sizeStr}`);
+    terminalAppend(`\n${nowTs()} [backup] Flash 容量 ${sizeStr} (${size} bytes), 开始整片读取 (请勿拔线)…\n`);
+
+    // 分块读进预分配的整片缓冲, 同时增量计算 MD5 (避免整片 16MB 再转一份字符串)
+    const out = new Uint8Array(size);
+    const hasher = typeof CryptoJS !== 'undefined' ? CryptoJS.algo.MD5.create() : null;
+    for (let off = 0; off < size; off += BACKUP_CHUNK) {
+      const n = Math.min(BACKUP_CHUNK, size - off);
+      const chunk = await state.esploader.readFlash(off, n, (_pkt, read) => {
+        backupSetProgress(off + Math.min(read, n), size);
+      });
+      if (!chunk || chunk.length < n) {
+        throw new Error(`读取不完整 (0x${off.toString(16)} 处期望 ${n} 字节, 实收 ${chunk ? chunk.length : 0})`);
+      }
+      const part = chunk.subarray(0, n); // stub 可能多回几个字节, 只取本段
+      out.set(part, off);
+      if (hasher) hasher.update(CryptoJS.enc.Latin1.parse(u8ToLatin1(part)));
+      backupSetProgress(off + n, size);
+    }
+
+    // 落盘: 文件名带芯片与时间, 便于区分多块板子的备份
+    const d = new Date();
+    const stamp = `${d.getFullYear()}${two(d.getMonth() + 1)}${two(d.getDate())}-${two(d.getHours())}${two(d.getMinutes())}`;
+    const chipName = state.chip || 'esp32';
+    const filename = `${chipName}_backup_${sizeStr.toLowerCase()}_${stamp}.bin`;
+    const md5 = hasher ? hasher.finalize().toString() : '(未计算)';
+    const url = URL.createObjectURL(new Blob([out], { type: 'application/octet-stream' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    done = true;
+
+    backupSetProgress(size, size, `✓ 备份完成 · ${filename}`);
+    terminalAppend(`${nowTs()} [backup] 完成: ${filename} (${size} bytes, md5=${md5})\n`);
+    terminalAppend(`${nowTs()} [backup] 请妥善保存; 刷坏后可用 esptool write-flash 0x0 <备份文件> 恢复\n`);
+    msg(`✓ 备份完成并已开始下载: ${filename} (${sizeStr})`, 'ok');
+  } catch (e) {
+    backupSetProgress(0, 0, '✗ 备份失败');
+    terminalAppend(`\n[backup] 失败: ${e.message || e}\n`);
+    terminalAppend(`${nowTs()} [backup] 设备仍停在下载模式: 重新上电 / 拔插 USB 即可恢复运行\n`);
+    msg('✗ 备份失败: ' + (e.message || e) + ' (备份为只读操作, 不影响设备现有固件)', 'err');
+  } finally {
+    state.backingUp = false;
+    $('btnBackup').disabled = false;
+    // 备份后芯片仍在 stub: 复位运行原固件, 并切回 115200 控制台
+    if (done) {
+      try { await state.esploader.after('hard_reset'); } catch { /* ignore */ }
+      setTimeout(() => { startConsole().catch(() => {}); }, 800);
+    }
+  }
+};
 
 // ---------- 串口控制台 ----------
 async function startConsole() {
@@ -446,13 +560,12 @@ async function startConsole() {
     await state.transport.setRTS(false);
   } catch { /* ignore */ }
   try {
-    const loop = state.transport.rawRead();
+    // esptool-js 0.7.x: rawRead(onData, isClosed) 是回调式, 不再返回 async generator
     const dec = new TextDecoder();
-    while (state.consoleConn) {
-      const { value, done } = await loop.next();
-      if (done || !value) break;
-      terminalAppend(typeof value === 'string' ? value : dec.decode(value, { stream: true }));
-    }
+    await state.transport.rawRead(
+      (data) => terminalAppend(typeof data === 'string' ? data : dec.decode(data, { stream: true })),
+      () => !state.consoleConn,
+    );
   } catch { /* port closed */ }
   finally {
     state.consoleConn = false;

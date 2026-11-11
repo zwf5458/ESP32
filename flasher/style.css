@@ -208,6 +208,18 @@ html.dark .card.yellow .box-check,html.dark .card.blue .box-check{background:rgb
   font-weight:900; font-size:13.5px; color:var(--ink);
 }
 
+/* ---------- 一键备份 ---------- */
+.backup-box{
+  margin-top:18px; padding-top:14px;
+  border-top:2px dashed rgba(0,0,0,.22);
+}
+.backup-box h3{font-size:14px; margin:0 0 4px; font-weight:900}
+#backupBar{
+  position:absolute; inset:0 auto 0 0; width:0%;
+  background:repeating-linear-gradient(45deg,#2f7de1,#2f7de1 12px,#7fb3f0 12px,#7fb3f0 24px);
+  transition:width .25s;
+}
+
 /* ---------- ④ 版本 ---------- */
 .ver-row{display:flex; align-items:baseline; gap:14px}
 .ver-label{font-size:13px; font-weight:800; color:var(--muted)}
