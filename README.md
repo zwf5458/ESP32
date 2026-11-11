@@ -493,3 +493,5 @@ EAPOL/握手材料（M1~M4、PMKID、nonce、MIC）、凭据或密码字段。
 - 云部署（HTTPS + CDN；Web Serial 要求安全上下文）
 - 图文教程页（tw.html / az.html 占位）
 - C5 真机验证（镜像已出，等一块 ESP32-C5 板）
+- C5 5GHz / BLE 5 / 802.15.4 能力扩展（当前只用 2.4GHz）：
+  差距与改造清单见 [docs/plans/2026-11-11-c5-5ghz-ble-802154-roadmap.md](docs/plans/2026-11-11-c5-5ghz-ble-802154-roadmap.md)
