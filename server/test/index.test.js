@@ -504,6 +504,10 @@ test('烧录台(契约): 整片 Flash 备份走本地固定版本依赖', () => 
   assert.ok(appJs.includes('readFlash(off, n'), '必须调用 readFlash 分块读回整片');
   assert.ok(appJs.includes('URL.createObjectURL'), '读回后必须触发浏览器下载');
   assert.ok(html.includes('id="btnBackup"'), '页面必须有「备份固件」按钮');
+  assert.ok(html.includes('id="btnCustomFlash"') && html.includes('id="customSlotSelect"'),
+    '页面必须有多系统/外部固件刷写入口');
+  assert.ok(appJs.includes('customSlotSelect') && appJs.includes('0x7F0000'),
+    '必须支持按 ota_2/ota_1 分区偏移写入外部固件 (如 Muse / ESPsoup)');
   assert.ok(appJs.includes('import { ESPLoader, Transport } from "./vendor/esptool-js-0.7.1.js"'),
     'esptool-js 必须用本地 0.7.x (0.5.x 无 C5 目标与读 Flash 能力)');
   assert.ok(html.includes('/flasher/vendor/crypto-js-4.2.0.js'), 'crypto-js 必须用本地 UMD 构建');
@@ -560,4 +564,19 @@ test('工程闭环(契约): 后台 API 与固件路由严格一一对应', () =>
   assert.deepEqual([...calls].filter((p) => !routes.has(p)), [], '不得存在面板调用但未注册的悬空 API');
   assert.deepEqual([...routes].filter((p) => !calls.has(p)), [], '不得存在固件注册但面板未用的冗余路由');
 });
+
+test('多系统引导(契约): 支持三系统槽位定义与引导切换接口', () => {
+  const html = readFileSync(join(ROOT, 'firmware', 'data', 'admin.html'), 'utf-8');
+  assert.ok(mainCpp.includes('SYSTEM_SLOTS'), '固件必须定义多系统引导槽位表');
+  assert.ok(mainCpp.includes('"audit"') && mainCpp.includes('"espsoup"') && mainCpp.includes('"muse"'),
+    '必须支持 audit / espsoup / muse 三大系统槽位');
+  assert.ok(mainCpp.includes('esp_ota_set_boot_partition'), '必须调用 esp_ota_set_boot_partition 切换引导');
+  assert.ok(mainCpp.includes('handleSerialCli'), '必须支持串口 CLI 切换引导');
+  assert.ok(html.includes('id="bootCard"'), '后台配置页必须有多系统引导卡片');
+  assert.ok(html.includes('loadBootSlots') && html.includes('doSwitchBoot'), '后台必须具备槽位加载与切换处理函数');
+  const partCsv = readFileSync(join(ROOT, 'firmware', 'partitions-16mb-triple.csv'), 'utf-8');
+  assert.ok(partCsv.includes('ota_0') && partCsv.includes('ota_1') && partCsv.includes('ota_2'),
+    '16MB 三系统分区表必须定义 ota_0/ota_1/ota_2 三个 app 分区');
+});
+
 

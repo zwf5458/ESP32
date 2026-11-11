@@ -40,6 +40,8 @@
 #include "admin_page.h"
 #include "wifi_weak_dict.h"     // 内置 7,153 条弱口令 (与 server/data/weak-passwords.txt 同序)
 #include "mbedtls/md.h"         // PBKDF2-HMAC-SHA1 / HMAC-SHA1 / HMAC-MD5 (板载跑包)
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
 
 #ifndef FW_VERSION
   #define FW_VERSION "1.1.0"
@@ -2047,6 +2049,221 @@ static void handleGetConfig() {
   server.send(200, "application/json", json);
 }
 
+/* ---------------- 多系统引导管理 (Triple-Boot) ----------------
+ * 支持在 16MB Flash (如 ESP32-C5N16R8) 或多 OTA 分区环境下无缝切换系统:
+ *   1. audit   : Wi-Fi 安全审计平台 (当前固件, 默认 ota_0 或 factory)
+ *   2. espsoup : ESPsoup 口袋 SDR 模式 (ota_1)
+ *   3. muse    : Meta Muse AI 伴侣模式 (ota_2)
+ */
+
+struct SystemSlot {
+  const char *id;
+  const char *name;
+  const char *desc;
+  esp_partition_subtype_t subtype;
+  const char *label;
+};
+
+static const SystemSlot SYSTEM_SLOTS[] = {
+  { "audit",   "Wi-Fi 安全审计平台",     "AP热点、Web管理后台、混杂抓包、Evil Twin、Deauth", ESP_PARTITION_SUBTYPE_APP_OTA_0, "ota_0" },
+  { "espsoup", "ESPsoup 口袋 SDR 模式",  "2.4G~5.9G 瀑布图、FPV 模拟图传、AirTag/DroneID 感知", ESP_PARTITION_SUBTYPE_APP_OTA_1, "ota_1" },
+  { "muse",    "Meta Muse AI 伴侣模式",   "Wi-Fi 6 联网、BLE 配对、Meta Muse 语音与智能网关",   ESP_PARTITION_SUBTYPE_APP_OTA_2, "ota_2" }
+};
+static const size_t SYSTEM_SLOTS_COUNT = sizeof(SYSTEM_SLOTS) / sizeof(SYSTEM_SLOTS[0]);
+
+static const esp_partition_t *findSystemPartition(const SystemSlot &slot) {
+  const esp_partition_t *p = esp_partition_find_first(ESP_PARTITION_TYPE_APP, slot.subtype, NULL);
+  if (!p && slot.label) {
+    p = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, slot.label);
+  }
+  if (!p && slot.id) {
+    p = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, slot.id);
+  }
+  if (!p && strcmp(slot.id, "audit") == 0) {
+    p = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
+  }
+  return p;
+}
+
+static bool isSlotInstalled(const esp_partition_t *part) {
+  if (!part) return false;
+  uint8_t magic = 0;
+  esp_err_t err = esp_partition_read(part, 0, &magic, 1);
+  return (err == ESP_OK && magic == 0xE9);
+}
+
+static String getRunningSystemId() {
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  if (!running) return "audit";
+  for (size_t i = 0; i < SYSTEM_SLOTS_COUNT; i++) {
+    const esp_partition_t *p = findSystemPartition(SYSTEM_SLOTS[i]);
+    if (p && p->address == running->address) {
+      return SYSTEM_SLOTS[i].id;
+    }
+  }
+  if (running->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY ||
+      running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0) {
+    return "audit";
+  }
+  if (running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1) return "espsoup";
+  if (running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_2) return "muse";
+  return "audit";
+}
+
+static bool switchBootSystem(const String &targetId, String &errOut) {
+  const SystemSlot *targetSlot = nullptr;
+  for (size_t i = 0; i < SYSTEM_SLOTS_COUNT; i++) {
+    if (targetId.equalsIgnoreCase(SYSTEM_SLOTS[i].id)) {
+      targetSlot = &SYSTEM_SLOTS[i];
+      break;
+    }
+  }
+  if (!targetSlot) {
+    errOut = "未知系统目标: " + targetId + " (可选: audit / espsoup / muse)";
+    return false;
+  }
+  const esp_partition_t *targetPart = findSystemPartition(*targetSlot);
+  if (!targetPart) {
+    errOut = String("未找到 [") + targetSlot->name + "] 对应的 Flash 分区 (需 16MB 多系统分区表)";
+    return false;
+  }
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  if (running && running->address == targetPart->address) {
+    errOut = String("当前正在运行 [") + targetSlot->name + "]";
+    return true;
+  }
+  if (!isSlotInstalled(targetPart)) {
+    errOut = String("[") + targetSlot->name + "] 分区尚未烧录有效固件 (需在烧录台刷入 " + targetPart->label + ")";
+    return false;
+  }
+  esp_err_t err = esp_ota_set_boot_partition(targetPart);
+  if (err != ESP_OK) {
+    errOut = "设置启动引导分区失败: " + String(esp_err_to_name(err));
+    return false;
+  }
+  return true;
+}
+
+static void handleBootGet() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  String runningId = getRunningSystemId();
+  const esp_partition_t *runningPart = esp_ota_get_running_partition();
+
+  String json = "{";
+  json += "\"ok\":true,";
+  json += "\"current\":\"" + runningId + "\",";
+  json += "\"runningPartition\":\"" + String(runningPart ? runningPart->label : "default") + "\",";
+  json += "\"multiBootSupported\":" + String(
+    (findSystemPartition(SYSTEM_SLOTS[1]) != nullptr || findSystemPartition(SYSTEM_SLOTS[2]) != nullptr) ? "true" : "false"
+  ) + ",";
+  json += "\"systems\":[";
+  for (size_t i = 0; i < SYSTEM_SLOTS_COUNT; i++) {
+    const SystemSlot &slot = SYSTEM_SLOTS[i];
+    const esp_partition_t *p = findSystemPartition(slot);
+    bool installed = isSlotInstalled(p);
+    bool active = (runningId == slot.id);
+
+    if (i > 0) json += ",";
+    json += "{";
+    json += "\"id\":\"" + String(slot.id) + "\",";
+    json += "\"name\":\"" + String(slot.name) + "\",";
+    json += "\"desc\":\"" + String(slot.desc) + "\",";
+    json += "\"partition\":\"" + String(p ? p->label : slot.label) + "\",";
+    json += "\"active\":" + String(active ? "true" : "false") + ",";
+    json += "\"installed\":" + String(installed ? "true" : "false") + ",";
+    json += "\"address\":\"0x" + String(p ? p->address : 0, HEX) + "\",";
+    json += "\"size\":\"" + String(p ? (p->size / 1024) : 0) + "KB\"";
+    json += "}";
+  }
+  json += "]}";
+  server.send(200, "application/json", json);
+}
+
+static void handleBootPost() {
+  if (!server.hasArg("plain")) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing body\"}");
+    return;
+  }
+  String body = server.arg("plain");
+  String target = extractJson(body, "target");
+  if (!target.length()) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"缺少 target 参数\"}");
+    return;
+  }
+  String err;
+  if (!switchBootSystem(target, err)) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"" + jsonEscape(err) + "\"}");
+    return;
+  }
+  log("[boot] 已切换启动分区至 [" + target + "], 设备将在 1 秒后重启 …");
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", "{\"ok\":true,\"target\":\"" + target + "\",\"message\":\"切换成功，设备即将重启\"}");
+  delay(1000);
+  ESP.restart();
+}
+
+static String sSerialCmd = "";
+static void handleSerialCli() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r' || c == '\n') {
+      sSerialCmd.trim();
+      if (sSerialCmd.length() > 0) {
+        String cmd = sSerialCmd;
+        sSerialCmd = "";
+        if (cmd == "help" || cmd == "?") {
+          Serial.println(F("\n=== 可用串口命令 ==="));
+          Serial.println(F("boot               : 查看当前系统与多系统引导槽位"));
+          Serial.println(F("boot audit         : 切换至 Wi-Fi 安全审计平台并重启"));
+          Serial.println(F("boot espsoup       : 切换至 ESPsoup 口袋 SDR 模式并重启"));
+          Serial.println(F("boot muse          : 切换至 Meta Muse AI 伴侣模式并重启"));
+          Serial.println(F("reboot             : 重启当前系统"));
+          Serial.println(F("info               : 查看系统运行状态"));
+          Serial.println(F("====================\n"));
+        } else if (cmd == "boot" || cmd == "boot status") {
+          Serial.println(F("\n=== 多系统引导槽位 (Triple-Boot) ==="));
+          String cur = getRunningSystemId();
+          Serial.println("当前运行: [" + cur + "]");
+          for (size_t i = 0; i < SYSTEM_SLOTS_COUNT; i++) {
+            const SystemSlot &slot = SYSTEM_SLOTS[i];
+            const esp_partition_t *p = findSystemPartition(slot);
+            bool inst = isSlotInstalled(p);
+            Serial.printf(" - %-8s : %s | 分区:%s (0x%06X) | 状态:%s %s\n",
+                          slot.id, slot.name,
+                          p ? p->label : "未定义",
+                          (unsigned int)(p ? p->address : 0),
+                          (cur == slot.id) ? "[活跃运行中]" : (inst ? "[已就绪]" : "[未安装/未刷入]"),
+                          (cur == slot.id) ? "◀" : "");
+          }
+          Serial.println(F("===================================\n"));
+        } else if (cmd.startsWith("boot ")) {
+          String tgt = cmd.substring(5);
+          tgt.trim();
+          String err;
+          if (switchBootSystem(tgt, err)) {
+            Serial.println("[boot] 切换成功: 引导目标设为 [" + tgt + "], 正在重启 …");
+            delay(500);
+            ESP.restart();
+          } else {
+            Serial.println("[boot] 切换失败: " + err);
+          }
+        } else if (cmd == "reboot") {
+          Serial.println(F("[system] 正在重启 …"));
+          delay(500);
+          ESP.restart();
+        } else if (cmd == "info") {
+          Serial.printf("[system] 芯片:%s FreeHeap:%d Uptime:%lus SSID:%s\n",
+                        detectChipKey().c_str(), ESP.getFreeHeap(), millis() / 1000, apSsid.c_str());
+        }
+      }
+    } else if (c >= 32 && c <= 126) {
+      if (sSerialCmd.length() < 64) sSerialCmd += c;
+    }
+  }
+}
+
+
 static void handleConfig() {
   if (!server.hasArg("plain")) {
     server.send(400, "application/json", "{\"error\":\"missing body\"}");
@@ -2276,6 +2493,8 @@ void setup() {
   // 跑包统一走 /api/handshake/crack, 不再保留 /api/karma/crack 别名
 
   onAdmin("/api/log", HTTP_GET, handleLog);
+  onAdmin("/api/system/boot", HTTP_GET, handleBootGet);
+  onAdmin("/api/system/boot", HTTP_POST, handleBootPost);
   onAdmin("/api/reset", HTTP_POST, doReset);
   onAdmin("/api/factory-reset", HTTP_POST, doFactoryReset);
   server.onNotFound(notFound);
@@ -2290,6 +2509,7 @@ void setup() {
 }
 
 void loop() {
+  handleSerialCli();
   server.handleClient();
   dnsServer.processNextRequest();
 

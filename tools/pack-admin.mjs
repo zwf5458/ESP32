@@ -12,8 +12,8 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const HTML_PATH = join(ROOT, 'firmware', 'data', 'admin.html');
 const HEADER_PATH = join(ROOT, 'firmware', 'src', 'admin_page.h');
 
-const html = readFileSync(HTML_PATH, 'utf-8');
-const compressed = zlib.deflateSync(Buffer.from(html, 'utf-8'), { level: 9 });
+const html = readFileSync(HTML_PATH);
+const compressed = zlib.deflateSync(html, { level: 9 });
 
 const lines = [];
 lines.push('// 自动生成: data/admin.html (zlib 压缩字节) — 改 HTML 后重新运行 node tools/pack-admin.mjs');

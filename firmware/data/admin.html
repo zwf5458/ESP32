@@ -1583,6 +1583,14 @@ function renderCfg() {
     <div class="frow"><label>固件版本</label><div class="val" id="cfgVer">--</div></div>
     <div class="note">修改信道或 SSID 后会自动保存至 NVS，需点下方「重启设备」生效（会短暂断开已连接客户端）。</div>
   </div>
+  <div class="card" id="bootCard"><h3>多系统引导管理 (Triple-Boot)</h3>
+    <div class="note" style="margin-bottom:12px">
+      当前设备支持多系统无缝切换。选择目标模式即可一键切换启动引导并重启。
+    </div>
+    <div id="bootList" style="display:flex;flex-direction:column;gap:10px;">
+      <div style="font-weight:700;color:#8a7f6d">正在检测多系统引导槽位...</div>
+    </div>
+  </div>
   <div class="card"><h3>系统操作</h3>
     <div class="frow">
       <button class="btn yellow" onclick="location.reload()">↻ 刷新页面</button>
@@ -1645,7 +1653,69 @@ function renderCfg() {
       toast('修改口令失败: ' + e.message);
     }
   };
+  loadBootSlots();
 }
+async function loadBootSlots() {
+  const list = $('#bootList');
+  if (!list) return;
+  try {
+    const data = await api('/api/system/boot');
+    if (!data || !data.systems) {
+      list.innerHTML = '<div class="note">无法获取系统引导槽位信息</div>';
+      return;
+    }
+    const current = data.current || 'audit';
+    list.innerHTML = data.systems.map(s => {
+      const isCur = (s.id === current) || s.active;
+      const isInst = s.installed;
+      let actionHtml = '';
+      if (isCur) {
+        actionHtml = '<button class="btn sm gray" disabled style="opacity:0.8">● 当前运行中</button>';
+      } else if (isInst) {
+        actionHtml = `<button class="btn sm" style="background:var(--yellow)" onclick="doSwitchBoot('${s.id}', '${s.name}', true)">[点击切换至] ${s.name}</button>`;
+      } else {
+        actionHtml = `<button class="btn sm gray" onclick="doSwitchBoot('${s.id}', '${s.name}', false)">[点击切换至] ${s.name} <small style="opacity:0.8">(需刷入)</small></button>`;
+      }
+      return `
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px;border:var(--bd);border-radius:12px;background:${isCur ? 'var(--yellow)' : 'var(--cream)'};box-shadow:var(--sh2);flex-wrap:wrap;gap:10px">
+        <div style="flex:1;min-width:200px">
+          <div style="font-weight:900;font-size:14px;display:flex;align-items:center;gap:8px">
+            <span style="font-size:16px">${isCur ? '🔘' : '⚪'}</span>
+            <span>${isCur ? '当前系统: ' : ''}<b>${s.name}</b></span>
+            ${isCur ? '<span style="background:#111;color:var(--yellow);border-radius:6px;padding:1px 8px;font-size:11px;font-weight:800;margin-left:6px">活跃运行中</span>' : ''}
+          </div>
+          <div class="note" style="margin-top:4px">${s.desc} · <span class="mono">${s.partition} (${s.size || '--'})</span></div>
+        </div>
+        <div>${actionHtml}</div>
+      </div>`;
+    }).join('');
+  } catch (e) {
+    if (list) list.innerHTML = `<div class="note" style="color:#d33">加载多系统引导信息失败: ${e.message}</div>`;
+  }
+}
+
+async function doSwitchBoot(id, name, installed) {
+  let msg = `确定切换至【${name}】并重启设备？`;
+  if (!installed) {
+    msg = `【固件未就绪提示】\n目标分区 (${id}) 尚未检测到有效固件，切换后可能因镜像缺失而无法启动（需在烧录台先刷入对应分区）。\n\n是否仍然强制切换引导分区？`;
+  }
+  if (!confirm(msg)) return;
+  try {
+    toast(`正在切换引导至【${name}】并重启 …`);
+    const r = await api('/api/system/boot', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target: id })
+    });
+    if (r && r.ok) {
+      alert(`已成功设置引导分区为【${name}】！\n\n设备正在重启中，请留意板载指示灯并切换连接方式：\n- ESPsoup 模式：请使用 Native USB 数据线连接电脑/手机打开 app.espsoup.com\n- Muse AI 模式：请使用家庭 Wi-Fi 6 并在 Muse 手机端配对`);
+      location.reload();
+    }
+  } catch (e) {
+    toast('切换失败: ' + (e.message || e));
+  }
+}
+
 async function doReboot() { await act('/api/reset', '确定重启设备？'); }
 async function doFactory() { await act('/api/factory-reset', '确定恢复出厂设置？(清除配置并重启)'); }
 

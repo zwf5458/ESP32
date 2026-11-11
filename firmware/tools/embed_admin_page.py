@@ -3,10 +3,14 @@
 import os
 import zlib
 
-Import("env")  # noqa: F821
+try:
+    Import("env")  # noqa: F821
+    PROJECT_DIR = env["PROJECT_DIR"]
+except NameError:
+    PROJECT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-SRC = os.path.join(env["PROJECT_DIR"], "data", "admin.html")
-DST = os.path.join(env["PROJECT_DIR"], "src", "admin_page.h")
+SRC = os.path.join(PROJECT_DIR, "data", "admin.html")
+DST = os.path.join(PROJECT_DIR, "src", "admin_page.h")
 
 if os.path.exists(SRC):
     with open(SRC, "rb") as f:

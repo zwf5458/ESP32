@@ -97,6 +97,28 @@
         </div>
         <button class="btn yellow wide" id="btnBackup">💾 备份固件</button>
       </div>
+
+      <div class="backup-box" style="margin-top:16px">
+        <h3>🧩 多系统 / 外部固件刷写 (可刷 Muse / ESPsoup)</h3>
+        <p class="hint">支持上传外部固件直接写入对应系统分区（无需烧录码，按指定偏移写入，不影响已有系统）：</p>
+        <label class="field-label">写入目标系统分区</label>
+        <select class="sel-box yellow" id="customSlotSelect" style="width:100%;margin-bottom:10px">
+          <option value="0x7F0000" selected>ota_2 (0x7F0000) — Meta Muse AI 伴侣模式</option>
+          <option value="0x400000">ota_1 (0x400000) — ESPsoup 口袋 SDR 模式</option>
+          <option value="0x10000">ota_0 (0x010000) — Wi-Fi 安全审计固件</option>
+          <option value="0x0">0x000000 — 整片写入 (完整覆盖，慎用)</option>
+        </select>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+          <input type="file" id="customFileInput" accept=".bin" style="display:none">
+          <button class="btn yellow" id="btnChooseCustomFile" type="button">📁 选择本地 .bin 固件</button>
+          <span id="customFileName" class="muted2" style="font-size:12px;font-family:monospace">未选择文件</span>
+        </div>
+        <div class="progress-wrap">
+          <div id="customFlashBar" class="progress"></div>
+          <div class="bar-label" id="customFlashLabel">待命</div>
+        </div>
+        <button class="btn pale-green wide" id="btnCustomFlash" disabled>⚡ 刷入指定系统分区</button>
+      </div>
     </section>
 
     <!-- ④ 当前固件版本 -->

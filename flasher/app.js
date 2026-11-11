@@ -536,6 +536,104 @@ $('btnBackup').onclick = async () => {
   }
 };
 
+// ---------- 多系统 / 外部固件刷写 (可刷 Muse / ESPsoup) ----------
+let customBinData = null;
+let customBinName = '';
+let customBinMd5 = '';
+
+function customFlashProgress(pct, label) {
+  const bar = $('customFlashBar');
+  const txt = $('customFlashLabel');
+  if (bar) bar.style.width = Math.min(100, Math.max(0, pct)) + '%';
+  if (txt) txt.textContent = label;
+}
+
+const customFileInput = $('customFileInput');
+const btnChooseCustomFile = $('btnChooseCustomFile');
+const btnCustomFlash = $('btnCustomFlash');
+
+if (btnChooseCustomFile && customFileInput) {
+  btnChooseCustomFile.onclick = () => customFileInput.click();
+  customFileInput.onchange = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    customBinName = file.name;
+    const reader = new FileReader();
+    reader.onload = () => {
+      customBinData = new Uint8Array(reader.result);
+      customBinMd5 = typeof CryptoJS !== 'undefined'
+        ? CryptoJS.MD5(CryptoJS.enc.Latin1.parse(u8ToLatin1(customBinData))).toString()
+        : '';
+      const sizeMb = (customBinData.length / 1024 / 1024).toFixed(2);
+      $('customFileName').textContent = `${file.name} (${sizeMb} MB, MD5: ${customBinMd5.slice(0, 8)}…)`;
+      if (btnCustomFlash) btnCustomFlash.disabled = false;
+      terminalAppend(`${nowTs()} [custom] 已加载固件: ${file.name} (${customBinData.length} bytes, md5=${customBinMd5})\n`);
+    };
+    reader.readAsArrayBuffer(file);
+  };
+}
+
+if (btnCustomFlash) {
+  btnCustomFlash.onclick = async () => {
+    if (!customBinData || customBinData.length === 0) {
+      msg('请先选择本地 .bin 固件文件', 'warn');
+      return;
+    }
+    if (state.flashing || state.backingUp) {
+      msg('设备正忙, 请稍后再试', 'warn');
+      return;
+    }
+    const slotSelect = $('customSlotSelect');
+    const targetAddr = parseInt(slotSelect ? slotSelect.value : '0x7F0000', 16);
+    const slotText = slotSelect ? slotSelect.options[slotSelect.selectedIndex].text : `0x${targetAddr.toString(16)}`;
+
+    if (!confirm(`确定将固件【${customBinName}】写入【${slotText}】？\n\n- 写入对应系统分区不会影响其他分区已有数据。\n- 写入完成后可在 Web 后台一键切换或自动重启。`)) {
+      return;
+    }
+
+    state.flashing = true;
+    btnCustomFlash.disabled = true;
+    customFlashProgress(5, '准备中…');
+    try {
+      if (!state.esploader || state.consoleConn) {
+        msg('正在连接并进入下载模式…', '');
+        await enterDownloadMode();
+      }
+
+      terminalAppend(`\n${nowTs()} [custom] 开始写入: ${customBinName} -> 0x${targetAddr.toString(16).toUpperCase()} (${customBinData.length} bytes)\n`);
+      customFlashProgress(10, '正在写入 Flash…');
+
+      await state.esploader.writeFlash({
+        fileArray: [{ data: customBinData, address: targetAddr }],
+        flashSize: 'keep',
+        flashMode: 'keep',
+        flashFreq: 'keep',
+        eraseAll: false,
+        compress: true,
+        reportProgress: (_fi, written, total) => {
+          const pct = Math.round((written / total) * 100);
+          const kbs = (written / 1024).toFixed(0) + ' KB';
+          customFlashProgress(pct, `写入中 ${pct}% · ${kbs}`);
+        },
+        calculateMD5Hash: (img) => CryptoJS.MD5(CryptoJS.enc.Latin1.parse(u8ToLatin1(img))).toString(),
+      });
+
+      customFlashProgress(100, `✓ 写入成功 · 已刷入 ${slotText}`);
+      terminalAppend(`${nowTs()} [custom] 固件写入成功! 目标地址: 0x${targetAddr.toString(16).toUpperCase()}\n`);
+      msg(`✓ 固件写入成功! 已刷入 ${slotText}`, 'ok');
+
+      setTimeout(() => { startConsole().catch(() => {}); }, 1500);
+    } catch (e) {
+      customFlashProgress(0, '✗ 写入失败');
+      terminalAppend(`\n[custom] 写入失败: ${e.message || e}\n`);
+      msg('✗ 写入失败: ' + (e.message || e), 'err');
+    } finally {
+      state.flashing = false;
+      btnCustomFlash.disabled = false;
+    }
+  };
+}
+
 // ---------- 串口控制台 ----------
 async function startConsole() {
   if (!state.transport || state.consoleConn) return;

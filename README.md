@@ -101,7 +101,7 @@ Handshake 自 2026-11-10 起为真实抓包 + 真实跑包（见变更记录）�
 
 | 分组 | 接口 |
 |---|---|
-| 信息 / 配置 | `GET /api/info`、`GET /api/config`、`POST /api/config`、`POST /api/reset`、`POST /api/factory-reset` |
+| 信息 / 配置 | `GET /api/info`、`GET /api/config`、`POST /api/config`、`GET /api/system/boot`、`POST /api/system/boot`、`POST /api/reset`、`POST /api/factory-reset` |
 | 扫描 / 目标 | `GET /api/scan`、`POST /api/target`（`role=primary` 或 `twin`）、`POST /api/twin`、`DELETE /api/twin` |
 | 日志 | `GET /api/log?since=`（64 条环形缓冲增量拉取） |
 | 邪恶双子 | `POST /api/eviltwin/start`、`POST /api/eviltwin/stop`、`GET /api/eviltwin/creds`、`DELETE /api/eviltwin/creds` |

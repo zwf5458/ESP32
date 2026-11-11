@@ -306,3 +306,53 @@ esptool --chip esp32c5 -p COM5 -b 460800 write-flash 0x0 c5n16r8-backup.bin
 - 不要因为 Deauth / raw TX 报错就判断板子坏：C5 对 raw TX 的 SDK 支持受限，
   后台会如实显示错误码；
 - 不要用劣质 USB 线或供电不足的 Hub 刷写，写入中断虽可恢复，但会增加排查成本。
+
+---
+
+## 6. 附：16MB Flash 三系统 (Triple-Boot) 部署说明
+
+针对 ESP32-C5N16R8 等 16MB Flash 开发板，本工程支持在单块板子上同时部署并无缝切换三个系统：
+1. **Wi-Fi 安全审计平台**（`ota_0`，本工程固件）
+2. **ESPsoup 口袋 SDR 模式**（`ota_1`，全频段接收机与瀑布图）
+3. **Meta Muse AI 伴侣模式**（`ota_2`，Wi-Fi 6 联网与智能家居网关）
+
+### 6.1 分区规划（`firmware/partitions-16mb-triple.csv`）
+
+```text
+0x009000  nvs         (16KB)
+0x00d000  otadata     (8KB, 引导状态)
+0x00f000  phy_init    (4KB)
+0x010000  ota_0       (3.9375MB) -> Wi-Fi 安全审计平台
+0x400000  ota_1       (3.9375MB) -> ESPsoup 口袋 SDR 固件
+0x7F0000  ota_2       (3.9375MB) -> Meta Muse AI 伴侣固件
+0xBE0000  spiffs      (4.0625MB) -> 共享存储与数据区
+```
+
+### 6.2 部署步骤（网页烧录台直接刷写 或 命令行写入）
+
+**方式 A：直接在网页烧录台（Flasher）界面刷入（最推荐，免敲命令）**
+1. 访问本地烧录台（如 `http://127.0.0.1:8787`）；
+2. 连上开发板后，在步骤 ③ 卡片下方的 **「🧩 多系统 / 外部固件刷写」** 区域：
+   - 目标系统分区选择：`ota_2 (0x7F0000) — Meta Muse AI 伴侣模式`；
+   - 点击「📁 选择本地 .bin 固件」选中你的 `muse.bin`；
+   - 点击 **「⚡ 刷入指定系统分区」**，进度条跑满即可完成烧录，不影响其他分区！
+   - 同理，刷写 ESPsoup 固件只需选择 `ota_1 (0x400000)` 并上传对应镜像即可。
+
+**方式 B：命令行写入独立分区**
+
+```powershell
+# 1. 刷入当前安全审计固件至 ota_0 (从 0x10000)
+esptool --chip esp32c5 -p COM5 -b 460800 write-flash 0x10000 .pio\build\esp32c5\firmware.bin
+
+# 2. 刷入 ESPsoup 固件至 ota_1 (从 0x400000)
+esptool --chip esp32c5 -p COM5 -b 460800 write-flash 0x400000 espsoup-c5.bin
+
+# 3. 刷入 Meta Muse AI 固件至 ota_2 (从 0x7F0000)
+esptool --chip esp32c5 -p COM5 -b 460800 write-flash 0x7F0000 muse-c5.bin
+```
+
+### 6.3 切换方式
+
+- **Web 后台一键切换**：进入后台「配置」页面的 **多系统引导管理 (Triple-Boot)** 卡片，点击目标系统的 `[点击切换至]` 按钮确认即可重启进入；
+- **串口 CLI 命令切换**：在串口控制台输入 `boot` 查看槽位状态，输入 `boot espsoup` 或 `boot muse` 或 `boot audit` 即刻切换并重启。
+
