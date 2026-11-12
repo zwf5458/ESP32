@@ -359,9 +359,9 @@ app.post('/api/admin/firmware/:chip', requireAdmin, async (c) => {
   if (!existsSync(resolvedPath)) return json(c, { error: 'sourcePath 文件不存在' }, 400);
   const buf = readFileSync(resolvedPath);
   // 合并镜像中 bootloader 由芯片 ROM 规定在不同偏移 (见 tools/build-firmware.sh):
-  //   esp32/esp32s2=0x1000, esp32c5=0x2000, 其余=0x0; 该处应为 ESP image magic 0xE9。
+  //   esp32/esp32s2=0x1000, esp32c5 / esp32c5_16mb=0x2000, 其余=0x0; 该处应为 ESP image magic 0xE9。
   // 另兼容 app-only 镜像 (从 0x0 开始) 的开发调试场景。
-  const BOOTLOADER_OFFSET = { esp32: 0x1000, esp32s2: 0x1000, esp32c5: 0x2000 };
+  const BOOTLOADER_OFFSET = { esp32: 0x1000, esp32s2: 0x1000, esp32c5: 0x2000, esp32c5_16mb: 0x2000 };
   const expected = BOOTLOADER_OFFSET[chip] ?? 0x0;
   const hasMagic = (buf.length > expected && buf[expected] === 0xE9)
     || (buf[0] === 0xE9);

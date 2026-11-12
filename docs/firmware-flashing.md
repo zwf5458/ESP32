@@ -1,7 +1,8 @@
 # 刷固件说明（网页烧录台 / 命令行）
 
 适用于固件 **v1.1.0**，芯片 `esp32 / esp32s2 / esp32s3 / esp32c3 / esp32c5 / esp32c6`。
-镜像为 **4MB 整片合并镜像**，从 `0x0` 一次写入。
+镜像为 **4MB 整片合并镜像**，从 `0x0` 一次写入；16MB 板的三系统 (Triple-Boot)
+部署需用专用镜像 `esp32c5_16mb`（见 §6）。
 
 > ⚠️ 仅用于自有设备或取得书面授权的受测设备。刷入后设备会真实发射 WiFi 信号，
 > 教学模块的使用边界见 [README「功能范围与合规边界」](../README.md#功能范围与合规边界)。
@@ -259,7 +260,9 @@ esptool --chip esp32c5 -p COM5 -b 460800 write-flash 0x0 server\firmware\firmwar
 ```
 
 - 必须从 `0x0` 写整片，**不要**写 `0x2000` 或 `0x10000`；
-- 保持 4MB 镜像原样，写到 16MB 板子的前 4MB 是安全的；
+- ESP32-C5 有两个镜像，别选错：`firmware-esp32c5-*.bin` 是 4MB/min_spiffs 版，
+  `firmware-esp32c5_16mb-*.bin` 才是 16MB 三系统分区表版（见 §6，做 Triple-Boot 必须用后者）；
+- 保持镜像原样写入，写到 16MB 板子的前 4MB 是安全的（不会动 `0x400000` 之后的 ota_1/ota_2）；
 - esptool **v5 没有 `--verify` 选项**，需要回读校验时用
   `verify-flash 0x0 <镜像>`；v4 可在 `write_flash` 后加 `--verify`；
 - 不要加 `--erase-all`，也不要用 `--override-vddsdio` 之类电压覆盖；
@@ -300,9 +303,10 @@ esptool --chip esp32c5 -p COM5 -b 460800 write-flash 0x0 c5n16r8-backup.bin
 
 ### 5.6 C5N16R8 首刷不要做的事
 
-- 不要把网页烧录台的型号手动改成其他芯片（自动识别优先，防烧错镜像）；
-- 不要往 4MB 镜像上强行套 16MB 分区表 / 改 bootloader 头；要用满 16MB 需重新
-  生成分区表并重建镜像，属于后续优化，不是首刷目标；
+- 不要把网页烧录台的型号手动改成其他芯片（自动识别优先，防烧错镜像；
+  只有做 16MB 三系统时才需要手动选同芯片的 `ESP32-C5 (16MB 三系统)` 变体）；
+- 不要往 4MB 镜像上强行套 16MB 分区表 / 改 bootloader 头：要用满 16MB 请直接
+  构建并烧录 `esp32c5_16mb` 专用镜像（见 §6），两个镜像在烧录台里分开注册；
 - 不要因为 Deauth / raw TX 报错就判断板子坏：C5 对 raw TX 的 SDK 支持受限，
   后台会如实显示错误码；
 - 不要用劣质 USB 线或供电不足的 Hub 刷写，写入中断虽可恢复，但会增加排查成本。
@@ -329,6 +333,26 @@ esptool --chip esp32c5 -p COM5 -b 460800 write-flash 0x0 c5n16r8-backup.bin
 ```
 
 ### 6.2 部署步骤（网页烧录台直接刷写 或 命令行写入）
+
+**前置：先把 16MB 三系统基础镜像刷进 `ota_0`**
+
+三系统分区表只内建在 `esp32c5_16mb` 这个专用构建里（4MB 版 `esp32c5` 仍是
+min_spiffs，`0x400000` / `0x7F0000` 在它下面不可引导）。先构建并注册该镜像：
+
+```bash
+tools/build-firmware.sh            # 产出 server/firmware/firmware-esp32c5_16mb-<版本>.bin
+```
+
+然后在网页烧录台里**手动**把型号选成 `ESP32-C5 (16MB 三系统)`（自动识别只会匹配到
+4MB 版 `esp32c5`，手动选中的同芯片变体会被保留），再从 `0x0` 整片刷入；或命令行：
+
+```powershell
+esptool --chip esp32c5 -p COM5 -b 460800 write-flash 0x0 server\firmware\firmware-esp32c5_16mb-1.1.0.bin
+```
+
+该镜像实际只占前 4MB（bootloader + 分区表 + `ota_0` app），不会覆盖
+`0x400000` 之后的 `ota_1` / `ota_2`，所以重复刷新审计固件不会抹掉已写入的
+ESPsoup / Muse。
 
 **方式 A：直接在网页烧录台（Flasher）界面刷入（最推荐，免敲命令）**
 1. 访问本地烧录台（如 `http://127.0.0.1:8787`）；

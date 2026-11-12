@@ -96,8 +96,8 @@ async function loadManifest() {
     $('fwLabel').textContent = ver;
     $('fwLabel-mini').textContent = 'v' + ver;
     const totalKB = chips.reduce((a, [, v]) => a + v.size, 0) / 1024;
-    const names = chips.map(([k]) => k.replace(/^esp32/, '').toUpperCase() || 'ESP32').join('/');
-    $('fwNote').textContent = `${ver} 版本覆盖 ${chips.length} 个芯片系列 (${names})，合计镜像 ${(totalKB / 1024).toFixed(1)} MB`;
+    const names = chips.map(([k]) => chipDisplayName(k)).join(' / ');
+    $('fwNote').textContent = `${ver} 版本覆盖 ${chips.length} 个镜像 (${names})，合计 ${(totalKB / 1024).toFixed(1)} MB`;
     terminalAppend(`${nowTs()} [manifest] 可用镜像: ${chips.map(([k, v]) => `${k} @v${v.version}`).join(' ')}\n`);
     terminalAppend(`${nowTs()} 请先连接串口识别开发板型号。\n`);
     populateChipSelect();
@@ -131,6 +131,7 @@ function populateChipSelect() {
 }
 
 function chipDisplayName(key) {
+  if (key === 'esp32c5_16mb') return 'ESP32-C5 (16MB 三系统)';
   return key === 'esp32' ? 'ESP32' : 'ESP32-' + key.slice(5).toUpperCase();
 }
 
@@ -207,10 +208,17 @@ async function connect() {
     const desc = await state.esploader.main(); // 复位进下载模式 → 读芯片 → 上传 stub
     const detected = chipKeyFromDescription(desc);
     if (detected) {
-      if (state.chip && state.chip !== detected && state.chipManual) {
-        terminalAppend(`${nowTs()} [chip] 检测到实际芯片 ${desc} — 与手动指定的 ${chipDisplayName(state.chip)} 不符, 已按检测值自动匹配 (防止烧错镜像)\n`);
+      // 同一物理芯片的变体镜像 (如 esp32c5_16mb 三系统) 不能被自动识别覆盖,
+      // 否则手动选择的 16MB 镜像会被改回 4MB 版。
+      const manualVariant = state.chipManual && state.chip && state.chip.startsWith(detected + '_');
+      if (manualVariant) {
+        terminalAppend(`${nowTs()} [chip] 检测到实际芯片 ${desc} — 保留手动选择的 ${chipDisplayName(state.chip)}\n`);
+      } else {
+        if (state.chip && state.chip !== detected && state.chipManual) {
+          terminalAppend(`${nowTs()} [chip] 检测到实际芯片 ${desc} — 与手动指定的 ${chipDisplayName(state.chip)} 不符, 已按检测值自动匹配 (防止烧错镜像)\n`);
+        }
+        state.chip = detected; state.chipManual = false;
       }
-      state.chip = detected; state.chipManual = false;
     } else if (!state.chip) {
       msg(`识别到芯片 ${desc}, 但服务端没有该芯片的镜像`, 'warn');
     } else {

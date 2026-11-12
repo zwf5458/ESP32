@@ -33,7 +33,9 @@ else
   WIN_BUILD_DIR="$BUILD_DIR"
 fi
 # C5 需要 tools/install-c5-libs.sh 注入的本地 c5-libs 包 (espressif32 v8 registry 无此包)
-CHIPS=(esp32 esp32s2 esp32s3 esp32c3 esp32c5 esp32c6)
+# esp32c5_16mb 为 16MB 三系统 (Triple-Boot) 专用镜像: env 名与 chip key 一致,
+# 但 esptool 的芯片型号仍是 esp32c5 (见下方 ESPTOOL_CHIP 映射)。
+CHIPS=(esp32 esp32s2 esp32s3 esp32c3 esp32c5 esp32c5_16mb esp32c6)
 
 mkdir -p "$OUT_DIR"
 cd "$ROOT/firmware"
@@ -82,17 +84,22 @@ for CHIP in "${CHIPS[@]}"; do
   #   esp32 / esp32s2 = 0x1000 ; esp32c5 = 0x2000 ; 其余 = 0x0
   # 注意: espressif32 v8 的 platformio-build.py 把 esp32c5 也当成 0x0 (平台适配缺陷),
   #       因此这里必须显式按芯片指定, 不可沿用 pio upload 的默认。
+  # esp32c5_16mb 是同一个物理芯片的 16MB 三系统镜像, esptool 仍按 esp32c5 处理。
+  ESPTOOL_CHIP="$CHIP"
   case "$CHIP" in
-    esp32|esp32s2) BL_OFFSET="0x1000" ;;
-    esp32c5)       BL_OFFSET="0x2000" ;;
-    *)             BL_OFFSET="0x0" ;;
+    esp32|esp32s2)      BL_OFFSET="0x1000" ;;
+    esp32c5)            BL_OFFSET="0x2000" ;;
+    esp32c5_16mb)       BL_OFFSET="0x2000"; ESPTOOL_CHIP="esp32c5" ;;
+    *)                  BL_OFFSET="0x0" ;;
   esac
   if [[ -f "$BOOTLOADER" && -f "$PARTITIONS" ]]; then
-    "$ESPTOOL" --chip "$CHIP" merge-bin --pad-to-size 4MB -o "$WIN_MERGED" \
+    # pad 到 4MB: 只覆盖 ota_0 (0x10000~0x3FFFFF) 的范围, 不会碰 ota_1 (0x400000)
+    # 与 ota_2 (0x7F0000), 因此重刷审计固件不会清掉已写入的 ESPsoup/Muse。
+    "$ESPTOOL" --chip "$ESPTOOL_CHIP" merge-bin --pad-to-size 4MB -o "$WIN_MERGED" \
       "$BL_OFFSET" "$BOOTLOADER" \
       0x8000 "$PARTITIONS" \
       0x10000 "$APP_BIN" | tail -2
-    echo "[$CHIP] bootloader @ $BL_OFFSET"
+    echo "[$CHIP] bootloader @ $BL_OFFSET (esptool chip: $ESPTOOL_CHIP)"
   else
     # 数据分区/缺 bootloader (C5/C6 等环境差异) → 直接注册 app (开发调试用)
     cp "$APP_BIN" "$MERGED"

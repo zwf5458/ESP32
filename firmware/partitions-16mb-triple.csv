@@ -1,5 +1,8 @@
-# ESP32 16MB Flash 三系统 (Triple-Boot) 分区表
-# 适用于 ESP32-C5N16R8 及配备 16MB Flash 的 ESP32/S3 系列开发板
+# ESP32 16MB Flash triple-boot partition table
+# Target: ESP32-C5N16R8 (16MB) and other 16MB boards.
+# Slots: ota_0 = audit firmware, ota_1 = ESPsoup, ota_2 = Meta Muse.
+# NOTE: keep this file ASCII-only. PlatformIO parses board_build.partitions with
+# the system default encoding on Windows, so non-ASCII bytes break the build.
 # Name,   Type, SubType, Offset,   Size,     Flags
 nvs,      data, nvs,     0x009000, 0x004000,
 otadata,  data, ota,     0x00d000, 0x002000,

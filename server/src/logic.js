@@ -7,7 +7,7 @@ export const DEFAULT_ADMIN_TOKEN = 'local-admin-token-change-me';
 export const CODE_TTL_MS = 15 * 60 * 1000;
 export const VERIFY_WINDOW_MS = 60 * 1000;
 export const VERIFY_LIMIT = 10;
-export const CHIP_ALIASES = ['esp32', 'esp32s2', 'esp32s3', 'esp32c3', 'esp32c5', 'esp32c6'];
+export const CHIP_ALIASES = ['esp32', 'esp32s2', 'esp32s3', 'esp32c3', 'esp32c5', 'esp32c5_16mb', 'esp32c6'];
 export const VERSION_RE = /^[a-zA-Z0-9._-]+$/;
 
 // 判断绝对路径是否在工作区根目录内 (必须带分隔符, 防 E:\code\ESP32-other 兄弟目录误放行)

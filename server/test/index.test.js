@@ -14,7 +14,7 @@ import { readFileSync } from 'node:fs';
 import { inflateSync, inflateRawSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import {
-  DEFAULT_ADMIN_TOKEN, CODE_TTL_MS, VERIFY_WINDOW_MS, VERIFY_LIMIT, VERSION_RE,
+  DEFAULT_ADMIN_TOKEN, CODE_TTL_MS, VERIFY_WINDOW_MS, VERIFY_LIMIT, VERSION_RE, CHIP_ALIASES,
   makeIsWithinRoot, checkAdminToken, resolveClientIp, makeRegisterNonce, sweepExpired, makeVerifyLimiter,
   etagResult, redeemCode, summarizeStats, parseChannel, validateSsid,
 } from '../src/logic.js';
@@ -577,6 +577,35 @@ test('多系统引导(契约): 支持三系统槽位定义与引导切换接口'
   const partCsv = readFileSync(join(ROOT, 'firmware', 'partitions-16mb-triple.csv'), 'utf-8');
   assert.ok(partCsv.includes('ota_0') && partCsv.includes('ota_1') && partCsv.includes('ota_2'),
     '16MB 三系统分区表必须定义 ota_0/ota_1/ota_2 三个 app 分区');
+  assert.ok(/ota_1,\s*app,\s*ota_1,\s*0x400000/.test(partCsv), 'ota_1 必须落在烧录台写入偏移 0x400000');
+  assert.ok(/ota_2,\s*app,\s*ota_2,\s*0x7F0000/.test(partCsv), 'ota_2 必须落在烧录台写入偏移 0x7F0000');
+  assert.ok(!/[^\x00-\x7F]/.test(partCsv),
+    '分区表必须纯 ASCII: Windows 下 PlatformIO 按系统默认编码解析, 非 ASCII 会 UnicodeDecodeError');
+});
+
+test('多系统引导(契约): 16MB 三系统镜像已接入构建与烧录台', () => {
+  const ini = readFileSync(join(ROOT, 'firmware', 'platformio.ini'), 'utf-8');
+  const envMatch = /\[env:esp32c5_16mb\]([\s\S]*?)(?=\n\[|$)/.exec(ini);
+  assert.ok(envMatch, '必须提供 esp32c5_16mb 专用 env (保留 4MB 版 esp32c5)');
+  assert.ok(envMatch[1].includes('board_build.partitions = partitions-16mb-triple.csv'),
+    'esp32c5_16mb 必须真正使用 16MB 三系统分区表, 否则 0x400000/0x7F0000 不可引导');
+  assert.ok(/board_upload\.flash_size\s*=\s*16MB/.test(envMatch[1]), 'env 必须声明 16MB Flash');
+  assert.ok(/board_upload\.maximum_size\s*=\s*16777216/.test(envMatch[1]), 'env 必须放开 16MB 体积上限');
+  assert.ok(/\[base_esp32\][\s\S]*?board_build\.partitions = min_spiffs\.csv/.test(ini),
+    '4MB 版 env 必须继续继承 min_spiffs');
+  assert.equal((ini.match(/partitions-16mb-triple\.csv/g) || []).length, 1,
+    '16MB 分区表只能被 esp32c5_16mb 引用, 不得污染 4MB 版构建');
+
+  assert.ok(CHIP_ALIASES.includes('esp32c5_16mb'), '服务端必须允许注册/下载 esp32c5_16mb 镜像');
+  const buildSh = readFileSync(join(ROOT, 'tools', 'build-firmware.sh'), 'utf-8');
+  assert.ok(/CHIPS=\([^)]*\besp32c5_16mb\b/.test(buildSh), '构建脚本必须编译 16MB 镜像');
+  assert.ok(/esp32c5_16mb\)\s*BL_OFFSET="0x2000";\s*ESPTOOL_CHIP="esp32c5"/.test(buildSh),
+    '16MB 变体的 bootloader 偏移 0x2000 且 esptool 芯片型号仍须是 esp32c5');
+
+  const appJs = readFileSync(join(ROOT, 'flasher', 'app.js'), 'utf-8');
+  assert.ok(appJs.includes("key === 'esp32c5_16mb'"), '烧录台必须能正确显示 16MB 变体名称');
+  assert.ok(/startsWith\(detected \+ '_'\)/.test(appJs),
+    '自动识别不得覆盖手动选择的同芯片变体镜像 (否则 16MB 镜像会被改回 4MB 版)');
 });
 
 

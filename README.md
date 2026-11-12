@@ -151,9 +151,11 @@ sh tools/install-registry-pkg.sh ~/pio-dl/framework-*.tar.gz ~/pio-dl/tool-*.tar
 sh tools/build-firmware.sh 1.1.0
 ```
 
-已验证 6 个 env 全部 SUCCESS：
-`esp32 / esp32s2 / esp32s3 / esp32c3 / esp32c5 / esp32c6`；
-其中 `esp32c5` 由 `tools/install-c5-libs.sh` 注入本地 libs 包实现（实验性支持）。
+已验证 7 个 env 全部 SUCCESS：
+`esp32 / esp32s2 / esp32s3 / esp32c3 / esp32c5 / esp32c5_16mb / esp32c6`；
+其中 `esp32c5` 由 `tools/install-c5-libs.sh` 注入本地 libs 包实现（实验性支持），
+`esp32c5_16mb` 是同一芯片的 16MB 三系统 (Triple-Boot) 镜像（见
+[docs/firmware-flashing.md §6](docs/firmware-flashing.md)）。
 
 > **Windows（Git Bash）**：venv 的可执行文件在 `~/.venvs/platformio/Scripts/`，
 > 需把该目录加入 `PATH`（或安装全局 PlatformIO）让 `pio` 可被找到；`tools/build-firmware.sh`
@@ -163,7 +165,7 @@ sh tools/build-firmware.sh 1.1.0
 
 ```
 firmware/           PlatformIO 工程（Arduino 框架, espressif32 v8）
-├── platformio.ini  可编 env: esp32/s2/s3/c3/c5/c6（c5 需本地注入 libs）
+├── platformio.ini  可编 env: esp32/s2/s3/c3/c5/c5_16mb/c6（c5 需本地注入 libs）
 ├── src/main.cpp    共享固件逻辑（AP + 鉴权 API + 抓包/教学模块 + 日志/扫描/目标）
 ├── src/admin_page.h       自动生成（勿手改）
 ├── src/wifi_weak_dict.h   内置 7,153 条弱口令（由 build-wordlist.mjs 生成）
@@ -215,6 +217,7 @@ esptool `BOOTLOADER_FLASH_OFFSET`）：
 |---|---|---|
 | `esp32` / `esp32s2` | `0x1000` | 经典 ESP32 与 S2 的 ROM 约定 |
 | `esp32c5` | `0x2000` | WiFi 6 双频芯片, 前 2 扇区保留 |
+| `esp32c5_16mb` | `0x2000` | 同一芯片的 16MB 三系统镜像, esptool 型号仍是 `esp32c5` |
 | `esp32s3` / `esp32c3` / `esp32c6` | `0x0` | 新版 RISC-V/S3 从 0 起 |
 
 分区表固定 `0x8000`、app 固定 `0x10000`（PlatformIO 默认，全系列一致）。
