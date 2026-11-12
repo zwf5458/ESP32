@@ -3723,8 +3723,8 @@ static bool switchBootSystem(const String &targetId, String &errOut) {
   }
   const esp_partition_t *running = esp_ota_get_running_partition();
   if (running && running->address == targetPart->address) {
-    errOut = String("当前正在运行 [") + targetSlot->name + "]";
-    return true;
+    errOut = String("当前正在运行 [") + targetSlot->name + "], 无需切换";
+    return false;  // 走 400 提示路径, 避免对当前系统重复重启
   }
   if (!isSlotInstalled(targetPart)) {
     errOut = String("[") + targetSlot->name + "] 分区尚未烧录有效固件 (需在烧录台刷入 " + targetPart->label + ")";
