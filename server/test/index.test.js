@@ -624,6 +624,29 @@ test('多系统引导(契约): C5 构建开启原生 USB CDC (真机验收要求
     'esp32c5_16mb 不得自定义 build_flags (应通过 extends 继承 esp32c5 的 CDC 配置)');
 });
 
+test('扫描(契约): /api/scan 支持频段过滤, 默认 2.4G 缩短热点断网窗口', () => {
+  const main = readFileSync(join(ROOT, 'firmware', 'src', 'main.cpp'), 'utf-8');
+  // C5 双频全扫射频离站 ~30s+ → 软 AP 信标中断 → 客户端被踢且不自动重连 (真机实测)。
+  // 固件必须读取 ?band= 并用 esp_wifi_set_band_mode 缩小扫描范围, 且扫描后恢复 AUTO。
+  assert.ok(main.includes('server.arg("band")'),
+    'handleScan 必须读取 ?band= 查询参数');
+  assert.ok(/esp_wifi_set_band_mode\(scanBand\)/.test(main) &&
+            /esp_wifi_set_band_mode\(WIFI_BAND_MODE_AUTO\)/.test(main),
+    'handleScan 必须在扫描期间切换 band mode 并在扫描(含重试)后恢复 AUTO');
+  assert.ok(main.includes('WIFI_BAND_MODE_2G_ONLY') && main.includes('WIFI_BAND_MODE_5G_ONLY'),
+    'handleScan 必须支持 2.4G-only 与 5G-only 两种过滤');
+
+  const html = readFileSync(join(ROOT, 'firmware', 'data', 'admin.html'), 'utf-8');
+  assert.ok(html.includes("api('/api/scan?band='"),
+    'admin.html 扫描请求必须传递 band 参数 (默认 2.4G)');
+  assert.ok(html.includes("scanBand: '2'"),
+    'admin.html 默认扫描频段必须是 2.4G (基本不断网)');
+  assert.ok(html.includes('scanBandSel'),
+    'admin.html 必须提供扫描范围选择器 (双频扫描会断网, 须让用户可选且知情)');
+  assert.ok(html.includes('期间热点会短暂断开'),
+    'admin.html 必须提示扫描期间热点断开属正常 (消除误判为设备故障)');
+});
+
 // ---------------- P4: 设备识别 (BLE 画像 + 厂商表) ----------------
 const p4Adv = JSON.parse(
   readFileSync(join(ROOT, 'server', 'test', 'fixtures', 'p4-ble-adv.json'), 'utf-8'),

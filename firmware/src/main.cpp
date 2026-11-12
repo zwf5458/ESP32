@@ -2359,13 +2359,41 @@ static void sendInfo() {
 }
 
 static void handleScan() {
-  log("[scan] 开始扫描周围 AP …");
+  // 频段过滤 (真机验证: C5 双频全扫射频离站 ~30s+ → 软 AP 信标中断 → 客户端被踢且不自动重连):
+  // ?band=2/2g → 只扫 2.4G (14 信道, 默认推荐); ?band=5/5g → 只扫 5G; 其余/缺省 → 双频全扫 (旧行为)
+  String bandArg = server.arg("band");
+  wifi_band_mode_t scanBand = WIFI_BAND_MODE_AUTO;
+  const char *bandName = "双频";
+  uint32_t scanStartedAt = millis();
+  if (bandArg == "2" || bandArg == "2g" || bandArg == "24") {
+    scanBand = WIFI_BAND_MODE_2G_ONLY;
+    bandName = "2.4G";
+  } else if (bandArg == "5" || bandArg == "5g") {
+    scanBand = WIFI_BAND_MODE_5G_ONLY;
+    bandName = "5G";
+  }
+  log("[scan] 开始扫描周围 AP (频段: " + String(bandName) + ") @" + String(millis()) + "ms");
+  // 扫描期间临时切换 band mode 缩短射频离站时间, 结束后恢复 AUTO (不影响软 AP 信道配置)
+  if (scanBand != WIFI_BAND_MODE_AUTO) {
+    esp_err_t bem = esp_wifi_set_band_mode(scanBand);
+    log("[scan] band mode -> " + String(bandName) + " (err=0x" + String((uint32_t)bem, HEX) + ")");
+  }
   // 优化: 主动扫描信道驻留时间设为 120ms (扫描耗时缩减 60%, 显著降低软 AP 连接抖动与看门狗超时风险)
   int16_t n = WiFi.scanNetworks(false, true, false, 120);
   if (n < 0) {
-    WiFi.scanDelete();
-    n = WiFi.scanNetworks(false, true, false, 150);
+    // 频段过滤扫描不重试: WebServer 响应窗口仅 5s (HTTP_MAX_SEND_WAIT), 重试会翻倍超窗
+    if (scanBand == WIFI_BAND_MODE_AUTO) {
+      WiFi.scanDelete();
+      n = WiFi.scanNetworks(false, true, false, 150);
+    }
   }
+  if (scanBand != WIFI_BAND_MODE_AUTO) {
+    esp_err_t ber = esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);
+    log("[scan] band mode 恢复 AUTO (err=0x" + String((uint32_t)ber, HEX) + ") 扫描结果 n=" + String(n) +
+        " 耗时" + String((uint32_t)(millis() - scanStartedAt)) + "ms");
+  }
+  // 扫描结束后立即将射频强制切回 SoftAP 设定信道, 确保与电脑等客户端的连接迅速恢复
+  applyApChannel(apChannel);
   String json;
   json.reserve(1024 + (n > 0 ? n * 120 : 0));
   json = "{\"networks\":[";
