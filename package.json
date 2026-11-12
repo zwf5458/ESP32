@@ -13,7 +13,8 @@
     "gen-vendor": "node tools/gen-vendor-tables.mjs --fetch --src tools/vendor-src",
     "gen-code": "node tools/gen-code.mjs",
     "codes": "node tools/gen-code.mjs --list",
-    "stats": "node tools/gen-code.mjs --stats"
+    "stats": "node tools/gen-code.mjs --stats",
+    "verify-c5-16mb": "node tools/verify-c5-16mb.mjs"
   },
   "keywords": [],
   "author": "",
