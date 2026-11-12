@@ -280,7 +280,7 @@ const esc = s => String(s ?? '').replace(/[<>&"]/g, c => ({ '<': '&lt;', '>': '&
 function fragPct(free, maxBlock) { return free > 0 ? Math.max(0, (100 - 100 * maxBlock / free)).toFixed(0) : '--'; }
 
 const state = {
-  info: null, target: null, scan: [], filter: 'all', showHidden: true,
+  info: null, target: null, scan: [], filter: 'all', showHidden: true, scanBand: '2',
   scanSort: { key: 'rssi', asc: false }, logId: 0,
   deauthStatus: { running: false, count: 0, rate: 10, channel: 6, reason: 1 },
   handshakeStatus: { capturing: false, m1: false, m2: false, m3: false, m4: false, pmkid: false, captured: false, unsupported: false, keyver: 0, frames: 0, cracking: false, progress: 0, total: 7153, crackedPass: '' },
@@ -327,13 +327,30 @@ const band5gNote = () => has5g()
   : '';
 
 async function api(path, opts = {}) {
-  const r = await fetch(path, withAdminAuth(opts));
-  if (r.status === 401) {
-    showLogin('口令已失效，请重新登录');
-    throw new Error('未授权: 请输入后台口令');
+  const fetchOpts = Object.assign({}, opts);
+  const timeoutMs = fetchOpts.timeoutMs;
+  delete fetchOpts.timeoutMs;
+  let timer = null;
+  let timedOut = false;
+  if (!fetchOpts.signal && timeoutMs !== 0) {
+    const ctrl = new AbortController();
+    fetchOpts.signal = ctrl.signal;
+    timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, timeoutMs || 12000);
   }
-  if (!r.ok) throw new Error((await r.text()) || r.statusText);
-  return r.json();
+  try {
+    const r = await fetch(path, withAdminAuth(fetchOpts));
+    if (r.status === 401) {
+      showLogin('口令已失效，请重新登录');
+      throw new Error('未授权: 请输入后台口令');
+    }
+    if (!r.ok) throw new Error((await r.text()) || r.statusText);
+    return await r.json();
+  } catch (e) {
+    if (timedOut) throw new Error('请求超时，请确认电脑仍连接在设备热点上');
+    throw e;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /* ---------- 后台口令 (localStorage) ---------- */
@@ -532,23 +549,93 @@ function renderTarget() {
 
 /* ---------- 2. 扫描与嗅探 ---------- */
 let scanFlag = false;
-async function realScan() {
-  if (scanFlag) return; scanFlag = true;
-  const st = $('#scanStatus');
-  if (st) st.textContent = '正在扫描周围无线信道 …';
-  const btn = $('#btnScan');
-  if (btn) btn.disabled = true;
-  try {
-    const j = await api('/api/scan');
-    state.scan = j.networks || [];
-    log('[scan] 扫描完成: 共发现 ' + state.scan.length + ' 个 AP', 't-ok');
-    if (st) st.textContent = state.scan.length + ' 个 AP 点击列表标题排序';
-  } catch (e) {
-    if (st) st.textContent = '扫描失败: ' + e.message;
+let scanAbortCtrl = null;
+let scanTimerInterval = null;
+
+function stopOrResetScan(reason = '已手动取消扫描') {
+  if (scanTimerInterval) { clearInterval(scanTimerInterval); scanTimerInterval = null; }
+  if (scanAbortCtrl) {
+    try { scanAbortCtrl.abort(); } catch {}
+    scanAbortCtrl = null;
   }
   scanFlag = false;
-  if (btn) btn.disabled = false;
+  const btn = $('#btnScan');
+  if (btn) { btn.disabled = false; btn.textContent = '开始扫描'; }
+  const btnStop = $('#btnStopScan');
+  if (btnStop) btnStop.style.display = 'none';
+  const st = $('#scanStatus');
+  if (st) st.textContent = state.scan.length ? `${state.scan.length} 个 AP (${reason})` : `就绪 · ${reason}`;
   paintScan();
+  if ($('#adApBody')) updateAirodumpUI();
+}
+
+async function realScan() {
+  if (scanFlag) return;
+  scanFlag = true;
+  let elapsed = 0;
+  const band = state.scanBand || '2';
+  const bandLabel = { '2': '2.4G', '5': '5G', 'all': '双频全部' }[band] || band;
+  const st = $('#scanStatus');
+  const btn = $('#btnScan');
+  const btnStop = $('#btnStopScan');
+
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ 扫描中 (0s)'; }
+  if (btnStop) btnStop.style.display = 'inline-block';
+
+  const updateDynamicUi = () => {
+    const dots = '.'.repeat((elapsed % 4) + 1);
+    if (btn) btn.textContent = `⏳ 扫描中 (${elapsed}s)`;
+    if (st) {
+      st.innerHTML = `<span style="color:#ffe14d;font-weight:800">📡 正在扫描 ${bandLabel} 信道 [已用时 ${elapsed}s]${dots}</span> <span style="font-size:11px;color:#8a7f6d">射频逐信道侦听中，请保持连接</span>`;
+    }
+    const tb = $('#tbody');
+    if (tb && (!state.scan || state.scan.length === 0)) {
+      tb.innerHTML = `<tr><td colspan="6" style="text-align:center;padding:26px;color:#ffe14d"><b style="font-size:14px">⏳ 正在扫描无线信道（已用时 ${elapsed} 秒）${dots}</b><br><small style="color:#888;margin-top:6px;display:block">ESP32 正在逐信道发包收回响应，结果即将呈现</small></td></tr>`;
+    }
+    const adTb = $('#adApBody');
+    if (adTb && (!state.scan || state.scan.length === 0)) {
+      adTb.innerHTML = `<tr><td colspan="7" style="text-align:center;padding:26px;color:#ffe14d"><b style="font-size:14px">⏳ 正在扫描无线信道（已用时 ${elapsed} 秒）${dots}</b></td></tr>`;
+    }
+  };
+
+  updateDynamicUi();
+  if (scanTimerInterval) clearInterval(scanTimerInterval);
+  scanTimerInterval = setInterval(() => {
+    elapsed++;
+    updateDynamicUi();
+  }, 1000);
+
+  scanAbortCtrl = new AbortController();
+  // 扫描双频近40个信道时耗时可达 20~30s, 设置 60s 充足窗口, 避免前端过早掐断请求并保证一直展示扫描中
+  const timeoutMs = 60000;
+  const timer = setTimeout(() => {
+    if (scanFlag) {
+      log('[scan] 扫描超时: 若电脑自动切换回了自家Wi-Fi，请重新连接 ESP32 热点', 't-warn');
+      stopOrResetScan('扫描超时 · 请检查电脑是否已断开开发板热点');
+    }
+  }, timeoutMs);
+
+  try {
+    const j = await api('/api/scan?band=' + encodeURIComponent(band), { signal: scanAbortCtrl.signal });
+    clearTimeout(timer);
+    if (scanTimerInterval) { clearInterval(scanTimerInterval); scanTimerInterval = null; }
+    state.scan = j.networks || [];
+    log('[scan] 扫描完成: 共发现 ' + state.scan.length + ' 个 AP (耗时 ' + elapsed + 's)', 't-ok');
+    if (st) st.textContent = `${state.scan.length} 个 AP (耗时 ${elapsed}s) · 点击列表标题排序`;
+  } catch (e) {
+    clearTimeout(timer);
+    if (scanTimerInterval) { clearInterval(scanTimerInterval); scanTimerInterval = null; }
+    const isAbort = e.name === 'AbortError' || scanAbortCtrl?.signal?.aborted;
+    const errText = isAbort ? '扫描超时或已取消' : (e.message || '网络连接中断');
+    if (st) st.textContent = '扫描未完成: ' + errText + ' (请确认仍连在板载热点)';
+    log('[scan] 扫描中断: ' + errText, 't-warn');
+  }
+  scanFlag = false;
+  scanAbortCtrl = null;
+  if (btn) { btn.disabled = false; btn.textContent = '开始扫描'; }
+  if (btnStop) btnStop.style.display = 'none';
+  paintScan();
+  if ($('#adApBody')) updateAirodumpUI();
 }
 
 function sortScan(key) {
@@ -625,6 +712,12 @@ function renderScan() {
   $('#view').innerHTML = `
   <div class="scanband">
     <button class="btn yellow" id="btnScan" style="font-size:13px;padding:8px 14px">开始扫描</button>
+    <button class="btn gray sm" id="btnStopScan" style="font-size:13px;padding:8px 14px;display:none" title="中断当前等待，恢复按钮状态">⏹ 停止/取消</button>
+    <select class="mini" id="scanBandSel" style="max-width:200px" title="扫描范围：双频扫描时设备射频会长时间离开热点信道，热点会断开较久">
+      <option value="2" ${state.scanBand==='2'?'selected':''}>范围: 2.4G (推荐·基本不断网)</option>
+      <option value="5" ${state.scanBand==='5'?'selected':''}>范围: 5G (热点会断开数秒)</option>
+      <option value="all" ${state.scanBand==='all'?'selected':''}>范围: 双频全部 (断网最久)</option>
+    </select>
     <div class="filters">
       <span style="font-weight:900;margin-right:2px">频段:</span>
       <label><input type="radio" name="f" value="24" ${state.filter==='24'?'checked':''}> 2.4G</label>
@@ -633,6 +726,7 @@ function renderScan() {
       <label style="margin-left:6px;border-left:2px solid #ccc;padding-left:8px"><input type="checkbox" id="chkHidden" ${state.showHidden?'checked':''}> +隐藏</label>
     </div>
     <div class="st" id="scanStatus" style="width:100%;margin-top:2px">${state.scan.length ? state.scan.length + ' 个 AP 点击列表标题排序' : '就绪 · 点击开始扫描'}</div>
+    <div class="st" style="width:100%;margin-top:1px;font-size:11px;color:#8a7f6d">⚠ 扫描时设备射频需逐信道侦听，期间热点会短暂断开属正常 — 扫描结束自动恢复；5G/双频扫描断开最久，推荐默认 2.4G</div>
   </div>
   <div class="card" style="padding:10px 14px;margin:0 0 12px;font-size:13px">
     操作顺序: <b>③ 点击开始扫描 → ④ 把其它频段/同名目标设为「+双子」 → ⑤ 把主目标设为「目标」(2.4G${has5g() ? ' 或 5G 非 DFS' : ''}; 5G DFS 只能做双子)</b> → ⑥ 进入「邪恶双子攻击」点击「发起攻击」
@@ -646,9 +740,13 @@ function renderScan() {
   <div class="logc" id="logc">[SYSTEM] 就绪。</div>`;
 
   $$('.filters input[type=radio]').forEach(r => r.onchange = () => { state.filter = r.value; paintScan(); });
+  const bandSel = $('#scanBandSel');
+  if (bandSel) bandSel.onchange = () => { state.scanBand = bandSel.value; };
   const chk = $('#chkHidden');
   if (chk) chk.onchange = () => { state.showHidden = chk.checked; paintScan(); };
   $('#btnScan').onclick = realScan;
+  const btnStop = $('#btnStopScan');
+  if (btnStop) btnStop.onclick = () => stopOrResetScan('用户手动取消');
   paintScan();
 }
 async function pickTarget(t, role) {
@@ -669,6 +767,7 @@ async function pickTarget(t, role) {
   }
   try {
     if (role === 'twin') {
+      toast('正在加入双子目标…');
       await api('/api/twin', { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(Object.assign({}, t, { fakeAp: 'false' })) });
       log('[twin] 已加入双子目标: ' + (t.ssid || '(隐藏)') + ' @ ' + t.bssid + ' 信道' + t.channel);
@@ -676,6 +775,7 @@ async function pickTarget(t, role) {
       await pollInfo(); paintScan();
       toast('已加入双子目标 (共 ' + ((state.info?.twins || []).length) + ' 条)');
     } else {
+      toast('正在设置主目标并跳转…');
       await api('/api/target', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(t) });
       state.target = t;
       log('[target] 已设置主目标: ' + (t.ssid || '(隐藏)') + ' @ ' + t.bssid + ' 信道' + t.channel);
@@ -868,6 +968,15 @@ function renderPacket() {
 }
 
 /* ---------- 3. Airodump 侦察 (Airodump Recon) ---------- */
+window.selectTgt = (idx) => {
+  const list = state.scan || [];
+  if (list[idx]) pickTarget(list[idx], 'primary');
+};
+window.selectTwin = (idx) => {
+  const list = state.scan || [];
+  if (list[idx]) pickTarget(list[idx], 'twin');
+};
+
 function updateAirodumpUI() {
   const a = state.airodumpStatus || {};
   const pill = $('#adPill');
