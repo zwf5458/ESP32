@@ -551,3 +551,6 @@ EAPOL/握手材料（M1~M4、PMKID、nonce、MIC）、凭据或密码字段。
   经典 ESP32 因 Bluedroid 体积与双 app 槽冲突而裁剪）已实现待真机验证；P3（802.15.4
   纯被动嗅探 + 信道能量扫描，C5/C6 开放）已实现待真机验证。差距与改造清单见
   [docs/plans/2026-11-11-c5-5ghz-ble-802154-roadmap.md](docs/plans/2026-11-11-c5-5ghz-ble-802154-roadmap.md)
+- P4 设备识别与指纹（BLE 厂商/类别、OUI 厂商名、ASTM F3411 Remote ID）：
+  规划中，含字段扩展、体积预算与契约测试点，见
+  [docs/plans/2026-11-12-p4-device-identification-roadmap.md](docs/plans/2026-11-12-p4-device-identification-roadmap.md)
