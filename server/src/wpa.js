@@ -265,6 +265,40 @@ export function buildEapolM2({
  * has to come from its M1, which the capture procedure recorded. `keyver`
  * overrides the version bits of the frame when the AP did not set them.
  */
+/**
+ * prepareCrack: 校验入参并预计算两条跑包路径 (同步 / 异步) 共用的帧上下文。
+ * 入参校验与 M2 解析只在这里做一次，避免同步版与异步版各自维护一份。
+ */
+function prepareCrack({ essid, candidates, eapol, anonce, aa, spa, keyver, maxCandidates = 0 }) {
+  if (!Array.isArray(candidates) || candidates.length === 0) {
+    throw new Error('no candidate passwords given');
+  }
+  if (!Buffer.isBuffer(eapol)) throw new Error('a captured EAPOL-Key frame is required');
+  if (!anonce || !aa || !spa) throw new Error('anonce, aa and spa are required');
+  const parsed = parseM2(eapol);
+  const keyInfo = keyver ?? parsed.keyver;
+  return {
+    frame: eapol,
+    keyInfo,
+    kddParts: { aa, spa, anonce, snonce: parsed.snonce },
+    carried: eapol.subarray(EAPOL_KEY_MIC_OFFSET, EAPOL_KEY_MIC_OFFSET + MIC_LEN),
+    limit: maxCandidates > 0 ? Math.min(candidates.length, maxCandidates) : candidates.length,
+  };
+}
+
+/**
+ * verifyCandidate: 单个候选口令的完整校验 (PBKDF2 → PTK/KCK → 重算 MIC → 定长比较)。
+ * 返回 true 表示命中；比较使用 timingSafeEqual，不泄露前缀匹配长度。
+ */
+function verifyCandidate(candidate, essid, { frame, keyInfo, kddParts, carried }) {
+  const kck = deriveKck({
+    pmk: pbkdf2Sha1(candidate, essid),
+    ...kddParts,
+    keyver: keyInfo,
+  });
+  return crypto.timingSafeEqual(eapolKeyMic({ kck, eapol: frame, keyver: keyInfo }), carried);
+}
+
 export function crackHandshake({
   essid,
   candidates,
@@ -275,28 +309,13 @@ export function crackHandshake({
   keyver,
   maxCandidates = 0,
 }) {
-  if (!Array.isArray(candidates) || candidates.length === 0) {
-    throw new Error('no candidate passwords given');
-  }
-  if (!Buffer.isBuffer(eapol)) throw new Error('a captured EAPOL-Key frame is required');
-  if (!anonce || !aa || !spa) throw new Error('anonce, aa and spa are required');
-  const frame = eapol;
-  const parsed = parseM2(frame);
-  const keyInfo = keyver ?? parsed.keyver;
-  const kddParts = { aa, spa, anonce, snonce: parsed.snonce };
-  const carried = frame.subarray(EAPOL_KEY_MIC_OFFSET, EAPOL_KEY_MIC_OFFSET + MIC_LEN);
-  const limit = maxCandidates > 0 ? Math.min(candidates.length, maxCandidates) : candidates.length;
-  for (let i = 0; i < limit; i++) {
-    const kck = deriveKck({
-      pmk: pbkdf2Sha1(candidates[i], essid),
-      ...kddParts,
-      keyver: keyInfo,
-    });
-    if (crypto.timingSafeEqual(eapolKeyMic({ kck, eapol: frame, keyver: keyInfo }), carried)) {
-      return { index: i, candidate: String(candidates[i]), attempts: i + 1, keyver: keyInfo };
+  const ctx = prepareCrack({ essid, candidates, eapol, anonce, aa, spa, keyver, maxCandidates });
+  for (let i = 0; i < ctx.limit; i++) {
+    if (verifyCandidate(candidates[i], essid, ctx)) {
+      return { index: i, candidate: String(candidates[i]), attempts: i + 1, keyver: ctx.keyInfo };
     }
   }
-  return { index: -1, candidate: null, attempts: limit, keyver: keyInfo };
+  return { index: -1, candidate: null, attempts: ctx.limit, keyver: ctx.keyInfo };
 }
 
 /**
@@ -314,31 +333,16 @@ export async function crackHandshakeAsync({
   maxCandidates = 0,
   batchSize = 25,
 }) {
-  if (!Array.isArray(candidates) || candidates.length === 0) {
-    throw new Error('no candidate passwords given');
-  }
-  if (!Buffer.isBuffer(eapol)) throw new Error('a captured EAPOL-Key frame is required');
-  if (!anonce || !aa || !spa) throw new Error('anonce, aa and spa are required');
-  const frame = eapol;
-  const parsed = parseM2(frame);
-  const keyInfo = keyver ?? parsed.keyver;
-  const kddParts = { aa, spa, anonce, snonce: parsed.snonce };
-  const carried = frame.subarray(EAPOL_KEY_MIC_OFFSET, EAPOL_KEY_MIC_OFFSET + MIC_LEN);
-  const limit = maxCandidates > 0 ? Math.min(candidates.length, maxCandidates) : candidates.length;
-  for (let i = 0; i < limit; i++) {
-    const kck = deriveKck({
-      pmk: pbkdf2Sha1(candidates[i], essid),
-      ...kddParts,
-      keyver: keyInfo,
-    });
-    if (crypto.timingSafeEqual(eapolKeyMic({ kck, eapol: frame, keyver: keyInfo }), carried)) {
-      return { index: i, candidate: String(candidates[i]), attempts: i + 1, keyver: keyInfo };
+  const ctx = prepareCrack({ essid, candidates, eapol, anonce, aa, spa, keyver, maxCandidates });
+  for (let i = 0; i < ctx.limit; i++) {
+    if (verifyCandidate(candidates[i], essid, ctx)) {
+      return { index: i, candidate: String(candidates[i]), attempts: i + 1, keyver: ctx.keyInfo };
     }
     if ((i + 1) % batchSize === 0) {
       await new Promise((resolve) => setImmediate(resolve));
     }
   }
-  return { index: -1, candidate: null, attempts: limit, keyver: keyInfo };
+  return { index: -1, candidate: null, attempts: ctx.limit, keyver: ctx.keyInfo };
 }
 
 /** parseM2: pull the fields the 4-way handshake needs out of an EAPOL-Key frame. */
