@@ -74,6 +74,7 @@ BLE 扫描 / 802.15.4 扫描 / 捕获凭据 / 配置）。**首次上电时设�
 | Karma 探针诱捕 | ✅ 真实实现 | 监听真实 Probe Request，记录客户端 MAC / 目标 SSID / RSSI；SSID 命中当前克隆热点时标记为「已诱捕」，并复用握手捕获链路同步收集 4-Way Handshake |
 | BLE 广播嗅探 | ✅ 真实实现 | 纯被动监听周边 BLE 广播（ADV_IND / SCAN_RSP 等），解析 MAC / 名称 / RSSI / 广播类型 / 厂商数据摘要 / 广播计数；不发 SCAN_REQ、不连接设备。C3/C5/C6/S3 开放（NimBLE 后端），经典 ESP32 因 Bluedroid 体积与双 app 槽冲突而裁剪，S2 无蓝牙硬件 |
 | 802.15.4 嗅探 | ✅ 真实实现 | 纯被动接收 IEEE 802.15.4 帧（Zigbee / Thread / 智能家居），解析帧类型 / PAN ID / 源地址 / RSSI / LQI，并对 11-26 信道做能量检测（dBm）；promiscuous 模式只收不发、不自动 ACK、不注入。仅 ESP32-C5 / C6 具备该射频，其余芯片整页隐藏且 API 返回 501；与 WiFi 2.4G 共用射频，AP 保持在线、抓包为分时采样 |
+| 16MB 三系统引导 | ✅ 实现（`esp32c5_16mb`） | 16MB C5 板（C5N16R8）上划分 `ota_0/ota_1/ota_2` 三个 app 槽（各 3.9375MB）+ 共享 spiffs，可部署审计固件 / ESPsoup / Meta Muse 并通过 `GET·POST /api/system/boot`、串口 `boot` 命令或烧录台「外部固件刷写」切换；4MB 版 `esp32c5` 不受影响 |
 
 **Evil Twin 自 2026-11-10 起为真实实现**（热点真实改名 + 联动 Deauth 双频段压制），
 Deauther 自 2026-11-10 起为真实帧注入，
@@ -206,6 +207,26 @@ docs/plans/         设计文档（含固件 API、合规边界、视觉规范�
 docs/firmware-flashing.md  刷固件说明（网页烧录台 + 命令行 esptool + 常见问题）
 ```
 
+## 16MB 三系统 (Triple-Boot)
+
+16MB Flash 的 C5（如 ESP32-C5N16R8）用专用 env `esp32c5_16mb` 构建，可在同一块板上
+部署并无缝切换三套系统：
+
+| 槽位 | 偏移 | 系统 |
+|---|---|---|
+| `ota_0` | `0x10000` | Wi-Fi 安全审计平台（本工程固件） |
+| `ota_1` | `0x400000` | ESPsoup 口袋 SDR |
+| `ota_2` | `0x7F0000` | Meta Muse AI 伴侣 |
+
+- 分区表 `firmware/partitions-16mb-triple.csv`（纯 ASCII，Windows 下 PlatformIO 按系统编码解析）；
+- 4MB 版 `esp32c5` 仍用 `min_spiffs.csv`，两个镜像在烧录台里分开注册（key 分别为
+  `esp32c5` / `esp32c5_16mb`，后者显示为「ESP32-C5 (16MB 三系统)」）；
+- 合并镜像仍按 4MB pad，只覆盖 `ota_0`，重刷审计固件不会抹掉 `ota_1`/`ota_2`；
+- 切换：后台「多系统引导管理」卡片、串口 `boot audit|espsoup|muse`，或 `POST /api/system/boot`。
+
+完整部署步骤、构建自检、真机验证清单与常见问题见
+[docs/firmware-flashing.md §6](docs/firmware-flashing.md#6-附16mb-flash-三系统-triple-boot-部署说明)。
+
 ## 合并镜像布局与 Bootloader 偏移（重要）
 
 `tools/build-firmware.sh` 用 `esptool merge-bin` 把三段合成单镜像，
@@ -294,7 +315,10 @@ unused ──verify──▶ verified(15min) ──烧录成功/pair nonce──
 - ✅ 已核销的码再次 verify 被拒
 - ✅ 镜像注册 0xE9 魔数校验 / 下载 md5 与 manifest 一致
 - ✅ 烧录台 UI：校验通过、错误提示、进度条、控制台渲染正常
-- ✅ 全 6 芯片镜像产出并注册（esp32/s2/s3/c3/c5/c6，C5 经本地 libs 注入支持）
+- ✅ 全 7 个镜像产出并注册（esp32/s2/s3/c3/c5/**c5_16mb**/c6，C5 经本地 libs 注入支持）
+- ✅ 16MB 三系统构建自检（2026-11-12）：`esp32c5_16mb` 编译 SUCCESS，分区表反解
+  `ota_0/1/2` 各 4032K、偏移 `0x10000/0x400000/0x7F0000`，合并镜像 4MB 且 `0x2000`=`0xE9`、
+  `0x8000`=`0xAA50`，契约测试 41/41
 - ✅ 固件后台 SPA 已内嵌（/api/scan、/api/target、/api/log、扩展 /api/info 编译通过）
 - ✅ 2026-11-11 全量重建 6 芯片 v1.1.0 镜像并注册（4MB / 逐芯片），DB `md5`/`size`
   与磁盘逐字节一致；镜像内嵌 `admin.html` 解压后与源文件逐字节相同
@@ -303,8 +327,29 @@ unused ──verify──▶ verified(15min) ──烧录成功/pair nonce──
 - ✅ 抓包模块回归：Sniffer / Airodump / Karma 共用 promiscuous 回调抓真实帧，
   握手状态并入 `/api/info`，冗余路由不再注册
 - ⬜ 真机烧录 + 热点后台端到端（需要接一块 ESP32/S2/S3/C3/C6 板）
+- ⬜ 16MB 三系统真机验证（需 ESP32-C5N16R8，步骤见 `docs/firmware-flashing.md` §6.6）
 
 ## 变更记录
+
+### 2026-11-12（四）16MB 三系统分区表接入构建
+
+- **根因修复**：`partitions-16mb-triple.csv` 此前只有文档与契约测试引用，所有 env 仍用
+  `min_spiffs.csv`，导致烧录台写入 `0x400000` / `0x7F0000` 的 ESPsoup / Muse 固件不对应
+  任何可引导分区，后台与串口 `boot` 切换均报「未找到分区」。现新增 `[env:esp32c5_16mb]`
+  （`extends = env:esp32c5`）并使用 16MB 三系统表，4MB 版 `esp32c5` 保持 `min_spiffs` 不变。
+- **构建链路**：`build-firmware.sh` 的 `CHIPS` 增加 `esp32c5_16mb`，esptool 物理芯片型号
+  经 `ESPTOOL_CHIP` 映射回 `esp32c5`（bootloader 偏移同为 `0x2000`）；`merge-bin` 仍按
+  4MB pad，只覆盖 `ota_0` 范围，重复刷新审计固件不会抹掉 `ota_1`/`ota_2`。
+- **分区表编码**：CSV 注释改为纯 ASCII —— Windows 下 PlatformIO 按系统默认编码（GBK）
+  解析 `board_build.partitions`，中文注释会 `UnicodeDecodeError` 直接构建失败。
+- **服务端 / 烧录台**：`CHIP_ALIASES` 与 `BOOTLOADER_OFFSET` 登记 `esp32c5_16mb`（`0x2000`）；
+  烧录台显示「ESP32-C5 (16MB 三系统)」，且自动识别不再覆盖手动选中的同芯片变体镜像。
+- **验证**：`pio run -e esp32c5_16mb` SUCCESS（Flash 45.8% / RAM 14.5%）；分区表反解确认
+  `ota_0/1/2` 各 4032K、偏移与烧录台一致；合并镜像正好 4MB，`0x2000` 为 `0xE9`、
+  `0x8000` 为 `0xAA50`；`npm test` 41/41 通过。
+- **文档**：`firmware-flashing.md` §6 增补镜像/env 对应表、构建自检、真机验证清单与常见问题。
+- ⬜ 真机验证待执行（需 ESP32-C5N16R8）：刷 16MB 镜像 → 分写 `ota_1`/`ota_2` → 切换 →
+  重刷审计固件确认外部系统仍保留。
 
 ### 2026-11-11（三）安全加固与工程闭环
 

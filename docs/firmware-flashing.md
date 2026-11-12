@@ -320,7 +320,24 @@ esptool --chip esp32c5 -p COM5 -b 460800 write-flash 0x0 c5n16r8-backup.bin
 2. **ESPsoup 口袋 SDR 模式**（`ota_1`，全频段接收机与瀑布图）
 3. **Meta Muse AI 伴侣模式**（`ota_2`，Wi-Fi 6 联网与智能家居网关）
 
-### 6.1 分区规划（`firmware/partitions-16mb-triple.csv`）
+### 6.1 镜像与构建 env 的对应关系
+
+C5 有两个镜像，烧录台里分开注册，**别选错**：
+
+| chip key / env | 分区表 | 适用板子 | 说明 |
+|---|---|---|---|
+| `esp32c5` | `min_spiffs.csv` | 4MB Flash C5 | 双 app 槽（`app0 @0x10000` / `app1 @0x1F0000`），无 `ota_2` |
+| `esp32c5_16mb` | `partitions-16mb-triple.csv` | 16MB Flash C5（C5N16R8） | `ota_0/1/2` 各 3.9375MB + 共享 spiffs |
+
+- `esp32c5_16mb` 通过 `extends = env:esp32c5` 复用 4MB 版配置，只覆盖分区表与
+  Flash 容量（`board_upload.flash_size = 16MB`、`maximum_size = 16777216`）；
+- esptool 的物理芯片型号仍是 **`esp32c5`**：`tools/build-firmware.sh` 内部用
+  `ESPTOOL_CHIP` 做映射，bootloader 偏移同样是 `0x2000`；
+- 合并镜像仍按 **4MB** pad（`merge-bin --pad-to-size 4MB`），只覆盖
+  `0x10000–0x3FFFFF` 的 `ota_0` 范围，不会碰 `0x400000` 的 `ota_1` 与 `0x7F0000` 的
+  `ota_2`，因此重复刷新审计固件不会抹掉另外两个系统。
+
+### 6.2 分区规划（`firmware/partitions-16mb-triple.csv`）
 
 ```text
 0x009000  nvs         (16KB)
@@ -332,7 +349,11 @@ esptool --chip esp32c5 -p COM5 -b 460800 write-flash 0x0 c5n16r8-backup.bin
 0xBE0000  spiffs      (4.0625MB) -> 共享存储与数据区
 ```
 
-### 6.2 部署步骤（网页烧录台直接刷写 或 命令行写入）
+> ⚠️ 该 CSV **必须保持纯 ASCII**（注释也只能用英文）：PlatformIO 在 Windows 下按
+> 系统默认编码（GBK）解析 `board_build.partitions`，出现中文会直接
+> `UnicodeDecodeError` 构建失败。契约测试会校验这一点。
+
+### 6.3 部署步骤（网页烧录台直接刷写 或 命令行写入）
 
 **前置：先把 16MB 三系统基础镜像刷进 `ota_0`**
 
@@ -365,8 +386,8 @@ ESPsoup / Muse。
 **方式 B：命令行写入独立分区**
 
 ```powershell
-# 1. 刷入当前安全审计固件至 ota_0 (从 0x10000)
-esptool --chip esp32c5 -p COM5 -b 460800 write-flash 0x10000 .pio\build\esp32c5\firmware.bin
+# 1. 刷入当前安全审计固件至 ota_0 (从 0x10000; 需先有 16MB 分区表)
+esptool --chip esp32c5 -p COM5 -b 460800 write-flash 0x10000 .pio\build\esp32c5_16mb\firmware.bin
 
 # 2. 刷入 ESPsoup 固件至 ota_1 (从 0x400000)
 esptool --chip esp32c5 -p COM5 -b 460800 write-flash 0x400000 espsoup-c5.bin
@@ -375,8 +396,59 @@ esptool --chip esp32c5 -p COM5 -b 460800 write-flash 0x400000 espsoup-c5.bin
 esptool --chip esp32c5 -p COM5 -b 460800 write-flash 0x7F0000 muse-c5.bin
 ```
 
-### 6.3 切换方式
+### 6.4 切换方式
 
 - **Web 后台一键切换**：进入后台「配置」页面的 **多系统引导管理 (Triple-Boot)** 卡片，点击目标系统的 `[点击切换至]` 按钮确认即可重启进入；
 - **串口 CLI 命令切换**：在串口控制台输入 `boot` 查看槽位状态，输入 `boot espsoup` 或 `boot muse` 或 `boot audit` 即刻切换并重启。
+
+### 6.5 构建产物自检（刷机前，不需要硬件）
+
+```powershell
+# 1) 16MB 环境能否构建（应 SUCCESS, Flash 上限 4128768 字节）
+cd firmware
+pio run -e esp32c5_16mb
+
+# 2) 反解生成的分区表，确认三个 app 槽偏移/大小
+python "$env:USERPROFILE\.platformio\packages\framework-arduinoespressif32\tools\gen_esp32part.py" `
+  .pio\build\esp32c5_16mb\partitions.bin
+# 期望: ota_0=0x10000 / ota_1=0x400000 / ota_2=0x7f0000, 各 4032K, spiffs=0xbe0000 4160K
+
+# 3) 合并镜像自检: 必须正好 4MB, 0x2000 处为 0xE9 (bootloader), 0x8000 处为 0xAA50 (分区表)
+esptool --chip esp32c5 merge-bin --pad-to-size 4MB -o merged-16mb.bin `
+  0x2000 .pio\build\esp32c5_16mb\bootloader.bin `
+  0x8000 .pio\build\esp32c5_16mb\partitions.bin `
+  0x10000 .pio\build\esp32c5_16mb\firmware.bin
+
+# 3b) 或直接读字节确认（size 应为 4194304）
+$d = [IO.File]::ReadAllBytes('merged-16mb.bin')
+"{0} bytes; magic @0x2000=0x{1:X2}, @0x8000=0x{2:X2}{3:X2}" -f $d.Length, $d[0x2000], $d[0x8000], $d[0x8001]
+
+# 4) 契约测试（含 16MB env / 分区偏移 / 烧录台变体契约）
+cd ..\server; npm test
+```
+
+### 6.6 真机验证清单（有 16MB 板时按序执行）
+
+| # | 操作 | 期望结果 |
+|---|---|---|
+| 1 | `esptool --chip esp32c5 -p COM5 flash-id` | `Chip is ESP32-C5`、`Detected flash size: 16MB` |
+| 2 | 烧录台手动选 `ESP32-C5 (16MB 三系统)`，从 `0x0` 刷合并镜像 | 进度跑满；串口能看到审计固件启动日志 |
+| 3 | 串口输入 `boot` | 列出 audit / espsoup / muse 三个槽，audit 标记为当前运行 |
+| 4 | 「外部固件刷写」向 `0x400000` 写 ESPsoup、`0x7F0000` 写 Muse | 两次写入均完成，MD5/大小校验通过 |
+| 5 | `boot espsoup` 或后台点「切换至 ESPsoup」 | 重启进入 ESPsoup；反向 `boot audit` 能切回 |
+| 6 | 再刷一次审计固件（`0x0` 整片 4MB 镜像） | 审计固件正常启动，且 `boot` 里 espsoup/muse 仍显示已安装 |
+| 7 | 重复步骤 5 | 两个外部系统仍可正常切换启动 |
+
+> 第 6 步是关键回归：验证 4MB pad 的合并镜像只覆盖 `ota_0`，不会清掉
+> `0x400000` / `0x7F0000` 的外部系统。
+
+### 6.7 常见问题
+
+| 现象 | 原因 / 处理 |
+|---|---|
+| 后台切换报「未找到分区 (需 16MB 多系统分区表)」 | 板子里跑的还是 4MB 版 `esp32c5` 镜像；改刷 `esp32c5_16mb` |
+| 烧录台自动识别后又变回 4MB 镜像 | 已修复：手动选中的同芯片变体（`esp32c5_16mb`）会被保留；若仍被覆盖，检查是否选中了「自动识别」 |
+| 构建报 `UnicodeDecodeError: 'gbk' codec ...` | `partitions-16mb-triple.csv` 混入了非 ASCII 字符（注释也算） |
+| `merge-bin` 报镜像超过 4MB | `ota_0` 只有 3.9375MB；需裁剪固件或调整分区表 |
+| 写入 `0x400000` 后无法引导 | 确认写入的是**应用镜像**（`firmware.bin` / 厂商 app bin），不是整片合并镜像 |
 
