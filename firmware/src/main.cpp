@@ -35,11 +35,28 @@
 #include <Preferences.h>
 #include <nvs_flash.h>
 #include "esp_wifi.h"           // esp_wifi_80211_tx: 802.11 raw 帧注入 (Deauther 真实发送)
-#include "soc/soc_caps.h"       // SOC_WIFI_SUPPORT_5G: 双频芯片 (ESP32-C5) 的编译期能力门控
+#include "soc/soc_caps.h"       // SOC_WIFI_SUPPORT_5G / SOC_BLE_SUPPORTED: 芯片编译期能力门控
 #include "esp_random.h"         // esp_random(): 硬件 TRNG, 用于生成设备唯一的出厂后台口令
 #include "admin_page.h"
 #include "wifi_weak_dict.h"     // 内置 7,153 条弱口令 (与 server/data/weak-passwords.txt 同序)
 #include "mbedtls/md.h"         // PBKDF2-HMAC-SHA1 / HMAC-SHA1 / HMAC-MD5 (板载跑包)
+
+/* BLE 能力门控 (P2): 芯片需有 BLE 硬件, 且本构建未被显式裁剪。
+ * 经典 ESP32 例外 —— 它的 BLE 走 Bluedroid (比 NimBLE 多约 810KB), 与 min_spiffs 的
+ * 双 app 槽 (三系统引导 esp_ota_set_boot_partition 依赖) 在 4MB Flash 上无法共存,
+ * 因此该 env 用 -DFW_BLE_DISABLED 裁剪 BLE, 其余 4 款 (C3/C5/C6/S3) 正常开放。 */
+#if SOC_BLE_SUPPORTED && !defined(FW_BLE_DISABLED)
+#define FW_BLE_SUPPORTED 1
+#else
+#define FW_BLE_SUPPORTED 0
+#endif
+
+#if FW_BLE_SUPPORTED
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#endif
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 
@@ -644,6 +661,233 @@ struct KarmaState {
   uint8_t probeHead = 0;
 };
 static KarmaState sKarma;
+
+#if FW_BLE_SUPPORTED
+/* ---------------- BLE 嗅探 (P2) ----------------
+ * 纯被动: setActiveScan(false) → 不发 SCAN_REQ / 不建立连接, 只听广播。
+ * 射频共用: BLE 与 WiFi 共用一个射频前端, 扫描时 AP 保持在线, 由控制器共存
+ *   仲裁分时; 默认占空比 50% (interval 100ms / window 50ms), AP 吞吐会下降,
+ *   面板上需明确提示。停止扫描时归还射频占用并拆掉协议栈。
+ * 生命周期: 所有 BLE 栈调用 (init / scan / stop / deinit) 都集中在 bleTaskFunc
+ *   单任务内串行执行, 避免在 HTTP 处理任务里做阻塞初始化, 也避免多任务并发
+ *   操作协议栈。HTTP 层只翻 want 标志。
+ *
+ * 为什么 wantDuplicates=true: Arduino BLE 库在两种后端下都只在「首次发现」时回调,
+ *   要拿到逐条广播 (实时 RSSI / 广播计数) 必须打开重复上报; 已确认该路径不会在
+ *   库内部的 map 里累积对象 (Bluedroid 回调后 delete 临时对象, NimBLE 只更新
+ *   已存在条目), 因此长时间扫描不会泄漏内存。
+ */
+static constexpr int BLE_MAX_DEVICES = 24;
+static constexpr int BLE_TASK_STACK = 8192;
+static constexpr uint16_t BLE_SCAN_INTERVAL_MS = 100;  // 扫描间隔
+static constexpr uint16_t BLE_SCAN_WINDOW_MS = 50;     // 扫描窗口 (占空比 50%)
+
+struct BleDeviceEntry {
+  char mac[18];
+  char name[33];
+  char mfgHex[25];   // 厂商数据前 8 字节, 大写十六进制
+  int32_t rssi;
+  uint32_t advCount;
+  uint32_t lastSeen;
+  uint8_t addrType;
+  uint8_t advType;
+  bool used;
+};
+
+enum BlePhase : uint8_t { BLE_IDLE = 0, BLE_STARTING, BLE_RUNNING, BLE_STOPPING };
+
+struct BleState {
+  volatile bool want = false;        // HTTP 层请求状态: true = 希望处于扫描中
+  volatile bool initFailed = false;  // 最近一次启动是否失败 (供 UI 显示)
+  volatile uint8_t phase = BLE_IDLE;
+  volatile bool sliceDone = false;   // 本轮扫描是否已自然结束 (由协议栈回调置位)
+  uint32_t totalAdv = 0;
+  uint32_t scanStartedAt = 0;
+  uint16_t durationSec = 0;          // 0 = 持续 (按 10s 切片循环)
+  BleDeviceEntry devices[BLE_MAX_DEVICES];
+  uint8_t deviceCount = 0;
+  portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+};
+static BleState sBLE;
+
+// 单切片时长: 持续模式按此长度循环, 保证库内部结果表周期性清空、RSSI 保持新鲜
+static constexpr uint32_t BLE_SLICE_SEC = 10;
+
+class BleAdvCallbacks : public BLEAdvertisedDeviceCallbacks {
+public:
+  void onResult(BLEAdvertisedDevice d) override;
+};
+
+// 单例: BLEScan 只保存回调指针、从不 delete 它, 若每切片 new 一个会持续泄漏
+static BleAdvCallbacks sBleAdvCallbacks;
+
+// 只在临界区内做纯内存拷贝 (无 String / 无堆分配)
+static void bleStoreAdv(const char *mac, int32_t rssi, const char *name,
+                        const char *mfgHex, uint8_t addrType, uint8_t advType) {
+  uint32_t now = millis();
+  portENTER_CRITICAL(&sBLE.mux);
+  sBLE.totalAdv++;
+  int idx = -1;
+  for (int i = 0; i < BLE_MAX_DEVICES; i++) {
+    if (sBLE.devices[i].used && strcmp(sBLE.devices[i].mac, mac) == 0) { idx = i; break; }
+  }
+  const bool isNew = (idx < 0);
+  if (isNew) {
+    for (int i = 0; i < BLE_MAX_DEVICES; i++) {
+      if (!sBLE.devices[i].used) { idx = i; break; }
+    }
+    if (idx < 0) {  // 表满: 淘汰最久未出现的条目
+      uint32_t oldest = UINT32_MAX;
+      for (int i = 0; i < BLE_MAX_DEVICES; i++) {
+        if (sBLE.devices[i].lastSeen < oldest) { oldest = sBLE.devices[i].lastSeen; idx = i; }
+      }
+    }
+  }
+  if (idx >= 0) {
+    BleDeviceEntry &e = sBLE.devices[idx];
+    e.used = true;
+    e.rssi = rssi;
+    e.lastSeen = now;
+    if (isNew) {
+      strlcpy(e.mac, mac, sizeof(e.mac));
+      strlcpy(e.name, name, sizeof(e.name));
+      strlcpy(e.mfgHex, mfgHex, sizeof(e.mfgHex));
+      e.addrType = addrType;
+      e.advType = advType;
+      e.advCount = 1;
+    } else {
+      if (name[0]) strlcpy(e.name, name, sizeof(e.name));
+      if (mfgHex[0] && !e.mfgHex[0]) strlcpy(e.mfgHex, mfgHex, sizeof(e.mfgHex));
+      e.advCount++;
+    }
+    uint8_t n = 0;
+    for (int i = 0; i < BLE_MAX_DEVICES; i++) {
+      if (sBLE.devices[i].used) n++;
+    }
+    sBLE.deviceCount = n;
+  }
+  portEXIT_CRITICAL(&sBLE.mux);
+}
+
+// 运行在协议栈 host 任务: 先把字段抽到栈上, 再进临界区
+void BleAdvCallbacks::onResult(BLEAdvertisedDevice d) {
+  if (!sBLE.want) return;  // 已请求停止, 丢弃迟到结果
+  char mac[18] = {0};
+  strlcpy(mac, d.getAddress().toString().c_str(), sizeof(mac));
+  char name[33] = {0};
+  if (d.haveName()) strlcpy(name, d.getName().c_str(), sizeof(name));
+  char mfg[25] = {0};
+  if (d.haveManufacturerData()) {
+    String raw = d.getManufacturerData();
+    int n = raw.length() > 8 ? 8 : (int)raw.length();
+    for (int i = 0; i < n; i++) snprintf(mfg + i * 2, 3, "%02X", (uint8_t)raw[i]);
+    mfg[n * 2] = '\0';
+  }
+  bleStoreAdv(mac, (int32_t)d.getRSSI(), name, mfg, d.getAddressType(), d.getAdvType());
+}
+
+// 运行在协议栈 host 任务: 只置标志, 不在这里调用任何 BLEScan 方法 (避免重入)
+static void onBleScanDone(BLEScanResults) {
+  sBLE.sliceDone = true;
+}
+
+static const char *bleAdvTypeStr(uint8_t t) {
+  // Bluedroid 与 NimBLE 的广播类型数值一致
+  switch (t) {
+    case 0: return "ADV_IND";
+    case 1: return "ADV_DIRECT";
+    case 2: return "ADV_SCAN";
+    case 3: return "ADV_NONCONN";
+    case 4: return "SCAN_RSP";
+    default: return "UNKNOWN";
+  }
+}
+
+static bool bleStartScanSlice(uint32_t seconds) {
+  BLEScan *scan = BLEDevice::getScan();
+  if (!scan) return false;
+  scan->setActiveScan(false);  // 纯被动
+  scan->setInterval(BLE_SCAN_INTERVAL_MS);
+  scan->setWindow(BLE_SCAN_WINDOW_MS);
+  scan->setAdvertisedDeviceCallbacks(&sBleAdvCallbacks, true);
+  return scan->start(seconds, onBleScanDone, false);
+}
+
+static void bleTaskFunc(void *) {
+  for (;;) {
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    const uint8_t phase = sBLE.phase;
+
+    if (sBLE.want && phase == BLE_IDLE) {
+      sBLE.phase = BLE_STARTING;
+      sBLE.initFailed = false;
+      log("[ble] 初始化 BLE 协议栈...");
+      if (!BLEDevice::init("esp32-ble-sniffer")) {
+        log("[ble] BLE 初始化失败 (协议栈不可用)");
+        sBLE.initFailed = true;
+        sBLE.want = false;
+        sBLE.phase = BLE_IDLE;
+        continue;
+      }
+      portENTER_CRITICAL(&sBLE.mux);
+      for (int i = 0; i < BLE_MAX_DEVICES; i++) sBLE.devices[i].used = false;
+      sBLE.deviceCount = 0;
+      sBLE.totalAdv = 0;
+      portEXIT_CRITICAL(&sBLE.mux);
+      sBLE.scanStartedAt = millis();
+      sBLE.sliceDone = false;
+      sBLE.phase = BLE_RUNNING;
+      if (!sBLE.want) {  // 初始化期间已被请求停止
+        sBLE.phase = BLE_STOPPING;
+      } else {
+        uint32_t slice = sBLE.durationSec ? sBLE.durationSec : BLE_SLICE_SEC;
+        if (bleStartScanSlice(slice)) {
+          log("[ble] BLE 被动扫描已启动" +
+              String(sBLE.durationSec ? (" (限时 " + String(sBLE.durationSec) + "s)")
+                                      : String(" (持续, 10s 切片刷新)")));
+          emitLabState("ble", true);
+        } else {
+          log("[ble] 扫描启动失败");
+          sBLE.initFailed = true;
+          sBLE.want = false;
+          sBLE.phase = BLE_STOPPING;
+        }
+      }
+      continue;
+    }
+
+    if (sBLE.want && phase == BLE_RUNNING && sBLE.sliceDone) {
+      // 本轮切片自然结束: 持续模式重开一轮, 限时模式到此收尾
+      sBLE.sliceDone = false;
+      if (sBLE.durationSec == 0 && sBLE.want) {
+        if (!bleStartScanSlice(BLE_SLICE_SEC)) {
+          log("[ble] 续扫失败, 停止扫描");
+          sBLE.want = false;
+          sBLE.phase = BLE_STOPPING;
+        }
+      } else {
+        sBLE.want = false;
+        sBLE.phase = BLE_STOPPING;
+      }
+      continue;
+    }
+
+    if (!sBLE.want && (phase == BLE_RUNNING || phase == BLE_STOPPING || phase == BLE_STARTING)) {
+      sBLE.phase = BLE_STOPPING;
+      BLEScan *scan = BLEDevice::getScan();
+      if (scan) scan->stop();
+      const uint32_t total = sBLE.totalAdv;
+      const uint8_t cnt = sBLE.deviceCount;
+      BLEDevice::deinit(false);  // 停协议栈/控制器并归还射频, 保留 BT 内存以便再次启动
+      sBLE.phase = BLE_IDLE;
+      sBLE.sliceDone = false;
+      log("[ble] BLE 扫描已停止, 累计 " + String(total) + " 条广播 / " + String(cnt) + " 个设备");
+      emitLabState("ble", false);
+      continue;
+    }
+  }
+}
+#endif /* FW_BLE_SUPPORTED */
 
 static void addKarmaProbe(const char *mac, const char *ssid, int8_t rssi, bool baited) {
   KarmaProbe &p = sKarma.probes[sKarma.probeHead];
@@ -1262,6 +1506,14 @@ static void sendInfo() {
   json += "\"band5g\":true,";
 #else
   json += "\"band5g\":false,";
+#endif
+#if FW_BLE_SUPPORTED
+  json += "\"ble\":{\"supported\":true,\"running\":" +
+          String(sBLE.phase == BLE_RUNNING && sBLE.want ? "true" : "false") +
+          ",\"devices\":" + String(sBLE.deviceCount) +
+          ",\"totalAdv\":" + String(sBLE.totalAdv) + "},";
+#else
+  json += "\"ble\":{\"supported\":false},";
 #endif
   json += "\"version\":\"" FW_VERSION "\",";
   uint8_t macAddressBytes[6];
@@ -2000,6 +2252,185 @@ static void handleAirodumpStatus() {
   server.send(200, "application/json", json);
 }
 
+/* ---------------- BLE 扫描 API (P2) ----------------
+ * 路由在所有芯片上都注册 (路由表不分叉), 无 BLE 硬件的芯片 (ESP32-S2) 返回 501。
+ * 启停只翻 sBLE.want, 真正的协议栈初始化/拆除在 bleTaskFunc 里串行完成。
+ */
+static void bleUnsupported() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(501, "application/json",
+              "{\"ok\":false,\"error\":\"本芯片不支持 BLE (无蓝牙硬件)\"}");
+}
+
+static void handleBleStart() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+#if FW_BLE_SUPPORTED
+  if (sBLE.want || sBLE.phase != BLE_IDLE) {
+    server.send(409, "application/json", "{\"ok\":false,\"error\":\"BLE 扫描已在运行\"}");
+    return;
+  }
+  // 首次使用时才创建管理任务: 不用 BLE 的部署不额外占用任务栈
+  static bool sBleTaskStarted = false;
+  if (!sBleTaskStarted) {
+    if (xTaskCreate(bleTaskFunc, "ble_task", BLE_TASK_STACK, nullptr, 1, nullptr) != pdPASS) {
+      server.send(500, "application/json", "{\"ok\":false,\"error\":\"BLE 任务创建失败 (内存不足)\"}");
+      return;
+    }
+    sBleTaskStarted = true;
+  }
+  uint16_t dur = 0;  // 0 = 持续 (10s 切片循环)
+  if (server.hasArg("plain")) {
+    String body = server.arg("plain");
+    String durStr = extractJson(body, "duration");
+    if (durStr.length()) {
+      int v = durStr.toInt();
+      if (v > 0) dur = (uint16_t)(v > 65535 ? 65535 : v);
+    }
+  }
+  sBLE.durationSec = dur;
+  sBLE.initFailed = false;
+  sBLE.sliceDone = false;
+  sBLE.want = true;  // bleTaskFunc 接管
+  log("[ble] 收到扫描请求 (" +
+      String(dur ? ("限时 " + String(dur) + "s") : String("持续")) +
+      "), 等待协议栈就绪...");
+  server.send(200, "application/json", "{\"ok\":true,\"status\":\"starting\"}");
+#else
+  bleUnsupported();
+#endif
+}
+
+static void handleBleStop() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+#if FW_BLE_SUPPORTED
+  if (!sBLE.want && sBLE.phase == BLE_IDLE) {
+    server.send(409, "application/json", "{\"ok\":false,\"error\":\"BLE 扫描未在运行\"}");
+    return;
+  }
+  sBLE.want = false;  // bleTaskFunc 会停扫并拆除协议栈
+  server.send(200, "application/json", "{\"ok\":true,\"status\":\"stopping\"}");
+#else
+  bleUnsupported();
+#endif
+}
+
+static void handleBleStatus() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+#if FW_BLE_SUPPORTED
+  uint32_t totalAdv;
+  uint16_t durationSec;
+  uint32_t startedAt;
+  uint8_t phase;
+  bool initFailed, want;
+  uint8_t snapshotCount;
+  portENTER_CRITICAL(&sBLE.mux);
+  totalAdv = sBLE.totalAdv;
+  durationSec = sBLE.durationSec;
+  startedAt = sBLE.scanStartedAt;
+  phase = sBLE.phase;
+  initFailed = sBLE.initFailed;
+  want = sBLE.want;
+  snapshotCount = sBLE.deviceCount;
+  portEXIT_CRITICAL(&sBLE.mux);
+
+  String json;
+  // 按实际设备数预留, 避免大面积连续堆分配 + 多次扩容
+  json.reserve(320 + (size_t)snapshotCount * 200);
+  json = "{\"supported\":true,";
+  json += "\"running\":" + String(phase == BLE_RUNNING && want ? "true" : "false") + ",";
+  json += "\"phase\":\"";
+  switch (phase) {
+    case BLE_STARTING: json += "starting"; break;
+    case BLE_RUNNING:  json += "running"; break;
+    case BLE_STOPPING: json += "stopping"; break;
+    default:           json += "idle"; break;
+  }
+  json += "\",";
+  json += "\"initFailed\":" + String(initFailed ? "true" : "false") + ",";
+  json += "\"continuous\":" + String(durationSec == 0 ? "true" : "false") + ",";
+  json += "\"durationSec\":" + String(durationSec) + ",";
+  json += "\"totalAdv\":" + String(totalAdv) + ",";
+  json += "\"uptime\":" + String(phase == BLE_RUNNING ? (millis() - startedAt) / 1000 : 0) + ",";
+  json += "\"devices\":[";
+
+  // 逐条拷出 (临界区内只做定长 memory copy, 不在临界区里拼 String)
+  bool first = true;
+  uint8_t count = 0;
+  for (int i = 0; i < BLE_MAX_DEVICES; i++) {
+    BleDeviceEntry e;
+    bool used;
+    portENTER_CRITICAL(&sBLE.mux);
+    used = sBLE.devices[i].used;
+    if (used) e = sBLE.devices[i];
+    portEXIT_CRITICAL(&sBLE.mux);
+    if (!used) continue;
+    count++;
+    if (!first) json += ",";
+    first = false;
+    json += "{\"mac\":\"" + jsonEscape(String(e.mac)) + "\"";
+    json += ",\"name\":\"" + jsonEscape(String(e.name)) + "\"";
+    json += ",\"rssi\":" + String(e.rssi);
+    json += ",\"addrType\":" + String(e.addrType);
+    json += ",\"advType\":\"" + String(bleAdvTypeStr(e.advType)) + "\"";
+    json += ",\"mfgHex\":\"" + String(e.mfgHex) + "\"";
+    json += ",\"advCount\":" + String(e.advCount);
+    json += ",\"lastSeen\":" + String(e.lastSeen) + "}";
+  }
+  json += "],\"deviceCount\":" + String(count) + "}";
+  server.send(200, "application/json", json);
+#else
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", "{\"supported\":false,\"running\":false,\"devices\":[],\"deviceCount\":0}");
+#endif
+}
+
+static void handleBleDevices() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+#if FW_BLE_SUPPORTED
+  String json;
+  json.reserve(64 + (size_t)sBLE.deviceCount * 200);
+  json = "[";
+  bool first = true;
+  for (int i = 0; i < BLE_MAX_DEVICES; i++) {
+    BleDeviceEntry e;
+    bool used;
+    portENTER_CRITICAL(&sBLE.mux);
+    used = sBLE.devices[i].used;
+    if (used) e = sBLE.devices[i];
+    portEXIT_CRITICAL(&sBLE.mux);
+    if (!used) continue;
+    if (!first) json += ",";
+    first = false;
+    json += "{\"mac\":\"" + jsonEscape(String(e.mac)) + "\"";
+    json += ",\"name\":\"" + jsonEscape(String(e.name)) + "\"";
+    json += ",\"rssi\":" + String(e.rssi);
+    json += ",\"advType\":\"" + String(bleAdvTypeStr(e.advType)) + "\"";
+    json += ",\"mfgHex\":\"" + String(e.mfgHex) + "\"";
+    json += ",\"advCount\":" + String(e.advCount);
+    json += ",\"lastSeen\":" + String(e.lastSeen) + "}";
+  }
+  json += "]";
+  server.send(200, "application/json", json);
+#else
+  server.send(200, "application/json", "[]");
+#endif
+}
+
+static void handleBleClear() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+#if FW_BLE_SUPPORTED
+  portENTER_CRITICAL(&sBLE.mux);
+  for (int i = 0; i < BLE_MAX_DEVICES; i++) sBLE.devices[i].used = false;
+  sBLE.deviceCount = 0;
+  sBLE.totalAdv = 0;
+  portEXIT_CRITICAL(&sBLE.mux);
+  log("[ble] 设备列表已清空 (扫描状态不变)");
+  server.send(200, "application/json", "{\"ok\":true}");
+#else
+  bleUnsupported();
+#endif
+}
+
 /* ---------------- Karma API ---------------- */
 static void handleKarmaStart() {
   sKarma.probesCaptured = 0;
@@ -2570,6 +3001,12 @@ void setup() {
   onAdmin("/api/airodump/start", HTTP_POST, handleAirodumpStart);
   onAdmin("/api/airodump/stop", HTTP_POST, handleAirodumpStop);
   onAdmin("/api/airodump/status", HTTP_GET, handleAirodumpStatus);
+  // BLE 扫描: 路由在所有芯片上一致注册, 无 BLE 硬件的芯片返回 501
+  onAdmin("/api/ble/start", HTTP_POST, handleBleStart);
+  onAdmin("/api/ble/stop", HTTP_POST, handleBleStop);
+  onAdmin("/api/ble/status", HTTP_GET, handleBleStatus);
+  onAdmin("/api/ble/devices", HTTP_GET, handleBleDevices);
+  onAdmin("/api/ble/clear", HTTP_POST, handleBleClear);
 
   onAdmin("/api/karma/start", HTTP_POST, handleKarmaStart);
   onAdmin("/api/karma/stop", HTTP_POST, handleKarmaStop);

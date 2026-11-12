@@ -43,8 +43,8 @@ sh tools/build-firmware.sh 1.1.0
 烧录成功后：手机/电脑连接热点 `WiFi-xxxx`（密码 `00000000`），
 会自动弹出固件后台（Captive Portal 强制门户）；若未弹窗，手动访问
 `http://192.168.4.1/admin.html`
-（9 页：状态总览 / 扫描与嗅探 / 邪恶双子 / Karma / 取消认证 / 数据包分析器 / Airodump /
-捕获凭据 / 配置）。**首次上电时设备会用硬件 TRNG 生成一台一密的随机后台
+（10 页：状态总览 / 扫描与嗅探 / 邪恶双子 / Karma / 取消认证 / 数据包分析器 / Airodump /
+BLE 扫描 / 捕获凭据 / 配置）。**首次上电时设备会用硬件 TRNG 生成一台一密的随机后台
 初始口令**，仅在 115200 串口启动日志中打印一次（可用烧录台「串口控制台」查看），不出现在
 网页、NDJSON 遥测或 `/api/log` 里；首次登录会直接落到「配置」页引导修改口令。
 之后所有 `/api/*` 管理接口均需携带 `X-Admin-Token` 请求头。
@@ -59,7 +59,7 @@ sh tools/build-firmware.sh 1.1.0
 | 模块 | 状态 | 说明 |
 |---|---|---|
 | AP 热点 | ✅ 实现 | SSID `WiFi-xxxx`（MAC 尾 4 位）/ 密码 `00000000` / `192.168.4.1` |
-| Web 后台 9 页 | ✅ 实现 | 状态总览 / 扫描与嗅探 / 邪恶双子 / Karma / 取消认证 / 数据包分析器 / Airodump / 捕获凭据 / 配置（内嵌 SPA） |
+| Web 后台 10 页 | ✅ 实现 | 状态总览 / 扫描与嗅探 / 邪恶双子 / Karma / 取消认证 / 数据包分析器 / Airodump / BLE 扫描 / 捕获凭据 / 配置（内嵌 SPA） |
 | 后台口令鉴权 | ✅ 实现 | 每台设备随机初始口令（仅串口打印一次）；`/api/*` 需 `X-Admin-Token`（或 `?token=`），401 不执行业务逻辑 |
 | Captive Portal | ✅ 实现 | UDP 53 通配解析 + iOS/Android/Windows 探测路径 302 → 连热点自动弹后台 |
 | 周边 AP 扫描 | ✅ 实现 | `WiFi.scanNetworks()` 被动列出 SSID/RSSI/信道/加密方式 |
@@ -72,6 +72,7 @@ sh tools/build-firmware.sh 1.1.0
 | 数据包分析器 (Sniffer) | ✅ 真实实现 | 共用 promiscuous 回调抓真实 802.11 管理/控制/数据帧，解析帧类型、源/目的 MAC、SSID、Deauth Reason；支持单信道停驻与 1-13 自动跳频，实时帧率统计 |
 | Airodump 侦察 | ✅ 真实实现 | 从真实空口帧按 MAC 聚合对端（RSSI / 帧数 / 探测过的 SSID），支持 1-13 跳频；与 Evil Twin / Deauth / 握手捕获并行时停驻当前信道，避免破坏射频状态 |
 | Karma 探针诱捕 | ✅ 真实实现 | 监听真实 Probe Request，记录客户端 MAC / 目标 SSID / RSSI；SSID 命中当前克隆热点时标记为「已诱捕」，并复用握手捕获链路同步收集 4-Way Handshake |
+| BLE 广播嗅探 | ✅ 真实实现 | 纯被动监听周边 BLE 广播（ADV_IND / SCAN_RSP 等），解析 MAC / 名称 / RSSI / 广播类型 / 厂商数据摘要 / 广播计数；不发 SCAN_REQ、不连接设备。C3/C5/C6/S3 开放（NimBLE 后端），经典 ESP32 因 Bluedroid 体积与双 app 槽冲突而裁剪，S2 无蓝牙硬件 |
 
 **Evil Twin 自 2026-11-10 起为真实实现**（热点真实改名 + 联动 Deauth 双频段压制），
 Deauther 自 2026-11-10 起为真实帧注入，
@@ -110,8 +111,9 @@ Handshake 自 2026-11-10 起为真实抓包 + 真实跑包（见变更记录）�
 | 数据包分析器 | `POST /api/sniffer/start`、`POST /api/sniffer/stop`、`GET /api/sniffer/status` |
 | Airodump | `POST /api/airodump/start`、`POST /api/airodump/stop`、`GET /api/airodump/status` |
 | Karma | `POST /api/karma/start`、`POST /api/karma/stop`、`GET /api/karma/status` |
+| BLE 扫描 | `POST /api/ble/start`、`POST /api/ble/stop`、`GET /api/ble/status`、`GET /api/ble/devices`、`POST /api/ble/clear` |
 
-> `/api/info` 已包含 `evilTwin` / `deauth` / `handshake` / `sniffer` / `airodump` / `karma`
+> `/api/info` 已包含 `evilTwin` / `deauth` / `handshake` / `sniffer` / `airodump` / `karma` / `ble`
 > 等模块状态，不再单独提供 `/api/handshake/status`；`/api/karma/crack` 别名已删除，
 > 统一走 `/api/handshake/crack`。
 
@@ -237,7 +239,7 @@ esptool `BOOTLOADER_FLASH_OFFSET`）：
 | `heartbeat` | 每 30s | clients / heap / minFree / uptime / ssid |
 | `scan_result` | 扫描时每个周边 AP | ssid / rssi / ch / bssid / auth |
 | `client_join` / `client_leave` | softAP 客户端数变化 | clients |
-| `lab_state` | 教学模块启停 | module / running |
+| `lab_state` | 教学模块启停（`eviltwin` / `deauth` / `handshake` / `ble`） | module / running |
 | `eviltwin` | Evil Twin 首次捕获到门户提交 | caught / client（客户端 IP，不含口令） |
 
 > 遥测只镜像**已有只读状态**：不含 Probe Request/Response、802.11 管理帧、
@@ -495,5 +497,7 @@ EAPOL/握手材料（M1~M4、PMKID、nonce、MIC）、凭据或密码字段。
 - 图文教程页（tw.html / az.html 占位）
 - C5 真机验证（镜像已出，等一块 ESP32-C5 板）
 - C5 5GHz / BLE 5 / 802.15.4 能力扩展：P0（5G 抓包）与 P1（5G AP 非 DFS、5G 取消认证 /
-  双子含 DFS 跳频）已实现，均待真机验证；P2–P3 仍为规划。差距与改造清单见
+  双子含 DFS 跳频）已实现，均待真机验证；P2（BLE 广播嗅探，C3/C5/C6/S3 走 NimBLE，
+  经典 ESP32 因 Bluedroid 体积与双 app 槽冲突而裁剪）已实现待真机验证；P3（802.15.4）
+  仍为规划。差距与改造清单见
   [docs/plans/2026-11-11-c5-5ghz-ble-802154-roadmap.md](docs/plans/2026-11-11-c5-5ghz-ble-802154-roadmap.md)
