@@ -38,6 +38,7 @@
 #include "soc/soc_caps.h"       // SOC_WIFI_SUPPORT_5G / SOC_BLE_SUPPORTED: 芯片编译期能力门控
 #include "esp_random.h"         // esp_random(): 硬件 TRNG, 用于生成设备唯一的出厂后台口令
 #include "admin_page.h"
+#include "vendor_db.h"          // P4: 厂商 / Company ID / Service UUID 名称表 (构建时由 data/vendor_db.js 压缩内嵌)
 #include "wifi_weak_dict.h"     // 内置 7,153 条弱口令 (与 server/data/weak-passwords.txt 同序)
 #include "mbedtls/md.h"         // PBKDF2-HMAC-SHA1 / HMAC-SHA1 / HMAC-MD5 (板载跑包)
 #include "sdkconfig.h"          // CONFIG_IEEE802154_ENABLED: 802.15.4 组件是否编入框架
@@ -699,13 +700,56 @@ static constexpr uint16_t BLE_SCAN_WINDOW_MS = 50;     // 扫描窗口 (占空�
 struct BleDeviceEntry {
   char mac[18];
   char name[33];
-  char mfgHex[25];   // 厂商数据前 8 字节, 大写十六进制
+  uint8_t mfg[8];        // Manufacturer Data 前 8 字节 (companyId = 前 2 字节小端)
+  uint8_t mfgLen;
+  uint16_t companyId;    // 0 = 无厂商数据 / 数据不足 2 字节
+  uint16_t svcUuid;      // 首个 16-bit Service Data UUID，否则 Service UUID；0 = 无
+  uint8_t svcData[8];    // Service Data 前 8 字节 (Eddystone/BTHome/Remote ID 前缀)
+  uint8_t svcDataLen;
+  uint8_t devClass;      // BleDevClass, 固件判定, UI 只映射文案
+  uint8_t ridFlags;      // P4-3 预留: bit0 有 Remote ID, bit1 有位置, bit2 有操作员位置
+  char ridUasId[21];     // P4-3 预留: 20 字节 UAS ID + NUL
+  int32_t ridLat;        // P4-3 预留: 1e-7 度, INT32_MIN = 无效
+  int32_t ridLon;
+  int16_t ridAlt;        // P4-3 预留: 米, INT16_MIN = 无效
   int32_t rssi;
   uint32_t advCount;
   uint32_t lastSeen;
   uint8_t addrType;
   uint8_t advType;
+  bool randomMac;        // MAC 首字节 bit1 = 1 (本地管理 / 随机地址)
   bool used;
+};
+
+// 设备类别: 下标必须与 firmware/data/vendor_db.js 的 classes 数组一致。
+enum BleDevClass : uint8_t {
+  BLE_DEV_UNKNOWN = 0,
+  BLE_DEV_AIRTAG,     // Apple Find My / AirTag
+  BLE_DEV_IBEACON,
+  BLE_DEV_EDDYSTONE,
+  BLE_DEV_BTHOME,
+  BLE_DEV_XIAOMI,
+  BLE_DEV_GOVEE,
+  BLE_DEV_RUUVI,
+  BLE_DEV_FASTPAIR,
+  BLE_DEV_RID,        // ASTM F3411 Remote ID (详细解析在 P4-3)
+};
+
+// 协议栈回调 -> 临界区之间使用的栈上快照 (只含定长字段, 无 String / 堆分配)
+struct BleAdvSample {
+  char mac[18];
+  char name[33];
+  uint8_t mfg[8];
+  uint8_t mfgLen;
+  uint16_t companyId;
+  uint16_t svcUuid;
+  uint8_t svcData[8];
+  uint8_t svcDataLen;
+  uint8_t devClass;
+  int32_t rssi;
+  uint8_t addrType;
+  uint8_t advType;
+  bool randomMac;
 };
 
 enum BlePhase : uint8_t { BLE_IDLE = 0, BLE_STARTING, BLE_RUNNING, BLE_STOPPING };
@@ -736,14 +780,13 @@ public:
 static BleAdvCallbacks sBleAdvCallbacks;
 
 // 只在临界区内做纯内存拷贝 (无 String / 无堆分配)
-static void bleStoreAdv(const char *mac, int32_t rssi, const char *name,
-                        const char *mfgHex, uint8_t addrType, uint8_t advType) {
+static void bleStoreAdv(const BleAdvSample &s) {
   uint32_t now = millis();
   portENTER_CRITICAL(&sBLE.mux);
   sBLE.totalAdv++;
   int idx = -1;
   for (int i = 0; i < BLE_MAX_DEVICES; i++) {
-    if (sBLE.devices[i].used && strcmp(sBLE.devices[i].mac, mac) == 0) { idx = i; break; }
+    if (sBLE.devices[i].used && strcmp(sBLE.devices[i].mac, s.mac) == 0) { idx = i; break; }
   }
   const bool isNew = (idx < 0);
   if (isNew) {
@@ -759,21 +802,35 @@ static void bleStoreAdv(const char *mac, int32_t rssi, const char *name,
   }
   if (idx >= 0) {
     BleDeviceEntry &e = sBLE.devices[idx];
-    e.used = true;
-    e.rssi = rssi;
-    e.lastSeen = now;
     if (isNew) {
-      strlcpy(e.mac, mac, sizeof(e.mac));
-      strlcpy(e.name, name, sizeof(e.name));
-      strlcpy(e.mfgHex, mfgHex, sizeof(e.mfgHex));
-      e.addrType = addrType;
-      e.advType = advType;
+      e = BleDeviceEntry{};
+      strlcpy(e.mac, s.mac, sizeof(e.mac));
+      e.ridLat = INT32_MIN;
+      e.ridLon = INT32_MIN;
+      e.ridAlt = INT16_MIN;
       e.advCount = 1;
+      e.addrType = s.addrType;
+      e.advType = s.advType;
+      e.randomMac = s.randomMac;
     } else {
-      if (name[0]) strlcpy(e.name, name, sizeof(e.name));
-      if (mfgHex[0] && !e.mfgHex[0]) strlcpy(e.mfgHex, mfgHex, sizeof(e.mfgHex));
       e.advCount++;
     }
+    e.used = true;
+    e.rssi = s.rssi;
+    e.lastSeen = now;
+    if (s.name[0] && !e.name[0]) strlcpy(e.name, s.name, sizeof(e.name));
+    // 后续广播只补空字段, 不覆盖已识别的厂商 / 类别
+    if (s.mfgLen && !e.mfgLen) {
+      e.mfgLen = s.mfgLen;
+      memcpy(e.mfg, s.mfg, s.mfgLen);
+    }
+    if (s.companyId && !e.companyId) e.companyId = s.companyId;
+    if (s.svcUuid && !e.svcUuid) e.svcUuid = s.svcUuid;
+    if (s.svcDataLen && !e.svcDataLen) {
+      e.svcDataLen = s.svcDataLen;
+      memcpy(e.svcData, s.svcData, s.svcDataLen);
+    }
+    if (s.devClass != BLE_DEV_UNKNOWN && e.devClass == BLE_DEV_UNKNOWN) e.devClass = s.devClass;
     uint8_t n = 0;
     for (int i = 0; i < BLE_MAX_DEVICES; i++) {
       if (sBLE.devices[i].used) n++;
@@ -783,21 +840,84 @@ static void bleStoreAdv(const char *mac, int32_t rssi, const char *name,
   portEXIT_CRITICAL(&sBLE.mux);
 }
 
+static uint8_t bleHexVal(char c) {
+  if (c >= '0' && c <= '9') return (uint8_t)(c - '0');
+  if (c >= 'A' && c <= 'F') return (uint8_t)(c - 'A' + 10);
+  if (c >= 'a' && c <= 'f') return (uint8_t)(c - 'a' + 10);
+  return 0;
+}
+
+// MAC 首字节 bit1 = 本地管理地址 (手机 / 手环普遍使用的随机 MAC)
+static bool bleMacIsRandom(const char *mac) {
+  if (!mac[0] || !mac[1]) return false;
+  return (((bleHexVal(mac[0]) << 4) | bleHexVal(mac[1])) & 0x02) != 0;
+}
+
+// 只取 16-bit UUID; 32/128-bit 返回 0 (P4 的类别判定只依赖 16-bit 分配号)
+static uint16_t bleUuid16(BLEUUID u) {
+  if (u.bitSize() != 16) return 0;
+#if defined(CONFIG_NIMBLE_ENABLED)
+  const ble_uuid_any_t *native = u.getNative();
+  return native ? native->u16.value : 0;
+#elif defined(CONFIG_BLUEDROID_ENABLED)
+  esp_bt_uuid_t *native = u.getNative();
+  return native ? native->uuid.uuid16 : 0;
+#else
+  return 0;
+#endif
+}
+
+// 分类规则只做整数比较, 不分配内存; 顺序 = 优先级
+static uint8_t bleClassify(const BleAdvSample &s) {
+  if (s.svcUuid == 0xFFFA && s.svcDataLen >= 1 && s.svcData[0] == 0x0D) return BLE_DEV_RID;
+  if (s.companyId == 0x004C && s.mfgLen >= 4) {
+    if (s.mfg[2] == 0x12 && s.mfg[3] == 0x19) return BLE_DEV_AIRTAG;
+    if (s.mfg[2] == 0x02 && s.mfg[3] == 0x15) return BLE_DEV_IBEACON;
+  }
+  if (s.svcUuid == 0xFEAA) return BLE_DEV_EDDYSTONE;
+  if (s.svcUuid == 0xFCD2) return BLE_DEV_BTHOME;
+  if (s.companyId == 0xFE95 || s.svcUuid == 0xFE95) return BLE_DEV_XIAOMI;
+  if (s.companyId == 0xEC88) return BLE_DEV_GOVEE;
+  if (s.companyId == 0x0499) return BLE_DEV_RUUVI;
+  if (s.svcUuid == 0xFE2C) return BLE_DEV_FASTPAIR;
+  return BLE_DEV_UNKNOWN;
+}
+
 // 运行在协议栈 host 任务: 先把字段抽到栈上, 再进临界区
 void BleAdvCallbacks::onResult(BLEAdvertisedDevice d) {
   if (!sBLE.want) return;  // 已请求停止, 丢弃迟到结果
-  char mac[18] = {0};
-  strlcpy(mac, d.getAddress().toString().c_str(), sizeof(mac));
-  char name[33] = {0};
-  if (d.haveName()) strlcpy(name, d.getName().c_str(), sizeof(name));
-  char mfg[25] = {0};
+  BleAdvSample s = {};
+  strlcpy(s.mac, d.getAddress().toString().c_str(), sizeof(s.mac));
+  s.randomMac = bleMacIsRandom(s.mac);
+  if (d.haveName()) strlcpy(s.name, d.getName().c_str(), sizeof(s.name));
   if (d.haveManufacturerData()) {
     String raw = d.getManufacturerData();
-    int n = raw.length() > 8 ? 8 : (int)raw.length();
-    for (int i = 0; i < n; i++) snprintf(mfg + i * 2, 3, "%02X", (uint8_t)raw[i]);
-    mfg[n * 2] = '\0';
+    int n = (int)raw.length();
+    if (n > (int)sizeof(s.mfg)) n = (int)sizeof(s.mfg);
+    if (n > 0) {
+      memcpy(s.mfg, raw.c_str(), n);
+      s.mfgLen = (uint8_t)n;
+    }
+    if (n >= 2) s.companyId = (uint16_t)((uint8_t)raw[0] | ((uint16_t)(uint8_t)raw[1] << 8));
   }
-  bleStoreAdv(mac, (int32_t)d.getRSSI(), name, mfg, d.getAddressType(), d.getAdvType());
+  if (d.haveServiceUUID()) s.svcUuid = bleUuid16(d.getServiceUUID());
+  if (d.haveServiceData()) {
+    uint16_t dataUuid = bleUuid16(d.getServiceDataUUID());
+    // Service Data 的 UUID 更能代表载荷类型 (Eddystone/BTHome/Remote ID), 优先记录
+    if (dataUuid) s.svcUuid = dataUuid;
+    String sd = d.getServiceData();
+    int n = (int)sd.length();
+    if (n > (int)sizeof(s.svcData)) n = (int)sizeof(s.svcData);
+    if (n > 0) {
+      memcpy(s.svcData, sd.c_str(), n);
+      s.svcDataLen = (uint8_t)n;
+    }
+  }
+  s.devClass = bleClassify(s);
+  s.rssi = (int32_t)d.getRSSI();
+  s.addrType = d.getAddressType();
+  s.advType = d.getAdvType();
+  bleStoreAdv(s);
 }
 
 // 运行在协议栈 host 任务: 只置标志, 不在这里调用任何 BLEScan 方法 (避免重入)
@@ -1749,6 +1869,15 @@ static void sendAdminPage() {
   server.send_P(200, "text/html; charset=utf-8", (const char *)ADMIN_PAGE, ADMIN_PAGE_LEN);
 }
 
+// P4: 厂商 / 协议名称表。公开只读资源 (不含密钥), 由 admin.html 以 <script src> 加载。
+// 压缩字节直出, 不占 RAM; 缓存一天, 减少后台刷新流量。
+static void sendVendorDb() {
+  server.sendHeader("Content-Encoding", "deflate");
+  server.sendHeader("Cache-Control", "max-age=86400");
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send_P(200, "application/javascript; charset=utf-8", (const char *)VENDOR_DB, VENDOR_DB_LEN);
+}
+
 static void sendPortalPage() {
   String targetName = sEvilTwin.cloneSsid.length() ? sEvilTwin.cloneSsid : (sTarget.ssid.length() ? sTarget.ssid : apSsid);
 
@@ -2674,6 +2803,52 @@ static void handleBleStop() {
 #endif
 }
 
+#if FW_BLE_SUPPORTED
+// 定长字节数组 -> 大写十六进制 (out 至少 2*n+1 字节)
+static void bleBytesHex(const uint8_t *p, uint8_t n, char *out) {
+  static const char kHex[] = "0123456789ABCDEF";
+  for (uint8_t i = 0; i < n; i++) {
+    out[i * 2] = kHex[p[i] >> 4];
+    out[i * 2 + 1] = kHex[p[i] & 0x0F];
+  }
+  out[n * 2] = '\0';
+}
+
+// /api/ble/status 与 /api/ble/devices 共用, 保证两个端点的字段契约一致
+static void bleAppendDeviceJson(String &json, const BleDeviceEntry &e) {
+  char mfgHex[17];
+  bleBytesHex(e.mfg, e.mfgLen, mfgHex);
+  char svcHex[17];
+  bleBytesHex(e.svcData, e.svcDataLen, svcHex);
+  json += "{\"mac\":\"" + jsonEscape(String(e.mac)) + "\"";
+  json += ",\"name\":\"" + jsonEscape(String(e.name)) + "\"";
+  json += ",\"rssi\":" + String(e.rssi);
+  json += ",\"addrType\":" + String(e.addrType);
+  json += ",\"advType\":\"" + String(bleAdvTypeStr(e.advType)) + "\"";
+  json += ",\"companyId\":" + String(e.companyId);
+  json += ",\"svcUuid\":" + String(e.svcUuid);
+  json += ",\"svcData\":\"" + String(svcHex) + "\"";
+  json += ",\"devClass\":" + String(e.devClass);
+  json += ",\"randomMac\":" + String(e.randomMac ? "true" : "false");
+  json += ",\"mfgHex\":\"" + String(mfgHex) + "\"";
+  json += ",\"advCount\":" + String(e.advCount);
+  json += ",\"lastSeen\":" + String(e.lastSeen);
+  json += ",\"rid\":";
+  if (e.ridFlags) {
+    json += "{\"flags\":" + String(e.ridFlags);
+    if (e.ridFlags & 0x01) json += ",\"uasId\":\"" + jsonEscape(String(e.ridUasId)) + "\"";
+    if (e.ridFlags & 0x02) {
+      json += ",\"lat\":" + String(e.ridLat) + ",\"lon\":" + String(e.ridLon);
+      json += ",\"alt\":" + String(e.ridAlt);
+    }
+    json += "}";
+  } else {
+    json += "null";
+  }
+  json += "}";
+}
+#endif
+
 static void handleBleStatus() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
 #if FW_BLE_SUPPORTED
@@ -2695,7 +2870,7 @@ static void handleBleStatus() {
 
   String json;
   // 按实际设备数预留, 避免大面积连续堆分配 + 多次扩容
-  json.reserve(320 + (size_t)snapshotCount * 200);
+  json.reserve(320 + (size_t)snapshotCount * 260);
   json = "{\"supported\":true,";
   json += "\"running\":" + String(phase == BLE_RUNNING && want ? "true" : "false") + ",";
   json += "\"phase\":\"";
@@ -2727,14 +2902,7 @@ static void handleBleStatus() {
     count++;
     if (!first) json += ",";
     first = false;
-    json += "{\"mac\":\"" + jsonEscape(String(e.mac)) + "\"";
-    json += ",\"name\":\"" + jsonEscape(String(e.name)) + "\"";
-    json += ",\"rssi\":" + String(e.rssi);
-    json += ",\"addrType\":" + String(e.addrType);
-    json += ",\"advType\":\"" + String(bleAdvTypeStr(e.advType)) + "\"";
-    json += ",\"mfgHex\":\"" + String(e.mfgHex) + "\"";
-    json += ",\"advCount\":" + String(e.advCount);
-    json += ",\"lastSeen\":" + String(e.lastSeen) + "}";
+    bleAppendDeviceJson(json, e);
   }
   json += "],\"deviceCount\":" + String(count) + "}";
   server.send(200, "application/json", json);
@@ -2748,7 +2916,7 @@ static void handleBleDevices() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
 #if FW_BLE_SUPPORTED
   String json;
-  json.reserve(64 + (size_t)sBLE.deviceCount * 200);
+  json.reserve(64 + (size_t)sBLE.deviceCount * 260);
   json = "[";
   bool first = true;
   for (int i = 0; i < BLE_MAX_DEVICES; i++) {
@@ -2761,13 +2929,7 @@ static void handleBleDevices() {
     if (!used) continue;
     if (!first) json += ",";
     first = false;
-    json += "{\"mac\":\"" + jsonEscape(String(e.mac)) + "\"";
-    json += ",\"name\":\"" + jsonEscape(String(e.name)) + "\"";
-    json += ",\"rssi\":" + String(e.rssi);
-    json += ",\"advType\":\"" + String(bleAdvTypeStr(e.advType)) + "\"";
-    json += ",\"mfgHex\":\"" + String(e.mfgHex) + "\"";
-    json += ",\"advCount\":" + String(e.advCount);
-    json += ",\"lastSeen\":" + String(e.lastSeen) + "}";
+    bleAppendDeviceJson(json, e);
   }
   json += "]";
   server.send(200, "application/json", json);
@@ -3584,6 +3746,7 @@ void setup() {
 
   server.on("/", HTTP_GET, redirectToAdmin);
   server.on("/admin.html", HTTP_GET, sendAdminPage);
+  server.on("/vendor-db.js", HTTP_GET, sendVendorDb);
   server.on("/portal.html", HTTP_GET, sendPortalPage);
   server.on("/api/portal/submit", HTTP_POST, handlePortalSubmit);
   onAdmin("/api/info", HTTP_GET, sendInfo);

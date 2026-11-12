@@ -21,3 +21,4 @@ __pycache__/
 
 # local download caches (工具链/库下载脚本的工作目录不在此仓库内, 双保险)
 pio-dl/
+tools/vendor-src/

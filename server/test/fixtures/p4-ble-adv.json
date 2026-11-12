@@ -1,0 +1,102 @@
+[
+  {
+    "id": "airtag-findmy",
+    "mac": "DA:11:22:33:44:55",
+    "companyId": 76,
+    "svcUuid": 0,
+    "mfg": "4C00121901020304",
+    "svcData": "",
+    "expectedClass": 1,
+    "expectedRandomMac": true
+  },
+  {
+    "id": "ibeacon",
+    "mac": "C2:00:00:00:00:01",
+    "companyId": 76,
+    "svcUuid": 0,
+    "mfg": "4C000215E2C56DB5DFFB48D2B060D0F5A71096E000010001C5",
+    "svcData": "",
+    "expectedClass": 2,
+    "expectedRandomMac": true
+  },
+  {
+    "id": "eddystone",
+    "mac": "00:11:22:33:44:56",
+    "companyId": 0,
+    "svcUuid": 65194,
+    "mfg": "",
+    "svcData": "10AAFE0000000000",
+    "expectedClass": 3,
+    "expectedRandomMac": false
+  },
+  {
+    "id": "bthome",
+    "mac": "00:11:22:33:44:57",
+    "companyId": 0,
+    "svcUuid": 64722,
+    "mfg": "",
+    "svcData": "020106",
+    "expectedClass": 4,
+    "expectedRandomMac": false
+  },
+  {
+    "id": "xiaomi-mibeacon",
+    "mac": "00:11:22:33:44:58",
+    "companyId": 65173,
+    "svcUuid": 0,
+    "mfg": "95FE3012345678",
+    "svcData": "",
+    "expectedClass": 5,
+    "expectedRandomMac": false
+  },
+  {
+    "id": "govee",
+    "mac": "00:11:22:33:44:59",
+    "companyId": 60552,
+    "svcUuid": 0,
+    "mfg": "88EC01020304",
+    "svcData": "",
+    "expectedClass": 6,
+    "expectedRandomMac": false
+  },
+  {
+    "id": "ruuvi",
+    "mac": "00:11:22:33:44:5A",
+    "companyId": 1177,
+    "svcUuid": 0,
+    "mfg": "99040512345678",
+    "svcData": "",
+    "expectedClass": 7,
+    "expectedRandomMac": false
+  },
+  {
+    "id": "fast-pair",
+    "mac": "00:11:22:33:44:5B",
+    "companyId": 0,
+    "svcUuid": 65068,
+    "mfg": "",
+    "svcData": "010203",
+    "expectedClass": 8,
+    "expectedRandomMac": false
+  },
+  {
+    "id": "remote-id",
+    "mac": "C2:00:00:00:00:02",
+    "companyId": 0,
+    "svcUuid": 65530,
+    "mfg": "",
+    "svcData": "0D02010203040506",
+    "expectedClass": 9,
+    "expectedRandomMac": true
+  },
+  {
+    "id": "unknown",
+    "mac": "00:11:22:33:44:5C",
+    "companyId": 4660,
+    "svcUuid": 6159,
+    "mfg": "3412010203040506",
+    "svcData": "0102",
+    "expectedClass": 0,
+    "expectedRandomMac": false
+  }
+]

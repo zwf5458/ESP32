@@ -256,6 +256,7 @@ select.mini{padding:8px 12px;font-weight:800;border:var(--bd);border-radius:10px
 <main id="view"></main>
 <div id="toast"></div>
 
+<script src="/vendor-db.js"></script>
 <script>
 /* ================== helpers ================== */
 const $ = s => document.querySelector(s);
@@ -1031,12 +1032,41 @@ function bleRssi(r) {
   return `<b style="color:${c}">${v}</b>`;
 }
 
+/* ---------- P4: 厂商 / 类型名称 (vendor_db.js, 缺失时优雅降级) ---------- */
+const vdb = () => window.VENDOR_DB || null;
+const hexNum = (v, pad) => v ? '0x' + Number(v).toString(16).toUpperCase().padStart(pad, '0') : '';
+function bleCompanyName(id) {
+  const db = vdb();
+  return (id && db && db.company && db.company[id]) || '';
+}
+function bleServiceName(id) {
+  const db = vdb();
+  return (id && db && db.service && db.service[id]) || '';
+}
+function bleClassLabel(cls) {
+  const db = vdb();
+  if (db && db.classes && db.classes[cls]) return db.classes[cls];
+  return cls ? '类别 ' + cls : '未知';
+}
+function bleVendorCell(d) {
+  const cid = d.companyId || 0;
+  const cls = d.devClass || 0;
+  const company = bleCompanyName(cid);
+  const svc = bleServiceName(d.svcUuid);
+  let h = `<span class="status-pill ${cls ? 'run' : 'idle'}" style="font-size:11px">${esc(bleClassLabel(cls))}</span>`;
+  h += `<div style="margin-top:3px"><b>${cid ? esc(company || hexNum(cid, 4)) : '—'}</b>`;
+  if (d.svcUuid) h += `<span style="color:#888;font-size:11px"> / ${esc(svc || hexNum(d.svcUuid, 4))}</span>`;
+  h += '</div>';
+  if (d.randomMac) h += '<div style="color:#888;font-size:11px">随机 MAC</div>';
+  return h;
+}
+
 function blePaintRows(list) {
   const tb = $('#bleRows');
   if (!tb) return;
   const rows = (list || []).slice().sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
   if (!rows.length) {
-    tb.innerHTML = `<tr><td colspan="7" style="text-align:center;color:#888;padding:18px">暂无设备 — 点击「开始扫描」监听周边 BLE 广播</td></tr>`;
+    tb.innerHTML = `<tr><td colspan="8" style="text-align:center;color:#888;padding:18px">暂无设备 — 点击「开始扫描」监听周边 BLE 广播</td></tr>`;
     return;
   }
   tb.innerHTML = rows.map(d => {
@@ -1047,6 +1077,7 @@ function blePaintRows(list) {
       <td>${name}</td>
       <td style="white-space:nowrap">${bleRssi(d.rssi)} <small style="color:#888">dBm</small></td>
       <td><span class="status-pill idle" style="font-size:11px">${esc(d.advType || '—')}</span></td>
+      <td style="font-size:12px;white-space:nowrap">${bleVendorCell(d)}</td>
       <td>${mfg}</td>
       <td>${d.advCount || 0}</td>
       <td style="white-space:nowrap">${bleAge(d.lastSeen)}</td>
@@ -1085,7 +1116,8 @@ function renderBle() {
       <h3 style="margin:0">📡 BLE 广播嗅探</h3>
       <span class="status-pill ${b.running ? 'run' : 'idle'}" id="blePill">${b.running ? '● 扫描中' : (b.initFailed ? '✕ 初始化失败' : '○ 待命')}</span>
     </div>
-    <p class="note">被动监听周边 BLE 设备的广播包（ADV_IND / SCAN_RSP 等），解析 MAC、名称、RSSI、广播类型与厂商数据摘要。本页<b>只收不发</b>：不发送 SCAN_REQ、不发起连接、不读取任何特征值。</p>
+    <p class="note">被动监听周边 BLE 设备的广播包（ADV_IND / SCAN_RSP 等），解析 MAC、名称、RSSI、广播类型、厂商数据摘要，并按 Company ID / Service UUID 识别 AirTag、iBeacon、Eddystone、BTHome、小米、Govee、Ruuvi、Fast Pair、Remote ID 等类别。本页<b>只收不发</b>：不发送 SCAN_REQ、不发起连接、不读取任何特征值。</p>
+    <div class="note">现代手机 / 手环普遍使用随机 MAC（本地管理地址），因此 MAC 前 3 字节不能反查真实厂商；出现「随机 MAC」标记时，厂商名仅代表广播声明的 Company ID，不是设备身份。</div>
     <div class="note" style="color:#e67e22;font-weight:700">BLE 与 WiFi 共用同一射频：扫描期间热点保持在线，但 AP 吞吐会下降（默认 50% 扫描占空比，由控制器共存调度）。</div>
     ${ok ? '' : `<div class="note" style="color:#d9534f;font-weight:800">本芯片不支持 BLE 扫描（无蓝牙硬件，或该构建为保留双 app 槽已裁剪 BLE）。</div>`}
     <div class="frow" style="gap:10px;align-items:center;margin:14px 0">
@@ -1111,7 +1143,7 @@ function renderBle() {
   <div class="card">
     <h3 style="margin:0 0 8px">周边 BLE 设备</h3>
     <div class="table-wrap"><table>
-      <thead><tr><th>MAC</th><th>名称</th><th>RSSI</th><th>广播类型</th><th>厂商数据</th><th>广播数</th><th>最后出现</th></tr></thead>
+      <thead><tr><th>MAC</th><th>名称</th><th>RSSI</th><th>广播类型</th><th>厂商 / 类型</th><th>厂商数据</th><th>广播数</th><th>最后出现</th></tr></thead>
       <tbody id="bleRows"></tbody>
     </table></div>
   </div>

@@ -608,4 +608,116 @@ test('多系统引导(契约): 16MB 三系统镜像已接入构建与烧录台',
     '自动识别不得覆盖手动选择的同芯片变体镜像 (否则 16MB 镜像会被改回 4MB 版)');
 });
 
+// ---------------- P4: 设备识别 (BLE 画像 + 厂商表) ----------------
+const p4Adv = JSON.parse(
+  readFileSync(join(ROOT, 'server', 'test', 'fixtures', 'p4-ble-adv.json'), 'utf-8'),
+);
+
+// 固件分类逻辑的 Node 镜像: 只用于比对 fixture 期望值, 真实实现见 main.cpp:bleClassify()
+function classifyAdvSpec(v) {
+  const mfg = Buffer.from(v.mfg || '', 'hex');
+  const svcData = Buffer.from(v.svcData || '', 'hex');
+  const companyId = v.companyId || 0;
+  const svcUuid = v.svcUuid || 0;
+  if (svcUuid === 0xFFFA && svcData.length >= 1 && svcData[0] === 0x0D) return 9;
+  if (companyId === 0x004C && mfg.length >= 4) {
+    if (mfg[2] === 0x12 && mfg[3] === 0x19) return 1;
+    if (mfg[2] === 0x02 && mfg[3] === 0x15) return 2;
+  }
+  if (svcUuid === 0xFEAA) return 3;
+  if (svcUuid === 0xFCD2) return 4;
+  if (companyId === 0xFE95 || svcUuid === 0xFE95) return 5;
+  if (companyId === 0xEC88) return 6;
+  if (companyId === 0x0499) return 7;
+  if (svcUuid === 0xFE2C) return 8;
+  return 0;
+}
+
+function randomMacSpec(mac) {
+  return (parseInt(mac.slice(0, 2), 16) & 0x02) !== 0;
+}
+
+test('P4(契约): BLE 数据结构已扩展, 且 API 只新增字段', () => {
+  for (const token of [
+    'uint16_t companyId', 'uint16_t svcUuid', 'uint8_t svcData[8]',
+    'uint8_t devClass', 'bool randomMac', 'char ridUasId[21]',
+    'd.getServiceData()', 'd.getServiceUUID()', 'bleAppendDeviceJson',
+  ]) {
+    assert.ok(mainCpp.includes(token), `main.cpp 缺少 P4 字段/取数: ${token}`);
+  }
+  for (const key of ['companyId', 'svcUuid', 'svcData', 'devClass', 'randomMac']) {
+    assert.ok(mainCpp.includes('\\"' + key + '\\":'), `API JSON 缺少 ${key}`);
+  }
+  // 旧字段不能被移除 (导出 JSON 的已有消费方)
+  for (const key of ['mfgHex', 'advType', 'advCount', 'lastSeen']) {
+    assert.ok(mainCpp.includes('\\"' + key + '\\":'), `API JSON 丢失旧字段 ${key}`);
+  }
+  assert.ok(mainCpp.includes('server.on("/vendor-db.js"'), '固件未注册 /vendor-db.js 路由');
+  assert.ok(mainCpp.includes('VENDOR_DB_LEN'), '固件未引用内嵌的 vendor_db.h');
+});
+
+test('P4(契约): BLE 分类向量覆盖 10 类 (AirTag/iBeacon/Eddystone/BTHome/.../未知)', () => {
+  assert.ok(p4Adv.length >= 9, 'p4-ble-adv.json 至少需要 9 条向量');
+  for (const v of p4Adv) {
+    assert.equal(classifyAdvSpec(v), v.expectedClass, `${v.id} devClass 不匹配`);
+    assert.equal(randomMacSpec(v.mac), v.expectedRandomMac, `${v.id} 随机 MAC 判断不匹配`);
+  }
+});
+
+test('P4(契约): BLE 仍为纯被动, 不新增任何广播/注入调用', () => {
+  assert.ok(mainCpp.includes('setActiveScan(false)'), 'BLE 扫描必须仍是被动模式');
+  assert.ok(!mainCpp.includes('startAdvertising'), 'P4 不允许新增 BLE 广播');
+  assert.ok(!mainCpp.includes('esp_ble_gap_start_advertising'), 'P4 不允许新增 BLE 广播');
+  assert.equal((mainCpp.match(/esp_wifi_80211_tx\(/g) || []).length, 3,
+    'P4 不得新增 802.11 注入调用 (基点 3 处: 双子/Deauth)');
+  assert.ok(mainCpp.includes('memcpy(s.svcData, sd.c_str(), n)'), 'Service Data 只拷贝定长前缀');
+});
+
+test('P4(契约): vendor_db.js 结构/规模/格式正确', () => {
+  const raw = readFileSync(join(ROOT, 'firmware', 'data', 'vendor_db.js'), 'utf-8');
+  assert.ok(Buffer.byteLength(raw) <= 32 * 1024, 'vendor_db.js 超过 32KB');
+  const sandbox = { window: {} };
+  new Function('window', raw)(sandbox.window);
+  const db = sandbox.window.VENDOR_DB;
+  assert.ok(db && db.version === 1, 'VENDOR_DB.version 必须为 1');
+  const ouiKeys = Object.keys(db.oui || {});
+  assert.ok(ouiKeys.length >= 200 && ouiKeys.length <= 800,
+    `OUI 条目数应在 200-800 (实际 ${ouiKeys.length})`);
+  for (const k of ouiKeys) assert.match(k, /^[0-9A-F]{6}$/, `OUI 格式错误: ${k}`);
+  assert.ok(Object.keys(db.company || {}).length >= 100, 'Company ID 条目太少');
+  assert.ok(Object.keys(db.service || {}).length >= 40, 'Service UUID 条目太少');
+  assert.equal(db.classes.length, 10, 'classes 数量必须与 BleDevClass 一致');
+  assert.equal(db.classes[1], 'AirTag / Find My', 'classes[1] 必须是 AirTag');
+  assert.equal(db.classes[9], 'Remote ID', 'classes[9] 必须是 Remote ID');
+  assert.ok(db.company[76], 'Company ID 0x004C (Apple) 不在表内');
+  assert.ok(db.service[65194], 'Service UUID 0xFEAA (Eddystone) 不在表内');
+});
+
+test('P4(契约): vendor_db.h 内嵌压缩数据与 vendor_db.js 完全同步', () => {
+  const raw = readFileSync(join(ROOT, 'firmware', 'data', 'vendor_db.js'));
+  const header = readFileSync(join(ROOT, 'firmware', 'src', 'vendor_db.h'), 'utf-8');
+  const lenMatch = header.match(/VENDOR_DB_LEN\s*=\s*(\d+)/);
+  assert.ok(lenMatch, 'vendor_db.h 缺少 VENDOR_DB_LEN');
+  const bytes = [...header.matchAll(/0x([0-9A-Fa-f]{2})/g)].map((m) => parseInt(m[1], 16));
+  assert.equal(bytes.length, Number(lenMatch[1]), '压缩字节数量与长度不一致');
+  const blob = Buffer.from(bytes);
+  let inflated;
+  try { inflated = inflateSync(blob); }
+  catch { inflated = inflateRawSync(blob); }
+  assert.ok(inflated.equals(raw),
+    'vendor_db.h 解压后必须与 vendor_db.js 一致; 修改表后请重新编译固件');
+});
+
+test('P4(契约): BLE 页新增厂商/类型列, 表头与空态 colspan 一致', () => {
+  const html = readFileSync(join(ROOT, 'firmware', 'data', 'admin.html'), 'utf-8');
+  assert.ok(html.includes('<script src="/vendor-db.js"></script>'), 'BLE 页没有加载 vendor_db.js');
+  assert.ok(html.includes('bleVendorCell'), 'BLE 页缺少厂商/类型渲染函数');
+  assert.ok(html.includes('db.company') && html.includes('db.classes'),
+    'BLE 页未使用 Company ID / classes 映射');
+  const head = html.match(/<thead><tr><th>MAC<\/th><th>名称<\/th>[\s\S]*?<\/tr><\/thead>/);
+  assert.ok(head, '找不到 BLE 表头');
+  assert.equal((head[0].match(/<th>/g) || []).length, 8, 'BLE 表头应为 8 列');
+  assert.ok(html.includes('colspan="8"'), 'BLE 空态 colspan 应为 8');
+  assert.ok(Buffer.byteLength(html) <= 140 * 1024, 'admin.html 超过 140KB');
+});
 

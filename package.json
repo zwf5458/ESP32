@@ -10,6 +10,7 @@
     "start": "node server/src/index.js",
     "test": "node server/test/index.test.js",
     "pack-admin": "node tools/pack-admin.mjs",
+    "gen-vendor": "node tools/gen-vendor-tables.mjs --fetch --src tools/vendor-src",
     "gen-code": "node tools/gen-code.mjs",
     "codes": "node tools/gen-code.mjs --list",
     "stats": "node tools/gen-code.mjs --stats"

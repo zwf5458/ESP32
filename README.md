@@ -72,7 +72,7 @@ BLE 扫描 / 802.15.4 扫描 / 捕获凭据 / 配置）。**首次上电时设�
 | 数据包分析器 (Sniffer) | ✅ 真实实现 | 共用 promiscuous 回调抓真实 802.11 管理/控制/数据帧，解析帧类型、源/目的 MAC、SSID、Deauth Reason；支持单信道停驻与 1-13 自动跳频，实时帧率统计 |
 | Airodump 侦察 | ✅ 真实实现 | 从真实空口帧按 MAC 聚合对端（RSSI / 帧数 / 探测过的 SSID），支持 1-13 跳频；与 Evil Twin / Deauth / 握手捕获并行时停驻当前信道，避免破坏射频状态 |
 | Karma 探针诱捕 | ✅ 真实实现 | 监听真实 Probe Request，记录客户端 MAC / 目标 SSID / RSSI；SSID 命中当前克隆热点时标记为「已诱捕」，并复用握手捕获链路同步收集 4-Way Handshake |
-| BLE 广播嗅探 | ✅ 真实实现 | 纯被动监听周边 BLE 广播（ADV_IND / SCAN_RSP 等），解析 MAC / 名称 / RSSI / 广播类型 / 厂商数据摘要 / 广播计数；不发 SCAN_REQ、不连接设备。C3/C5/C6/S3 开放（NimBLE 后端），经典 ESP32 因 Bluedroid 体积与双 app 槽冲突而裁剪，S2 无蓝牙硬件 |
+| BLE 广播嗅探 + 设备画像 | ✅ 真实实现 | 纯被动监听周边 BLE 广播（ADV_IND / SCAN_RSP 等），解析 MAC / 名称 / RSSI / 广播类型 / 厂商数据摘要 / 广播计数，并按 Company ID / Service UUID 识别 AirTag/Find My、iBeacon、Eddystone、BTHome、小米、Govee、Ruuvi、Fast Pair、Remote ID 等类别，展示厂商名与「随机 MAC」标记；不发 SCAN_REQ、不连接设备。C3/C5/C6/S3 开放（NimBLE 后端），经典 ESP32 因 Bluedroid 体积与双 app 槽冲突而裁剪，S2 无蓝牙硬件 |
 | 802.15.4 嗅探 | ✅ 真实实现 | 纯被动接收 IEEE 802.15.4 帧（Zigbee / Thread / 智能家居），解析帧类型 / PAN ID / 源地址 / RSSI / LQI，并对 11-26 信道做能量检测（dBm）；promiscuous 模式只收不发、不自动 ACK、不注入。仅 ESP32-C5 / C6 具备该射频，其余芯片整页隐藏且 API 返回 501；与 WiFi 2.4G 共用射频，AP 保持在线、抓包为分时采样 |
 | 16MB 三系统引导 | ✅ 实现（`esp32c5_16mb`） | 16MB C5 板（C5N16R8）上划分 `ota_0/ota_1/ota_2` 三个 app 槽（各 3.9375MB）+ 共享 spiffs，可部署审计固件 / ESPsoup / Meta Muse 并通过 `GET·POST /api/system/boot`、串口 `boot` 命令或烧录台「外部固件刷写」切换；4MB 版 `esp32c5` 不受影响 |
 
@@ -114,6 +114,7 @@ Handshake 自 2026-11-10 起为真实抓包 + 真实跑包（见变更记录）�
 | Airodump | `POST /api/airodump/start`、`POST /api/airodump/stop`、`GET /api/airodump/status` |
 | Karma | `POST /api/karma/start`、`POST /api/karma/stop`、`GET /api/karma/status` |
 | BLE 扫描 | `POST /api/ble/start`、`POST /api/ble/stop`、`GET /api/ble/status`、`GET /api/ble/devices`、`POST /api/ble/clear` |
+| 厂商表资源 | `GET /vendor-db.js`（公开只读，deflate 压缩；后台按需加载，不含密钥） |
 | 802.15.4 扫描 | `POST /api/ieee802154/start`、`POST /api/ieee802154/stop`、`GET /api/ieee802154/status`、`GET /api/ieee802154/frames`、`POST /api/ieee802154/clear` |
 
 > `/api/info` 已包含 `evilTwin` / `deauth` / `handshake` / `sniffer` / `airodump` / `karma` / `ble` / `ieee802154`
@@ -330,6 +331,23 @@ unused ──verify──▶ verified(15min) ──烧录成功/pair nonce──
 - ⬜ 16MB 三系统真机验证（需 ESP32-C5N16R8，步骤见 `docs/firmware-flashing.md` §6.6）
 
 ## 变更记录
+
+### 2026-11-12（四）P4-0/P4-1：BLE 设备画像 + 公开厂商表
+
+- **数据源与生成脚本**：新增 `tools/gen-vendor-tables.mjs`，从 IEEE OUI + Bluetooth SIG
+  Assigned Numbers 生成 `firmware/data/vendor_db.js`（OUI 512 / Company 256 / Service 84），
+  支持 `--fetch` / `--check`；新增 `THIRD_PARTY.md` 记录数据来源，不引入任何第三方代码。
+- **BLE 字段扩展**：`BleDeviceEntry` 增加 `companyId` / `svcUuid` / `svcData` / `devClass` /
+  `randomMac` 与 `rid*` 预留字段；`onResult` 读取 Manufacturer Data、Service UUID、
+  Service Data，全程只把定长前缀拷入临界区。
+- **设备分类**：固件内按整数规则识别 AirTag/Find My、iBeacon、Eddystone、BTHome、小米、
+  Govee、Ruuvi、Fast Pair、Remote ID；文案与厂商名由 `vendor_db.js` 映射，改文案不动 C++。
+- **API / UI**：`/api/ble/status|devices` 只新增字段（旧字段保留）；BLE 页扩为 8 列，
+  新增「厂商 / 类型」胶囊与「随机 MAC」提示；新增公开只读资源 `GET /vendor-db.js`。
+- **体积**：4MB `esp32c5` 96.9%（1,904,179 / 1,966,080，P4-1 增量 13,616 B，余量 61,901 B）；
+  RAM 14.7%；`esp32s3` 79.9%、经典 `esp32` 66.5%；`esp32c5_16mb` 46.1%。
+- **测试**：`npm test` 47/47（新增 6 条 P4 契约：字段/10 条分类向量/纯被动/vendor_db 结构/
+  内嵌同步/UI 列数）；真机分类效果待 C5 实板确认。
 
 ### 2026-11-12（四）16MB 三系统分区表接入构建
 
@@ -552,5 +570,7 @@ EAPOL/握手材料（M1~M4、PMKID、nonce、MIC）、凭据或密码字段。
   纯被动嗅探 + 信道能量扫描，C5/C6 开放）已实现待真机验证。差距与改造清单见
   [docs/plans/2026-11-11-c5-5ghz-ble-802154-roadmap.md](docs/plans/2026-11-11-c5-5ghz-ble-802154-roadmap.md)
 - P4 设备识别与指纹（BLE 厂商/类别、OUI 厂商名、ASTM F3411 Remote ID）：
-  规划中，含字段扩展、体积预算与契约测试点，见
+  **P4-0/P4-1 已实现（待真机验证）**——公开数据生成 `vendor_db.js`、BLE 字段扩展与
+  10 类设备画像、`/vendor-db.js` 资源路由、契约测试；4MB C5 实测 96.9%（+13.6KB）。
+  P4-2（WiFi OUI 列）与 P4-3（Remote ID 解析）仍待实现，见
   [docs/plans/2026-11-12-p4-device-identification-roadmap.md](docs/plans/2026-11-12-p4-device-identification-roadmap.md)
