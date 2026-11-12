@@ -74,6 +74,7 @@
 #endif
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
+#include "esp_task_wdt.h"       // TWDT panic 模式: 挂死自愈 + 现场回溯 (真机 802.15.4 长跑挂死诊断)
 
 #ifndef FW_VERSION
   #define FW_VERSION "1.1.0"
@@ -1331,9 +1332,17 @@ struct I154State {
   I154DevEntry devs[I154_DEV_MAX];
   uint8_t devCount = 0;
 
+  // 与 AP 客户端共存 (C5 单射频): autoPaused=true 表示本次停止是共存自动暂停
+  // (用户未主动停), 恢复嗅探时统计不清零; 手动 start/stop 会清除该标记。
+  bool autoPaused = false;
+
   portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 };
 static I154State sI154;
+
+// AP 侧客户端活动时间戳: 由 WiFi 事件回调更新 (探针请求 = 关联前奏, 最灵敏的活动信号)
+static volatile uint32_t sApLastProbeMs = 0;
+static volatile uint32_t sApLastAssocMs = 0;
 
 static void i154ResetEd() {
   for (int i = 0; i < 16; i++) sI154.ed[i] = 127;
@@ -1527,15 +1536,20 @@ static void i154TaskFunc(void *) {
         continue;
       }
       esp_ieee802154_set_promiscuous(true);  // 只收不发, 不自动 ACK
-      portENTER_CRITICAL(&sI154.mux);
-      for (int i = 0; i < I154_PAN_MAX; i++) sI154.pans[i].used = false;
-      for (int i = 0; i < I154_DEV_MAX; i++) sI154.devs[i].used = false;
-      sI154.panCount = sI154.devCount = 0;
-      sI154.total = 0;
-      for (int i = 0; i < 5; i++) sI154.byType[i] = 0;
-      for (int i = 0; i < 16; i++) sI154.chFrames[i] = 0;
-      i154ResetEd();
-      portEXIT_CRITICAL(&sI154.mux);
+      // 统计重置只发生在"新鲜启动" (手动 start); 共存自动暂停后的恢复沿用累计结果
+      const bool freshStart = !sI154.autoPaused;
+      sI154.autoPaused = false;
+      if (freshStart) {
+        portENTER_CRITICAL(&sI154.mux);
+        for (int i = 0; i < I154_PAN_MAX; i++) sI154.pans[i].used = false;
+        for (int i = 0; i < I154_DEV_MAX; i++) sI154.devs[i].used = false;
+        sI154.panCount = sI154.devCount = 0;
+        sI154.total = 0;
+        for (int i = 0; i < 5; i++) sI154.byType[i] = 0;
+        for (int i = 0; i < 16; i++) sI154.chFrames[i] = 0;
+        i154ResetEd();
+        portEXIT_CRITICAL(&sI154.mux);
+      }
       sI154.startedAt = millis();
       sI154.lastHopAt = sI154.startedAt;
       sI154.phase = I154_RUNNING;
@@ -3424,6 +3438,7 @@ static void handleI154Start() {
   sI154.hopping = hopping;
   sI154.durationSec = dur;
   sI154.initFailed = false;
+  sI154.autoPaused = false;   // 手动启动: 清除共存自动暂停标记 (由新的手动意图接管)
   sI154.want = true;  // i154TaskFunc 接管
   log("[i154] 收到扫描请求 (" + String(mode == I154_MODE_ENERGY ? "能量扫描" : "帧嗅探") + ", " +
       String(hopping ? String("跳频 11-26") : ("信道 " + String(ch))) + "), 等待射频就绪...");
@@ -3436,6 +3451,7 @@ static void handleI154Start() {
 static void handleI154Stop() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
 #if FW_IEEE802154_SUPPORTED
+  sI154.autoPaused = false;   // 手动停止: 清除共存自动暂停标记 (包括处于暂停窗口时)
   if (!sI154.want && sI154.phase == I154_IDLE) {
     server.send(409, "application/json", "{\"ok\":false,\"error\":\"802.15.4 扫描未在运行\"}");
     return;
@@ -3826,6 +3842,30 @@ static void handleBootPost() {
 }
 
 static String sSerialCmd = "";
+// WiFi 射频重启: 恢复被 802.15.4 破坏的接收路径。
+// 真机实测: esp_ieee802154_enable+receive 后 AP 只发不收 (信标可见但关联/数据全挂),
+// esp_ieee802154_disable 也无法恢复, 唯 esp_wifi stop/start 重建。
+static void restartWifiAp() {
+  log("[wifi] 正在重启 WiFi 射频 (恢复接收路径)...");
+  // 无条件停掉/清除 i154 (含服务窗口暂停态): 15.4 必须先归还, 且不能被自动恢复逻辑重新拉起
+  sI154.want = false;
+  sI154.autoPaused = false;
+  delay(400);                  // 等 i154TaskFunc 走完 disable (若在运行)
+  WiFi.softAPdisconnect(true);
+  delay(100);
+  esp_wifi_stop();
+  delay(200);
+  esp_wifi_start();
+  WiFi.mode(WIFI_AP_STA);
+  if (!WiFi.softAP(apSsid.c_str(), AP_PASSWORD, apChannel, false, 4)) {
+    log("[wifi] 重启后 softAP 启动失败, 将重试 …");
+    delay(2000);
+    WiFi.softAP(apSsid.c_str(), AP_PASSWORD, apChannel, false, 4);
+  }
+  apChannelActive = apChannel;
+  log("[wifi] WiFi 射频已重启: SSID=" + apSsid + "  信道=" + String(apChannel));
+}
+
 static void handleSerialCli() {
   while (Serial.available()) {
     char c = (char)Serial.read();
@@ -3842,6 +3882,7 @@ static void handleSerialCli() {
           Serial.println(F("boot muse          : 切换至 Meta Muse AI 伴侣模式并重启"));
           Serial.println(F("reboot             : 重启当前系统"));
           Serial.println(F("info               : 查看系统运行状态"));
+          Serial.println(F("wifi               : 重启 WiFi 射频 (修复 802.15.4 后 AP 收不到包)"));
           Serial.println(F("====================\n"));
         } else if (cmd == "boot" || cmd == "boot status") {
           Serial.println(F("\n=== 多系统引导槽位 (Triple-Boot) ==="));
@@ -3874,6 +3915,8 @@ static void handleSerialCli() {
           Serial.println(F("[system] 正在重启 …"));
           delay(500);
           ESP.restart();
+        } else if (cmd == "wifi") {
+          restartWifiAp();
         } else if (cmd == "info") {
           Serial.printf("[system] 芯片:%s FreeHeap:%d Uptime:%lus SSID:%s\n",
                         detectChipKey().c_str(), ESP.getFreeHeap(), millis() / 1000, apSsid.c_str());
@@ -4027,6 +4070,55 @@ static void notFound() {
 void setup() {
   Serial.begin(115200);
   delay(200);
+
+  // WiFi 事件日志: 设备侧视角的关联/探针/地址分配 (诊断 "AP 可见但关联不上"),
+  // 并为共存策略记录客户端活动时间戳。探针很频繁, 只节流记录。
+  WiFi.onEvent([](WiFiEvent_t ev, WiFiEventInfo_t) {
+    static uint32_t lastProbeLog = 0;
+    switch (ev) {
+      case ARDUINO_EVENT_WIFI_AP_START:
+        log("[ev] AP_START");
+        break;
+      case ARDUINO_EVENT_WIFI_AP_STOP:
+        log("[ev] AP_STOP");
+        break;
+      case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
+        sApLastAssocMs = millis();
+        log("[ev] AP_STA_CONNECTED (关联完成)");
+        break;
+      case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
+        log("[ev] AP_STA_DISCONNECTED");
+        break;
+      case ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED:
+        log("[ev] AP_STAIPASSIGNED (DHCP 完成)");
+        break;
+      case ARDUINO_EVENT_WIFI_AP_PROBEREQRECVED:
+        sApLastProbeMs = millis();
+        if (millis() - lastProbeLog > 10000) {
+          lastProbeLog = millis();
+          log("[ev] PROBE_REQ (节流: 10s 一条)");
+        }
+        break;
+      default:
+        break;
+    }
+  });
+
+  // 任务看门狗 (panic 模式): 主循环/空闲任务 60s 未喂狗 → panic 打印各任务 backtrace 后自动重启。
+  // 动机: 真机发现 802.15.4 长时间嗅探后 WiFi/主循环挂死 (无 panic 文本、不复位、热点消失),
+  // TWDT panic 既让设备自愈, 又把挂死现场 (被卡任务的栈) 打到串口供诊断。
+  {
+    esp_task_wdt_config_t wdtCfg = {};
+    wdtCfg.timeout_ms = 60000;
+    wdtCfg.idle_core_mask = (1 << 0) | (1 << 1);  // 两个核的 idle 都监控
+    wdtCfg.trigger_panic = true;
+    if (esp_task_wdt_init(&wdtCfg) != ESP_OK) {
+      esp_task_wdt_reconfigure(&wdtCfg);   // Arduino 已初始化过 (5s, 无 panic) → 重配置为 60s + panic
+    }
+    esp_task_wdt_add(nullptr);    // 订阅当前任务 (loopTask)
+    Serial.println("[wdt] 任务看门狗已启用 (60s panic 模式)");
+  }
+
   Serial.println();
   Serial.println("==============================================");
   Serial.println(F("ESP32 无线网络开发固件 v" FW_VERSION " (" FW_BUILD_NS ")"));
@@ -4160,6 +4252,7 @@ void setup() {
 }
 
 void loop() {
+  esp_task_wdt_reset();   // 喂狗: 主循环任何一环 (HTTP/DNS/CLI/推进逻辑) 挂死都会触发 panic 回溯
   handleSerialCli();
   server.handleClient();
   dnsServer.processNextRequest();
@@ -4304,6 +4397,78 @@ void loop() {
     emitJson("client_leave", "\"clients\":" + String(clients));
   }
   lastClients = clients;
+
+  // C5 单射频共存策略 (真机实测根因):
+  //   esp_ieee802154 启用后 WiFi AP 的接收路径被破坏 —— 信标仍可发 (热点可见), 但
+  //   关联请求 / 数据 / HTTP 全部收不到; esp_ieee802154_disable 无法恢复,
+  //   唯 esp_wifi stop/start 可恢复 (真机验证: 重启后关联 + ping 立即正常)。
+  // 策略 = 服务窗口制: 嗅探 60s → 自动停嗅探 + 重启射频 → 动态服务窗口 (客户端回连后
+  //        再保持 5s 等 DHCP, 无人回连 45s 超时) → 自动恢复嗅探 (统计保留); 无条件周期执行
+  //        —— 楔死状态下探针也收不到, 不能依赖"检测到客户端活动"触发, 否则永久死锁。
+  {
+    const bool joinAttempt = clients == 0 && ((now - sApLastProbeMs < 15000) ||
+                                              (now - sApLastAssocMs < 15000));
+    (void)joinAttempt;   // 记录保留: 探针时间戳仍由事件回调维护, 供后续诊断/日志使用
+    static uint32_t sniffStartAt = 0;
+    static uint32_t windowEndAt = 0;
+    static uint32_t windowClientAt = 0;
+    static bool serviceWindow = false;
+    static bool windowRestarted = false;
+    static bool wasRunning = false;
+
+    if (sI154.phase == I154_RUNNING) wasRunning = true;
+
+    // 窗口外手动停止 (串口 CLI / HTTP): 自动重启射频, 恢复可能已被破坏的接收路径
+    if (wasRunning && sI154.phase == I154_IDLE && !sI154.autoPaused && !serviceWindow && !sI154.want) {
+      wasRunning = false;
+      log("[i154] 嗅探已停止, 自动重启射频恢复 AP 接收路径");
+      restartWifiAp();
+    }
+
+    if (serviceWindow) {
+      if (sI154.want && sI154.phase != I154_IDLE) {
+        // 用户在窗口期间手动重新启动嗅探 → 取消窗口
+        serviceWindow = false;
+        sniffStartAt = 0;
+      } else if (!windowRestarted && sI154.phase == I154_IDLE && !sI154.want) {
+        restartWifiAp();
+        sI154.autoPaused = true;    // 窗口结束恢复嗅探时统计保留
+        windowRestarted = true;
+        windowEndAt = now;
+        windowClientAt = 0;
+      } else if (windowRestarted && !sI154.want) {
+        // 动态窗口: 等客户端回连 (Windows 被踢后有 40-60s 自动回连退避, 固定短窗口会错过),
+        // 回连成功再保持 5s 等 DHCP 完成; 若 45s 内无人回连则按超时收窗恢复嗅探。
+        if (clients > 0 && windowClientAt == 0) {
+          windowClientAt = now;
+          log("[i154] 客户端已在服务窗口内回连, 保持 5s 等 DHCP");
+        }
+        const bool windowDone =
+            (windowClientAt != 0 && now - windowClientAt >= 5000) ||
+            (windowClientAt == 0 && now - windowEndAt >= 45000);
+        if (windowDone) {
+          if (sI154.autoPaused) {
+            sI154.want = true;
+            log("[i154] 服务窗口结束, 自动恢复嗅探 (统计保留)");
+          } else {
+            log("[i154] 服务窗口结束 (嗅探保持停止)");
+          }
+          serviceWindow = false;
+          sniffStartAt = 0;
+        }
+      }
+    } else if (sI154.want && sI154.phase == I154_RUNNING && !sI154.autoPaused) {
+      if (sniffStartAt == 0) sniffStartAt = now;
+      if ((int32_t)(now - sniffStartAt) >= 60000) {
+        sI154.want = false;         // i154TaskFunc 走常规停止路径 (esp_ieee802154_disable 归还射频)
+        sI154.autoPaused = true;
+        serviceWindow = true;
+        windowRestarted = false;
+        wasRunning = false;         // 窗口内会做射频重启, 避免上面的手动停止恢复重复触发
+        log("[i154] 进入服务窗口 (停嗅探 + 重启射频, 等客户端回连后再恢复嗅探)");
+      }
+    }
+  }
 
   // 心跳: 每 30 秒打印状态 (文本日志 + 结构化遥测各一份)
   static uint32_t lastBeat = 0;
