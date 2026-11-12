@@ -9,7 +9,7 @@ ESPsoup（App 未选择许可证、固件 GPL-3.0）的任何代码。
 | Bluetooth SIG Company Identifiers | BLE Manufacturer Data 的 Company ID 名称 | <https://bitbucket.org/bluetooth-SIG/public/src/main/assigned_numbers/company_identifiers/company_identifiers.yaml> | 仅提取数值与名称；生成 `firmware/data/vendor_db.js` |
 | Bluetooth SIG Service UUIDs | GATT 16-bit Service UUID 名称 | <https://bitbucket.org/bluetooth-SIG/public/src/main/assigned_numbers/uuids/service_uuids.yaml> | 仅提取数值与名称；生成 `firmware/data/vendor_db.js` |
 | 公开生态协议前缀 | Eddystone / BTHome / Fast Pair / Remote ID 等展示名 | Bluetooth SIG 成员 UUID 与各公开规范 | 仅补充 UUID → 名称映射，不含第三方代码 |
-| ASTM F3411 / OpenDroneID | Remote ID 消息格式与测试向量（P4-3 计划） | <https://github.com/opendroneid/opendroneid-core-c>（Apache-2.0） | 计划仅参考字段定义；如引入测试向量，将在实现处保留 Apache-2.0 署名 |
+| ASTM F3411 / OpenDroneID | Remote ID 消息格式参考（P4-3 已实现） | <https://github.com/opendroneid/opendroneid-core-c>（Apache-2.0） | 仅参考字段定义（消息头 / Basic ID / Location / System 的偏移与量纲），测试向量由本项目按规范自行构造，未引入其代码 |
 
 ## 生成方式
 

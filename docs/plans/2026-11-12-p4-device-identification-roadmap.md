@@ -1,7 +1,7 @@
 # 设备识别与指纹（P4）改造清单
 
 日期：2026-11-12
-状态：**P4-0/P4-1 已实现（待真机验证）**，P4-2/P4-3 规划中；不阻塞 v1.1.0 首刷与 16MB 三系统部署
+状态：**P4-0 ~ P4-3 已实现（待真机验证）**；不阻塞 v1.1.0 首刷与 16MB 三系统部署
 关联：[C5 5GHz / BLE / 802.15.4 roadmap](./2026-11-11-c5-5ghz-ble-802154-roadmap.md)、
 [平台设计文档 §4 能力矩阵](./2026-11-09-esp32-firmware-platform-design.md)、
 [刷固件说明 §6 三系统](../firmware-flashing.md#6-附16mb-flash-三系统-triple-boot-部署说明)
@@ -22,20 +22,21 @@ P2/P3 已把「能看到什么」补齐（BLE 广播、802.15.4 帧、5G 抓包�
 
 ## 2. 现状核对（代码事实）
 
-| 项 | 现状（P4-1 后） | 证据 |
+| 项 | 现状（P4-3 后） | 证据 |
 |---|---|---|
 | BLE 设备表 | 24 条，字段含 MAC / 名称 / `mfg[8]` / `companyId` / `svcUuid` / `svcData[8]` / `devClass` / `randomMac` / `rid*` | `main.cpp` `BleDeviceEntry`、`BleAdvSample`、`onResult` |
-| BLE 广播回调 | 取 `getManufacturerData()` + `getServiceUUID()` + `getServiceData()/getServiceDataUUID()` | `main.cpp` `onResult` |
+| BLE 广播回调 | 取 `getManufacturerData()` + `getServiceUUID()` + `getServiceData()/getServiceDataUUID()`，并把完整 Service Data 送 Remote ID 解析 | `main.cpp` `onResult` |
 | BLE API | `/api/ble/status|devices` 新增 `companyId` / `svcUuid` / `svcData` / `devClass` / `randomMac` / `rid`，旧字段保留 | `bleAppendDeviceJson()` |
-| BLE 页 | 8 列（MAC/名称/RSSI/类型/厂商·类型/厂商数据/广播数/最后出现） | `admin.html` `blePaintRows`、`bleVendorCell` |
-| 厂商表 | `vendor_db.js`：OUI 512 + Company 256 + Service 84；`GET /vendor-db.js` 压缩直出 | `tools/gen-vendor-tables.mjs`、`vendor_db.h` |
-| WiFi 扫描 | 输出 ssid/rssi/channel/bssid/auth，**无厂商名**（P4-2） | `main.cpp` `handleScan` |
-| Sniffer | 只解析 SSID / Reason，无 Vendor IE 遍历（P4-3） | `main.cpp` `snifferObserve`、`ieFindSsid` |
-| 4MB 版体积 | `esp32c5`：**1,904,179 / 1,966,080 = 96.9%**，剩余 **61,901 B**（P4-1 增量 13,616 B） | `pio run -e esp32c5` |
-| 16MB 版体积 | `esp32c5_16mb`：1,904,179 / 4,128,768 = 46.1% | `pio run -e esp32c5_16mb` |
-| 静态 RAM | 76,840 / 524,288 = 14.7% | 同上 |
-| 后台资源 | `admin.html` 128,801 B → deflate **35,657 B**；`vendor_db.js` 25,299 B → **8,721 B** | `embed_admin_page.py`、`pio run` |
-| 测试基线 | `npm test` **47/47** | `server/test/index.test.js` |
+| BLE 页 | 8 列（MAC/名称/RSSI/类型/厂商·类型/厂商数据/广播数/最后出现），次行补 UAS ID / 坐标 | `admin.html` `blePaintRows`、`bleVendorCell` |
+| 厂商表 | `vendor_db.js`：OUI 512 + Company 256 + Service 84；`GET /vendor-db.js` 压缩直出；扫描/Airodump/Sniffer 共用 | `tools/gen-vendor-tables.mjs`、`vendor_db.h` |
+| WiFi 扫描 | 输出 ssid/rssi/channel/bssid/auth，BSSID 次行显示 OUI 厂商名（随机 MAC 如实标注） | `main.cpp` `handleScan`、`admin.html` `vendorSub` |
+| Sniffer | 解析 SSID / Reason，并遍历厂商 IE 解析 Remote ID；src/dst 悬停显示厂商名 | `main.cpp` `snifferObserve`、`ieFindVendor`、`ridFromWifiFrame` |
+| Remote ID | `/api/rid` 最多 8 条 / 2 分钟 TTL；Basic ID + Location + System；BLE 与 WiFi 按 MAC 归并 | `main.cpp` `handleRid`、`admin.html` `paintRidCard` |
+| 4MB 版体积 | `esp32c5`：**1,910,147 / 1,966,080 = 97.2%**，剩余 **55,933 B**（P4-2/P4-3 增量 5,968 B） | `pio run -e esp32c5` |
+| 16MB 版体积 | `esp32c5_16mb`：1,910,147 / 4,128,768 = 46.3% | `pio run -e esp32c5_16mb` |
+| 静态 RAM | 77,896 / 524,288 = 14.9% | 同上 |
+| 后台资源 | `admin.html` 134,833 B → deflate **37,134 B**；`vendor_db.js` 25,299 B → **8,721 B** | `embed_admin_page.py`、`pio run` |
+| 测试基线 | `npm test` **52/52** | `server/test/index.test.js` |
 
 > **硬约束**：P4 的所有新增内容（固件代码 + 内嵌前端资源）必须控制在
 > **≤ 20KB Flash**（P4-1 实测 13.6KB；P4-1 后 4MB 版余量 61.9KB），并在每次提交前实测
@@ -65,7 +66,8 @@ P2/P3 已把「能看到什么」补齐（BLE 广播、802.15.4 帧、5G 抓包�
 - [x] **许可与署名**：`vendor_db.js` 头部注明数据来源；仓库根目录新增
       `THIRD_PARTY.md`（只记数据来源，不引入代码）。
 - [x] **测试向量**：`server/test/fixtures/p4-ble-adv.json`（10 条 BLE 分类向量）；
-      `p4-odid.json`（正常/截断/错误 OUI）随 P4-3 一起补。
+      `server/test/fixtures/p4-odid.json`（9 条 Remote ID 向量：BLE 单消息 / Message Pack /
+      WiFi Beacon / 截断 / 错误 OUI / 特殊字符）。
 
 ### P4-1：BLE 字段扩展与设备画像（1.5 天）
 
@@ -97,8 +99,8 @@ P2/P3 已把「能看到什么」补齐（BLE 广播、802.15.4 帧、5G 抓包�
 | Remote ID | `svcUuid==0xFFFA && svcData[0]==0x0D`（详细解析见 P4-3） |
 | 随机 MAC | MAC 首字节 `& 0x02`（独立布尔 `randomMac`，不占用 `devClass`，不参与 OUI 查询） |
 
-> `ridFlags` / `ridUasId` / `ridLat` / `ridLon` / `ridAlt` 已在 P4-1 预留并随 API 输出
-> （未命中时 `rid: null`），实际解析在 P4-3 落地。
+> `ridFlags` / `ridUasId` / `ridLat` / `ridLon` / `ridAlt` 在 P4-1 预留，P4-3 补齐解析，
+> 并由 `ridFlags` 决定字段是否有效（未命中时 `rid: null`）。
 
 - [x] **取数**：`onResult` 增加 `getServiceUUID()/getServiceUUIDCount()`、
       `getServiceData()/getServiceDataUUID()`，只把定长前缀拷到栈上再进临界区；
@@ -114,7 +116,7 @@ P2/P3 已把「能看到什么」补齐（BLE 广播、802.15.4 帧、5G 抓包�
 **已实现落点**：`firmware/src/main.cpp`（`BleDeviceEntry` / `BleAdvSample` / `bleClassify` /
 `bleAppendDeviceJson`）、`firmware/data/admin.html`（`bleVendorCell`）、
 `firmware/data/vendor_db.js`、`tools/gen-vendor-tables.mjs`、`server/test/fixtures/p4-ble-adv.json`。
-**验收状态**：构建与契约测试已通过（C5 96.9%、S3 79.9%、经典 ESP32 66.5%）；真机分类效果待 C5 实板确认。
+**验收状态**：构建与契约测试已通过（C5 97.2%、S3 80.3%、经典 ESP32 66.9%）；真机分类效果待 C5 实板确认。
 
 **验收**：手机开 AirDrop/Find My 时 10s 内出现 AirTag/Find My 标签；iBeacon 信标显示
 iBeacon；未知设备显示「未知」；导出 JSON 字段完整。
@@ -137,12 +139,13 @@ iBeacon；未知设备显示「未知」；导出 JSON 字段完整。
       `firmware/data/vendor_db.js`，由 `embed_admin_page.py` 扩展为压缩内嵌
       `src/vendor_db.h`，路由 `GET /vendor-db.js`（`Content-Encoding: deflate`、
       `Cache-Control: max-age=86400`）；P4-1 已提前落地，供 BLE 页使用；
-- [ ] **查询接口**：`vendorName(mac)` 取前 3 字节；首字节 `& 0x02` 直接返回「随机 MAC」；
-      未命中返回空（UI 显示「未知厂商」）；
-- [ ] **UI 落点**：扫描页 BSSID 列、Airodump 对端表、Sniffer 的 src/dst 悬浮提示；
-      默认不新增列，避免移动端表格过宽；
-- [ ] **注意**：现代手机普遍使用随机 MAC，OUI 对「手机」几乎无效，UI 必须如实标注，
-      不要把它当设备身份（BLE 页已加提示，WiFi 页待补）。
+- [x] **查询接口**：`vendorName(mac)` 取前 3 字节；首字节 `& 0x02` 直接返回「随机 MAC」；
+      未命中返回空（UI 显示「未知厂商」）；实现在 `admin.html`（`vendor_db.js` 已在浏览器侧，
+      固件不再重复实现一份查表逻辑，省 Flash）；
+- [x] **UI 落点**：扫描页 BSSID 列、Airodump 对端表（AP + Station）次行显示厂商名；
+      Sniffer 的 src/dst 用 `title` 悬浮提示，不新增列；
+- [x] **注意**：现代手机普遍使用随机 MAC，OUI 对「手机」几乎无效，UI 必须如实标注，
+      不要把它当设备身份（扫描 / Airodump / BLE 页均已加提示）。
 
 **预算合计（实测）**：`vendor_db.js` 原始 25,299 B / deflate 8,721 B；P4-1 固件与
 前端增量 13,616 B（含压缩后的 vendor_db.h）；4MB C5 剩余 61,901 B。
@@ -165,29 +168,32 @@ iBeacon；未知设备显示「未知」；导出 JSON 字段完整。
 **字段**：UA 类型（固定翼/多旋翼/直升机/火箭…）、ID 类型（序列号/CAA/UTM UUID/会话 ID）、
 UAS ID（20 字节）、无人机经纬度/高度、操作员经纬度、RSSI、首末次出现时间。
 
-- [ ] **BLE 侧**：在 `onResult` 内识别 `0xFFFA` 服务数据，**从完整 Service Data**
-      （栈上定长 64B 缓冲，超长部分丢弃）解析 ODID 消息包，结果写入
-      `BleDeviceEntry.rid*`；`svcData[8]` 只用于分类与展示，不承担完整解析；
-      解析失败不改类别、不 crash；
-- [ ] **WiFi 侧**：新增 `ieFindVendor(f,len,off,oui,ouiType,out,outLen)`；
-      `snifferObserve` 对 Beacon/ProbeResp 调用一次，解析结果进 `sRid`（**8 条**环形，
-      约 320B RAM）；`info[48]` 只放 `RemoteID: <UAS ID>` 摘要；
-- [ ] **API**：新增 `GET /api/rid`（数组，最多 8 条），字段与 BLE 侧一致；
-      遥测不新增事件类型（沿用 `lab_state`）；
-- [ ] **UI**：BLE 页在名称旁显示「Remote ID」胶囊 + UAS ID；Sniffer 页新增
-      「Remote ID」小卡片（UAS ID / 型号 / 经纬度 / 操作员位置 / 最后出现），
-      坐标只做文本展示与复制，**不加载在线地图**（AP 模式通常无外网）；
-- [ ] **安全**：所有长度按 IE/AD 实际长度校验；先 memcpy 到定长缓冲再解析；
-      不因畸形包扩大 `info` 或越界读。
+- [x] **BLE 侧**：在 `onResult` 内识别 `0xFFFA` 服务数据，**从完整 Service Data**
+      解析 ODID 消息包（读取前先校验长度），结果写入 `BleDeviceEntry.rid*`；
+      `svcData[8]` 只用于分类与展示，不承担完整解析；解析失败不改类别、不 crash；
+- [x] **WiFi 侧**：新增 `ieFindVendor(f,len,off,oui,ouiType,out,outLen)`；
+      `onPromiscuousFrame` 对 Beacon/ProbeResp 解析一次，结果进 `sRid`（**8 条**环形，
+      2 分钟 TTL）；`info[48]` 只放 `RemoteID: <UAS ID>` 摘要；
+- [x] **API**：新增 `GET /api/rid`（数组，最多 8 条），字段与 BLE 侧一致（`ridAppendFields`
+      共用同一份 JSON 片段）；遥测不新增事件类型（沿用 `lab_state`）；
+- [x] **UI**：BLE 页在厂商/类型胶囊下显示 UAS ID 与坐标；Sniffer 页新增
+      「Remote ID」卡片（UAS ID / 机型 / 经纬度 / 操作员位置 / 来源 / RSSI / 最后出现），
+      坐标只做文本展示与点击复制，**不加载在线地图**（AP 模式通常无外网）；
+- [x] **安全**：所有长度按 IE/AD 实际长度校验；不因畸形包扩大 `info` 或越界读；
+      UAS ID 中不可打印字符与 `"` / `\` 在解析时即替换为 `.`，可直接拼入 JSON。
+
+**实测**：`p4-odid.json` 9 条向量（BLE 单消息 / BLE Message Pack / WiFi Beacon 厂商 IE /
+(0,0) 坐标 / 截断包 / 短包 / 错误 OUI / 错误 OUI Type / UAS ID 特殊字符）；`npm test` 52/52。
 
 **验收**：用 OpenDroneID 官方/开源测试向量回放，Basic ID 与 Location 字段与向量一致；
 截断包返回未识别；真机上如周边有 Remote ID 无人机，10s 内出现条目（无则如实为空）。
 
 ### P4-4：验证与文档（0.5–1 天）
 
-- [x] `pio run -e esp32c5`：Flash **96.9%**（1,904,179 / 1,966,080，新增 13,616 B）；
-      `esp32c5_16mb` 正常产出（46.1%）；`esp32`（BLE 裁剪）66.5%、`esp32s3`（NimBLE）79.9%；
-- [x] `npm test`：47/47 全绿；`admin_page.h` / `vendor_db.h` 与源文件逐字节一致；
+- [x] `pio run -e esp32c5`：Flash **97.2%**（1,910,147 / 1,966,080，P4-2/P4-3 合计新增 5,968 B，
+      P4 全增量 19,584 B ≤ 20KB，余量 55,933 B）；RAM 14.9%；
+      `esp32c5_16mb` 正常产出（46.3%）；`esp32`（BLE 裁剪）66.9%、`esp32s3`（NimBLE）80.3%；
+- [x] `npm test`：52/52 全绿；`admin_page.h` / `vendor_db.h` 与源文件逐字节一致；
 - [ ] 真机（C5）：BLE 分类、OUI、Remote ID 三项分别验收；AP/5G/三系统切换不回归；
 - [x] 文档：`README` 功能表补「设备识别」，新增 `THIRD_PARTY.md`，更新本文件的状态与落点表。
 

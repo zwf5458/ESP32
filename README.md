@@ -69,7 +69,8 @@ BLE 扫描 / 802.15.4 扫描 / 捕获凭据 / 配置）。**首次上电时设�
 | Evil Twin（邪恶双子） | ✅ 真实实现 | 攻击时把本机热点**真实改名**为与主目标一模一样的 SSID（开放无密码、信道对齐主目标）→ 目标设备免密直连；同时自动对主目标持续注入 Deauth，并对双子目标（通常同路由 5G BSSID）每 2s 跳频连发注入 → 目标两个频段都无法联网；Captive Portal 自动弹钓鱼页，捕获第一条凭据后自动停止干扰，手动停止恢复原热点名/密码/信道 |
 | Deauther（WiFi 杀手） | ✅ 真实实现 | 经 `esp_wifi_80211_tx` 向空口注入真实 Deauthentication 管理帧（0x00c0，广播踢出目标 AP 下全部客户端），带 Reason Code 与帧率/计数遥测。启动时自动把热点切到目标信道（已连受测设备短暂掉线后自动重连），停止时恢复配置信道；C5 raw TX 受限时返回错误码并如实显示 |
 | Handshake / 握手包与跑包 | ✅ 真实实现 | `esp_wifi_set_promiscuous` 真实空口捕获 4-Way Handshake（M1~M4，含 PMKID KDE）；板载用内置 7,153 条弱口令逐条跑包（PMK=PBKDF2-HMAC-SHA1 4096 轮 → PTK → 重算 M2 的 MIC 比对，支持 keyver 1/2）。keyver 3（802.11w PMF）导出后交服务端 `/api/wpa/crack`（SHA256-KDF + AES-CMAC） |
-| 数据包分析器 (Sniffer) | ✅ 真实实现 | 共用 promiscuous 回调抓真实 802.11 管理/控制/数据帧，解析帧类型、源/目的 MAC、SSID、Deauth Reason；支持单信道停驻与 1-13 自动跳频，实时帧率统计 |
+| 数据包分析器 (Sniffer) | ✅ 真实实现 | 共用 promiscuous 回调抓真实 802.11 管理/控制/数据帧，解析帧类型、源/目的 MAC、SSID、Deauth Reason；支持单信道停驻与 1-13 自动跳频，实时帧率统计；源/目的 MAC 悬停显示 OUI 厂商名。同一回调顺带解析 Beacon / Probe Response 中的 ASTM F3411 Remote ID 厂商 IE |
+| Remote ID 解析 | ✅ 真实实现 | 纯被动解析两路载体：BLE Service Data（UUID 0xFFFA + App Code 0x0D）与 WiFi Beacon / ProbeResp 厂商 IE（OUI `FA-0B-BC` / Type 0x0D）。解析 Basic ID（UAS ID / 机型 / ID 类型）、Location（无人机经纬度 / 高度）、System（操作员位置）；同一 MAC 的 BLE 与 WiFi 数据自动归并，2 分钟未更新自动隐藏，最多 8 条。坐标仅文本展示并可点击复制，不加载在线地图（AP 模式无外网） |
 | Airodump 侦察 | ✅ 真实实现 | 从真实空口帧按 MAC 聚合对端（RSSI / 帧数 / 探测过的 SSID），支持 1-13 跳频；与 Evil Twin / Deauth / 握手捕获并行时停驻当前信道，避免破坏射频状态 |
 | Karma 探针诱捕 | ✅ 真实实现 | 监听真实 Probe Request，记录客户端 MAC / 目标 SSID / RSSI；SSID 命中当前克隆热点时标记为「已诱捕」，并复用握手捕获链路同步收集 4-Way Handshake |
 | BLE 广播嗅探 + 设备画像 | ✅ 真实实现 | 纯被动监听周边 BLE 广播（ADV_IND / SCAN_RSP 等），解析 MAC / 名称 / RSSI / 广播类型 / 厂商数据摘要 / 广播计数，并按 Company ID / Service UUID 识别 AirTag/Find My、iBeacon、Eddystone、BTHome、小米、Govee、Ruuvi、Fast Pair、Remote ID 等类别，展示厂商名与「随机 MAC」标记；不发 SCAN_REQ、不连接设备。C3/C5/C6/S3 开放（NimBLE 后端），经典 ESP32 因 Bluedroid 体积与双 app 槽冲突而裁剪，S2 无蓝牙硬件 |
@@ -114,6 +115,7 @@ Handshake 自 2026-11-10 起为真实抓包 + 真实跑包（见变更记录）�
 | Airodump | `POST /api/airodump/start`、`POST /api/airodump/stop`、`GET /api/airodump/status` |
 | Karma | `POST /api/karma/start`、`POST /api/karma/stop`、`GET /api/karma/status` |
 | BLE 扫描 | `POST /api/ble/start`、`POST /api/ble/stop`、`GET /api/ble/status`、`GET /api/ble/devices`、`POST /api/ble/clear` |
+| Remote ID | `GET /api/rid`（BLE + WiFi Beacon 汇总，只读，最多 8 条，2 分钟 TTL） |
 | 厂商表资源 | `GET /vendor-db.js`（公开只读，deflate 压缩；后台按需加载，不含密钥） |
 | 802.15.4 扫描 | `POST /api/ieee802154/start`、`POST /api/ieee802154/stop`、`GET /api/ieee802154/status`、`GET /api/ieee802154/frames`、`POST /api/ieee802154/clear` |
 
@@ -331,6 +333,23 @@ unused ──verify──▶ verified(15min) ──烧录成功/pair nonce──
 - ⬜ 16MB 三系统真机验证（需 ESP32-C5N16R8，步骤见 `docs/firmware-flashing.md` §6.6）
 
 ## 变更记录
+
+### 2026-11-12（四）P4-2/P4-3：WiFi OUI 厂商列 + ASTM F3411 Remote ID
+
+- **P4-2 厂商列**：扫描页 BSSID、Airodump 的 AP / Station 在 MAC 下方显示 OUI 厂商名
+  （公开 IEEE 注册表，经 `vendor_db.js` 查表）；首字节 bit1 置位的本地管理地址如实标注
+  「随机 MAC」，不反查真实厂商。Sniffer 表格不加列，源/目的 MAC 用 `title` 悬停提示。
+- **P4-3 Remote ID**：新增 `RidData` / `RidEntry` / `ridParseMessage` / `ridParsePack` /
+  `ridFromWifiFrame` / `ieFindVendor` / `ridUpsert`，纯被动解析 BLE Service Data
+  （0xFFFA + 0x0D）与 WiFi 厂商 IE（`FA-0B-BC` / 0x0D）中的 Basic ID / Location / System；
+  同一 MAC 归并 BLE 与 WiFi 数据，2 分钟 TTL、上限 8 条。新增只读端点 `GET /api/rid`，
+  `/api/ble/*` 与 `/api/sniffer/*` 既有字段不变。
+- **UI**：Sniffer 页新增 Remote ID 卡片（UAS ID、机型 / ID 类型、无人机与操作员坐标、来源、
+  RSSI、最后出现），坐标点击复制，不加载任何在线地图；BLE 设备行补 UAS ID / 坐标次行。
+- **体积**：4MB `esp32c5` 97.2%（1,910,147 / 1,966,080，P4-2/P4-3 合计增量 5,968 B，余量 55,933 B）；
+  RAM 14.9%；`esp32s3` 80.3%、经典 `esp32` 66.9%；`esp32c5_16mb` 46.3%。
+- **测试**：`npm test` 52/52（新增 5 条：OUI 查表 / 随机 MAC、展示位置、Remote ID 9 条向量回放、
+  `/api/rid` 字段与纯被动边界、卡片不加载在线地图）；真机信号验证待 C5 实板。
 
 ### 2026-11-12（四）P4-0/P4-1：BLE 设备画像 + 公开厂商表
 
@@ -570,7 +589,7 @@ EAPOL/握手材料（M1~M4、PMKID、nonce、MIC）、凭据或密码字段。
   纯被动嗅探 + 信道能量扫描，C5/C6 开放）已实现待真机验证。差距与改造清单见
   [docs/plans/2026-11-11-c5-5ghz-ble-802154-roadmap.md](docs/plans/2026-11-11-c5-5ghz-ble-802154-roadmap.md)
 - P4 设备识别与指纹（BLE 厂商/类别、OUI 厂商名、ASTM F3411 Remote ID）：
-  **P4-0/P4-1 已实现（待真机验证）**——公开数据生成 `vendor_db.js`、BLE 字段扩展与
-  10 类设备画像、`/vendor-db.js` 资源路由、契约测试；4MB C5 实测 96.9%（+13.6KB）。
-  P4-2（WiFi OUI 列）与 P4-3（Remote ID 解析）仍待实现，见
+  **P4-0/P4-1/P4-2/P4-3 已实现（待真机验证）**——公开数据生成 `vendor_db.js`、BLE 字段扩展与
+  10 类设备画像、`/vendor-db.js` 资源路由、扫描/Airodump OUI 厂商名、BLE + WiFi Remote ID
+  解析与 `GET /api/rid`、契约测试；4MB C5 实测 97.2%（P4 全增量 +19.6KB）。见
   [docs/plans/2026-11-12-p4-device-identification-roadmap.md](docs/plans/2026-11-12-p4-device-identification-roadmap.md)

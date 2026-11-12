@@ -721,3 +721,210 @@ test('P4(契约): BLE 页新增厂商/类型列, 表头与空态 colspan 一致'
   assert.ok(Buffer.byteLength(html) <= 140 * 1024, 'admin.html 超过 140KB');
 });
 
+// ---------------- P4-2: WiFi OUI 厂商列 (随机 MAC 不反查) ----------------
+// 从 admin.html 里抽出真实实现, 用真表 vendor_db.js 求值 (不复制逻辑)
+function loadVendorFns() {
+  const html = readFileSync(join(ROOT, 'firmware', 'data', 'admin.html'), 'utf-8');
+  const names = ['macIsRandom', 'vendorName', 'vendorSub'];
+  const vdbSrc = html.match(/const vdb = [\s\S]*?;\r?\n/)[0];
+  assert.ok(vdbSrc.includes('VENDOR_DB'), 'admin.html 缺少 vdb() 读取器');
+  const src = names.map((n) => {
+    const m = html.match(new RegExp(`function ${n}\\([\\s\\S]*?\\n\\}`));
+    assert.ok(m, `admin.html 缺少 P4-2 函数 ${n}`);
+    return m[0];
+  }).join('\n');
+  const raw = readFileSync(join(ROOT, 'firmware', 'data', 'vendor_db.js'), 'utf-8');
+  const window = {};
+  new Function('window', raw)(window);
+  const ctx = { window, esc: (s) => String(s ?? '') };
+  const fn = new Function('window', 'esc', `${vdbSrc}\n${src}\nreturn { macIsRandom, vendorName, vendorSub };`);
+  return fn(ctx.window, ctx.esc);
+}
+
+test('P4-2(契约): 厂商名查表 + 随机 MAC 判定与 vendor_db.js 一致', () => {
+  const { macIsRandom, vendorName, vendorSub } = loadVendorFns();
+  const raw = readFileSync(join(ROOT, 'firmware', 'data', 'vendor_db.js'), 'utf-8');
+  const window = {};
+  new Function('window', raw)(window);
+  const db = window.VENDOR_DB;
+
+  // 真实表条目: 任意取 3 个 OUI, 拼成 MAC 必须查到同一个厂商名
+  const keys = Object.keys(db.oui).slice(0, 3);
+  for (const oui of keys) {
+    const mac = `${oui.slice(0, 2)}:${oui.slice(2, 4)}:${oui.slice(4, 6)}:11:22:33`;
+    assert.equal(macIsRandom(mac), (parseInt(oui.slice(0, 2), 16) & 0x02) !== 0);
+    if (!macIsRandom(mac)) assert.equal(vendorName(mac), db.oui[oui], `${oui} 查表结果不一致`);
+  }
+
+  // 位标识: 首字节 bit1 置位 = 本地管理 / 随机地址, 不做 OUI 反查
+  assert.equal(macIsRandom('CA:FE:BA:BE:00:01'), true);
+  assert.equal(macIsRandom('00:1A:2B:3C:4D:5E'), false);
+  assert.equal(vendorName('CA:FE:BA:BE:00:01'), '随机 MAC');
+  assert.equal(vendorName('00:00:00:00:00:00'), '', '表中不存在的 OUI 应返回空串');
+  assert.equal(vendorName(''), '', '空 MAC 不得抛异常');
+
+  // 次行提示: 命中/未命中/随机三类都有稳定文案, 且输出已转义
+  assert.ok(vendorSub('00:00:00:00:00:00').includes('未知厂商'));
+  assert.ok(vendorSub('CA:FE:BA:BE:00:01').includes('随机 MAC'));
+  assert.ok(!vendorSub('<script>').includes('<script>'), 'vendorSub 必须转义');
+});
+
+test('P4-2(契约): 扫描/Airodump 显示 OUI, Sniffer 用 title 提示不挤占列', () => {
+  const html = readFileSync(join(ROOT, 'firmware', 'data', 'admin.html'), 'utf-8');
+  // 扫描页 BSSID 单元格与 Airodump 的 AP / Station 都带次行厂商名
+  assert.ok(/esc\(n\.bssid\)[\s\S]{0,80}vendorSub\(n\.bssid\)/.test(html), '扫描页 BSSID 缺少厂商名');
+  assert.ok(html.includes('vendorSub(s.mac)'), 'Airodump Station 缺少厂商名');
+  // Sniffer 表格不能加列 (移动端宽度), 只用 title 悬浮提示
+  assert.ok(/title="\$\{esc\(vendorName\(p\.src\)/.test(html), 'Sniffer src 缺少厂商 title');
+  assert.ok(/title="\$\{esc\(vendorName\(p\.dst\)/.test(html), 'Sniffer dst 缺少厂商 title');
+  // 随机 MAC 必须如实标注, 不得伪造厂商
+  assert.ok(html.includes('随机 MAC'));
+});
+
+// ---------------- P4-3: ASTM F3411 Remote ID ----------------
+const p4Odid = JSON.parse(
+  readFileSync(join(ROOT, 'server', 'test', 'fixtures', 'p4-odid.json'), 'utf-8'),
+);
+
+// 固件解析逻辑的 Node 镜像: 只用于比对 fixture 期望值, 真实实现见 main.cpp:ridParseMessage()
+function sanitizeUasSpec(buf) {
+  let out = '';
+  for (const c of buf) {
+    if (c === 0) break;
+    out += (c >= 0x20 && c <= 0x7e && c !== 0x22 && c !== 0x5c) ? String.fromCharCode(c) : '.';
+  }
+  return out.replace(/ +$/, '');
+}
+function coordValidSpec(lat, lon) {
+  return lat >= -900000000 && lat <= 900000000 &&
+         lon >= -1800000000 && lon <= 1800000000 && !(lat === 0 && lon === 0);
+}
+function ridParseMessageSpec(m, out) {
+  const type = m[0] >> 4;
+  if (type === 0) {
+    out.uaType = m[1] & 0x0f;
+    out.idType = (m[1] >> 4) & 0x0f;
+    out.uasId = sanitizeUasSpec(m.subarray(2, 22));
+    out.flags |= 1;
+  } else if (type === 1) {
+    const lat = m.readInt32LE(5), lon = m.readInt32LE(9);
+    if (coordValidSpec(lat, lon)) {
+      out.lat = lat; out.lon = lon;
+      out.alt = Math.floor(m.readUInt16LE(15) / 2) - 1000;
+      out.flags |= 2;
+    }
+  } else if (type === 4) {
+    const lat = m.readInt32LE(2), lon = m.readInt32LE(6);
+    if (coordValidSpec(lat, lon)) {
+      out.opLat = lat; out.opLon = lon;
+      out.opAlt = Math.floor(m.readUInt16LE(18) / 2) - 1000;
+      out.flags |= 4;
+    }
+  }
+}
+function ridParsePackSpec(p, out) {
+  if (!p || p.length < 25) return out;
+  if ((p[0] >> 4) === 0x0f) {
+    if (p.length < 3) return out;
+    const size = p[1], count = p[2];
+    if (size !== 25) return out;
+    for (let off = 3, i = 0; i < count && off + 25 <= p.length; i++, off += 25) {
+      ridParseMessageSpec(p.subarray(off, off + 25), out);
+    }
+  } else {
+    ridParseMessageSpec(p.subarray(0, 25), out);
+  }
+  return out;
+}
+const ridNewSpec = () => ({ flags: 0, uasId: '', uaType: 0, idType: 0, lat: 0, lon: 0, alt: 0, opLat: 0, opLon: 0, opAlt: 0 });
+
+function ridDecodeVector(v) {
+  const out = ridNewSpec();
+  if (v.kind === 'wifi') {
+    const f = Buffer.from(v.frame, 'hex');
+    // 24B 头 + IE 链; 找 id=0xDD 且 OUI FA-0B-BC / Type 0x0D
+    let off = 36;
+    while (off + 2 <= f.length) {
+      const id = f[off], len = f[off + 1];
+      if (off + 2 + len > f.length) break;
+      if (id === 0xdd && len >= 4 && f[off + 2] === 0xfa && f[off + 3] === 0x0b &&
+          f[off + 4] === 0xbc && f[off + 5] === 0x0d && len - 4 >= 25) {
+        ridParsePackSpec(f.subarray(off + 6, off + 2 + len), out);
+        out.mac = [...f.subarray(16, 22)].map((b) => b.toString(16).toUpperCase().padStart(2, '0')).join(':');
+        out.transport = 'wifi';
+        break;
+      }
+      off += 2 + len;
+    }
+  } else {
+    for (const hexMsg of v.messages || []) {
+      ridParsePackSpec(Buffer.from(hexMsg, 'hex'), out);
+    }
+  }
+  return out;
+}
+
+test('P4-3(契约): Remote ID 向量回放 (BLE Service Data / WiFi 厂商 IE / 错误输入)', () => {
+  assert.ok(p4Odid.vectors.length >= 8, 'p4-odid.json 向量太少');
+  const kinds = new Set();
+  for (const v of p4Odid.vectors) {
+    const got = ridDecodeVector(v);
+    const exp = v.expect;
+    kinds.add(v.kind);
+    assert.equal(got.flags, exp.flags, `${v.id} flags 不匹配`);
+    if (exp.flags & 1) {
+      assert.equal(got.uasId, exp.uasId, `${v.id} uasId 不匹配`);
+      assert.equal(got.uaType, exp.uaType, `${v.id} uaType 不匹配`);
+      assert.equal(got.idType, exp.idType, `${v.id} idType 不匹配`);
+    }
+    if (exp.flags & 2) {
+      assert.equal(got.lat, exp.lat, `${v.id} lat 不匹配`);
+      assert.equal(got.lon, exp.lon, `${v.id} lon 不匹配`);
+      assert.equal(got.alt, exp.alt, `${v.id} alt 不匹配`);
+    }
+    if (exp.flags & 4) {
+      assert.equal(got.opLat, exp.opLat, `${v.id} opLat 不匹配`);
+      assert.equal(got.opLon, exp.opLon, `${v.id} opLon 不匹配`);
+      assert.equal(got.opAlt, exp.opAlt, `${v.id} opAlt 不匹配`);
+    }
+    if (exp.mac) assert.equal(got.mac, exp.mac, `${v.id} BSSID 不匹配`);
+    if (exp.transport) assert.equal(got.transport, exp.transport, `${v.id} transport 不匹配`);
+  }
+  assert.deepEqual([...kinds].sort(), ['ble', 'wifi'], '向量必须同时覆盖 BLE 与 WiFi 两种载体');
+});
+
+test('P4-3(契约): /api/rid 独立端点与字段契约, 且保持纯被动', () => {
+  for (const token of [
+    'struct RidData', 'RID_FLAG_BASIC', 'RID_FLAG_LOCATION', 'RID_FLAG_OPERATOR',
+    'ridParseMessage', 'ridParsePack', 'ridFromWifiFrame', 'ieFindVendor',
+    'ridUpsert', 'ridAppendFields', 'handleRid', 'RID_TTL_MS', 'RID_MAX',
+  ]) {
+    assert.ok(mainCpp.includes(token), `main.cpp 缺少 P4-3 实现: ${token}`);
+  }
+  // 路由注册 (GET, 只读汇总)
+  assert.ok(mainCpp.includes('onAdmin("/api/rid", HTTP_GET, handleRid)'), '固件未注册 /api/rid');
+  // 两个载体都接入: BLE Service Data 0xFFFA + App Code 0x0D; WiFi OUI FA-0B-BC / Type 0x0D
+  assert.ok(/0xFFFA/.test(mainCpp), 'BLE Remote ID 未按 0xFFFA 识别');
+  assert.ok(/0xFA, 0x0B, 0xBC/.test(mainCpp), 'WiFi Remote ID 未按 OUI FA-0B-BC 识别');
+  // JSON 字段名 (前端契约)
+  for (const key of ['uasId', 'uaType', 'idType', 'opLat', 'opLon', 'opAlt', 'transport']) {
+    assert.ok(mainCpp.includes(key), `RID JSON 缺少字段 ${key}`);
+  }
+  // 纯被动: 不新增任何发送/注入路径, 也不做主动连接
+  assert.equal((mainCpp.match(/esp_wifi_80211_tx\(/g) || []).length, 3,
+    'P4-3 不得新增 802.11 注入调用');
+  assert.ok(!mainCpp.includes('startAdvertising'), 'P4-3 不得新增 BLE 广播');
+  assert.ok(!/rid.*(https?:\/\/|fetch\()/.test(mainCpp), 'Remote ID 解析不得联网');
+});
+
+test('P4-3(契约): Remote ID 卡片只做文本展示 + 复制, 不加载在线地图', () => {
+  const html = readFileSync(join(ROOT, 'firmware', 'data', 'admin.html'), 'utf-8');
+  assert.ok(html.includes('Remote ID (ASTM F3411)'), 'Sniffer 页缺少 Remote ID 卡片');
+  assert.ok(html.includes("api('/api/rid')"), '前端未轮询 /api/rid');
+  assert.ok(html.includes('function paintRidCard'), '缺少 Remote ID 渲染函数');
+  assert.ok(html.includes('ridCopy'), 'Remote ID 坐标缺少复制入口');
+  // AP 模式通常无外网: 不得引入在线地图 / 第三方瓦片
+  for (const bad of ['googleapis', 'maps.google', 'amap.com', 'openstreetmap', 'leaflet']) {
+    assert.ok(!html.toLowerCase().includes(bad), `Remote ID 卡片不得加载在线地图: ${bad}`);
+  }
+});

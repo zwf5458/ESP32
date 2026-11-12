@@ -677,6 +677,208 @@ struct KarmaState {
 };
 static KarmaState sKarma;
 
+/* ---------------- P4-3: ASTM F3411 Remote ID ----------------
+ * 纯被动解析两路载体:
+ *   - BLE 广播: Service Data UUID 0xFFFA + App Code 0x0D + ODID 消息包;
+ *   - WiFi Beacon / ProbeResp: 厂商 IE (id=0xDD, OUI FA-0B-BC, OUI Type 0x0D)。
+ * 只解析 Basic ID(0) / Location(1) / System(4) / Message Pack(0xF); Auth(2) /
+ * Self-ID(3) / Operator ID(5) 先跳过 (保留原始抓包即可)。所有读取先按长度校验,
+ * 解析失败只返回 false, 不影响分类与既有字段。
+ */
+static constexpr int RID_MAX = 8;
+static constexpr uint32_t RID_TTL_MS = 120000;  // 2 分钟未更新视为过期
+
+enum RidTransport : uint8_t { RID_TRANSPORT_BLE = 0, RID_TRANSPORT_WIFI = 1 };
+enum RidFlags : uint8_t {
+  RID_FLAG_BASIC = 0x01,     // 有 UAS ID / UA 类型 / ID 类型
+  RID_FLAG_LOCATION = 0x02,  // 有无人机位置
+  RID_FLAG_OPERATOR = 0x04,  // 有操作员位置
+};
+
+// 一次解析结果 (消息包中不同消息只带部分字段, 由调用方逐位合并)
+struct RidData {
+  uint8_t flags;
+  uint8_t uaType;
+  uint8_t idType;
+  char uasId[21];  // 20 字节 UAS ID + NUL, 不可打印字节替换为 '.'
+  int32_t lat, lon;   // 1e-7 度
+  int16_t alt;        // 地理高度 (米)
+  int32_t opLat, opLon;
+  int16_t opAlt;
+};
+
+struct RidEntry {
+  char mac[18];
+  uint8_t transport;
+  RidData d;
+  int32_t rssi;
+  uint32_t firstSeen;
+  uint32_t lastSeen;
+  bool used;
+};
+static RidEntry sRid[RID_MAX];
+static portMUX_TYPE sRidMux = portMUX_INITIALIZER_UNLOCKED;
+
+// ODID 全部多字节字段都是小端
+static uint16_t rdU16(const uint8_t *p) {
+  return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static int32_t rdI32(const uint8_t *p) {
+  return (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                   ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24));
+}
+
+static void ridCopyUasId(char *out, const uint8_t *src) {
+  int n = 0;
+  for (int i = 0; i < 20; i++) {
+    const uint8_t c = src[i];
+    if (c == 0) break;
+    // 只保留可打印 ASCII, 并替换 JSON 敏感字符, 之后可直接拼进 JSON
+    out[n++] = (c >= 0x20 && c <= 0x7E && c != '"' && c != '\\') ? (char)c : '.';
+  }
+  while (n > 0 && out[n - 1] == ' ') n--;
+  out[n] = '\0';
+}
+
+// RID 数据字段的共用 JSON 片段 (BLE 设备对象与 /api/rid 使用同一份实现)。
+// 固定输出全部字段, 由 flags 决定 UI 是否展示, 避免多分支拼接造成的代码膨胀。
+static void ridAppendFields(String &json, const RidData &d) {
+  char buf[224];
+  snprintf(buf, sizeof(buf),
+           "\"flags\":%u,\"uasId\":\"%s\",\"uaType\":%u,\"idType\":%u,"
+           "\"lat\":%ld,\"lon\":%ld,\"alt\":%d,"
+           "\"opLat\":%ld,\"opLon\":%ld,\"opAlt\":%d",
+           (unsigned)d.flags, d.uasId, (unsigned)d.uaType, (unsigned)d.idType,
+           (long)d.lat, (long)d.lon, (int)d.alt,
+           (long)d.opLat, (long)d.opLon, (int)d.opAlt);
+  json += buf;
+}
+
+static bool ridCoordValid(int32_t lat, int32_t lon) {
+  // 规范中 (0,0) 表示「无值/未知」
+  return lat >= -900000000 && lat <= 900000000 &&
+         lon >= -1800000000 && lon <= 1800000000 &&
+         !(lat == 0 && lon == 0);
+}
+
+// 单条 25 字节 ODID 消息 (调用方保证长度)
+static void ridParseMessage(const uint8_t *m, RidData &o) {
+  switch (m[0] >> 4) {
+    case 0:  // Basic ID: UA 类型 + ID 类型 + 20 字节 UAS ID
+      o.uaType = m[1] & 0x0F;
+      o.idType = (m[1] >> 4) & 0x0F;
+      ridCopyUasId(o.uasId, m + 2);
+      o.flags |= RID_FLAG_BASIC;
+      break;
+    case 1: {  // Location/Vector: 无人机经纬度在偏移 5 / 9, 地理高度在 15
+      const int32_t lat = rdI32(m + 5), lon = rdI32(m + 9);
+      if (ridCoordValid(lat, lon)) {
+        o.lat = lat;
+        o.lon = lon;
+        o.alt = (int16_t)((int32_t)rdU16(m + 15) / 2 - 1000);  // 0.5m 分辨率, 偏置 -1000m
+        o.flags |= RID_FLAG_LOCATION;
+      }
+      break;
+    }
+    case 4: {  // System: 操作员经纬度在偏移 2 / 6, 操作员高度在 18
+      const int32_t lat = rdI32(m + 2), lon = rdI32(m + 6);
+      if (ridCoordValid(lat, lon)) {
+        o.opLat = lat;
+        o.opLon = lon;
+        o.opAlt = (int16_t)((int32_t)rdU16(m + 18) / 2 - 1000);
+        o.flags |= RID_FLAG_OPERATOR;
+      }
+      break;
+    }
+    default:
+      break;  // Auth / Self-ID / Operator ID 暂不解析
+  }
+}
+
+// 解析一个 ODID 消息或消息包 (不含 BLE App Code / WiFi OUI)
+static bool ridParsePack(const uint8_t *p, int len, RidData &o) {
+  memset(&o, 0, sizeof(o));
+  if (!p || len < 25) return false;
+  if ((p[0] >> 4) == 0x0F) {  // Message Pack: header + 单条长度 + 条数 + N×25
+    if (len < 3) return false;
+    const int sz = p[1];
+    const int cnt = p[2];
+    if (sz != 25) return false;
+    int off = 3;
+    for (int i = 0; i < cnt && off + 25 <= len; i++, off += 25) {
+      ridParseMessage(p + off, o);
+    }
+  } else {
+    ridParseMessage(p, o);
+  }
+  return o.flags != 0;
+}
+
+// BLE 库的 MAC 是小写, WiFi 侧用大写; 统一成大写再做键
+static void ridNormalizeMac(char *out, const char *mac) {
+  int n = 0;
+  for (const char *p = mac; *p && n < 17; p++) {
+    char c = *p;
+    if (c >= 'a' && c <= 'f') c = (char)(c - 'a' + 'A');
+    out[n++] = c;
+  }
+  out[n] = '\0';
+}
+
+// 按 MAC 归并 (BLE 与 WiFi 同一架无人机可能同时被抓到), 只合并新解析出的字段
+static void ridUpsert(const char *mac, uint8_t transport, int32_t rssi, const RidData &d) {
+  if (!mac || !mac[0] || !d.flags) return;
+  char key[18];
+  ridNormalizeMac(key, mac);
+  const uint32_t now = millis();
+  portENTER_CRITICAL(&sRidMux);
+  int idx = -1;
+  for (int i = 0; i < RID_MAX; i++) {
+    if (sRid[i].used && strcmp(sRid[i].mac, key) == 0) { idx = i; break; }
+  }
+  if (idx < 0) {
+    for (int i = 0; i < RID_MAX; i++) {
+      if (!sRid[i].used || (uint32_t)(now - sRid[i].lastSeen) > RID_TTL_MS) { idx = i; break; }
+    }
+  }
+  if (idx < 0) {  // 表满: 淘汰最久未更新的条目
+    uint32_t oldest = UINT32_MAX;
+    for (int i = 0; i < RID_MAX; i++) {
+      if (sRid[i].lastSeen < oldest) { oldest = sRid[i].lastSeen; idx = i; }
+    }
+  }
+  RidEntry &e = sRid[idx];
+  if (!e.used || strcmp(e.mac, key) != 0) {
+    e = RidEntry{};
+    strlcpy(e.mac, key, sizeof(e.mac));
+    e.firstSeen = now;
+  }
+  e.used = true;
+  e.transport = transport;
+  e.rssi = rssi;
+  e.lastSeen = now;
+  if (d.flags & RID_FLAG_BASIC) {
+    e.d.flags |= RID_FLAG_BASIC;
+    e.d.uaType = d.uaType;
+    e.d.idType = d.idType;
+    memcpy(e.d.uasId, d.uasId, sizeof(e.d.uasId));
+  }
+  if (d.flags & RID_FLAG_LOCATION) {
+    e.d.flags |= RID_FLAG_LOCATION;
+    e.d.lat = d.lat;
+    e.d.lon = d.lon;
+    e.d.alt = d.alt;
+  }
+  if (d.flags & RID_FLAG_OPERATOR) {
+    e.d.flags |= RID_FLAG_OPERATOR;
+    e.d.opLat = d.opLat;
+    e.d.opLon = d.opLon;
+    e.d.opAlt = d.opAlt;
+  }
+  portEXIT_CRITICAL(&sRidMux);
+}
+
 #if FW_BLE_SUPPORTED
 /* ---------------- BLE 嗅探 (P2) ----------------
  * 纯被动: setActiveScan(false) → 不发 SCAN_REQ / 不建立连接, 只听广播。
@@ -707,11 +909,16 @@ struct BleDeviceEntry {
   uint8_t svcData[8];    // Service Data 前 8 字节 (Eddystone/BTHome/Remote ID 前缀)
   uint8_t svcDataLen;
   uint8_t devClass;      // BleDevClass, 固件判定, UI 只映射文案
-  uint8_t ridFlags;      // P4-3 预留: bit0 有 Remote ID, bit1 有位置, bit2 有操作员位置
-  char ridUasId[21];     // P4-3 预留: 20 字节 UAS ID + NUL
-  int32_t ridLat;        // P4-3 预留: 1e-7 度, INT32_MIN = 无效
+  uint8_t ridFlags;      // P4-3: RID_FLAG_* (basic/location/operator)
+  uint8_t ridUaType;     // P4-3: UA 类型 (0 未知 … 15 其他)
+  uint8_t ridIdType;     // P4-3: ID 类型 (序列号 / CAA / UTM UUID / 会话 ID)
+  char ridUasId[21];     // P4-3: 20 字节 UAS ID + NUL
+  int32_t ridLat;        // P4-3: 1e-7 度
   int32_t ridLon;
-  int16_t ridAlt;        // P4-3 预留: 米, INT16_MIN = 无效
+  int16_t ridAlt;        // P4-3: 地理高度 (米)
+  int32_t ridOpLat;      // P4-3: 操作员位置 (1e-7 度)
+  int32_t ridOpLon;
+  int16_t ridOpAlt;
   int32_t rssi;
   uint32_t advCount;
   uint32_t lastSeen;
@@ -746,6 +953,7 @@ struct BleAdvSample {
   uint8_t svcData[8];
   uint8_t svcDataLen;
   uint8_t devClass;
+  RidData rid;           // P4-3: 从完整 Service Data 解析 (未命中时 flags=0)
   int32_t rssi;
   uint8_t addrType;
   uint8_t advType;
@@ -831,6 +1039,25 @@ static void bleStoreAdv(const BleAdvSample &s) {
       memcpy(e.svcData, s.svcData, s.svcDataLen);
     }
     if (s.devClass != BLE_DEV_UNKNOWN && e.devClass == BLE_DEV_UNKNOWN) e.devClass = s.devClass;
+    // P4-3: Remote ID 按消息类型逐位合并 (一个广播可能只带 Basic ID 或只带 Location)
+    if (s.rid.flags & RID_FLAG_BASIC) {
+      e.ridFlags |= RID_FLAG_BASIC;
+      e.ridUaType = s.rid.uaType;
+      e.ridIdType = s.rid.idType;
+      memcpy(e.ridUasId, s.rid.uasId, sizeof(e.ridUasId));
+    }
+    if (s.rid.flags & RID_FLAG_LOCATION) {
+      e.ridFlags |= RID_FLAG_LOCATION;
+      e.ridLat = s.rid.lat;
+      e.ridLon = s.rid.lon;
+      e.ridAlt = s.rid.alt;
+    }
+    if (s.rid.flags & RID_FLAG_OPERATOR) {
+      e.ridFlags |= RID_FLAG_OPERATOR;
+      e.ridOpLat = s.rid.opLat;
+      e.ridOpLon = s.rid.opLon;
+      e.ridOpAlt = s.rid.opAlt;
+    }
     uint8_t n = 0;
     for (int i = 0; i < BLE_MAX_DEVICES; i++) {
       if (sBLE.devices[i].used) n++;
@@ -906,11 +1133,17 @@ void BleAdvCallbacks::onResult(BLEAdvertisedDevice d) {
     // Service Data 的 UUID 更能代表载荷类型 (Eddystone/BTHome/Remote ID), 优先记录
     if (dataUuid) s.svcUuid = dataUuid;
     String sd = d.getServiceData();
-    int n = (int)sd.length();
+    const int rawLen = (int)sd.length();
+    int n = rawLen;
     if (n > (int)sizeof(s.svcData)) n = (int)sizeof(s.svcData);
     if (n > 0) {
       memcpy(s.svcData, sd.c_str(), n);
       s.svcDataLen = (uint8_t)n;
+    }
+    // P4-3: Remote ID 从完整 Service Data 解析 (App Code 0x0D + ODID 消息包),
+    // svcData[8] 只用于分类与展示, 不承担完整解析。
+    if (dataUuid == 0xFFFA && rawLen >= 26 && (uint8_t)sd[0] == 0x0D) {
+      ridParsePack((const uint8_t *)sd.c_str() + 1, rawLen - 1, s.rid);
     }
   }
   s.devClass = bleClassify(s);
@@ -918,6 +1151,7 @@ void BleAdvCallbacks::onResult(BLEAdvertisedDevice d) {
   s.addrType = d.getAddressType();
   s.advType = d.getAdvType();
   bleStoreAdv(s);
+  if (s.rid.flags) ridUpsert(s.mac, RID_TRANSPORT_BLE, s.rssi, s.rid);
 }
 
 // 运行在协议栈 host 任务: 只置标志, 不在这里调用任何 BLEScan 方法 (避免重入)
@@ -1401,8 +1635,41 @@ static int ieFindSsid(const uint8_t *f, int len, int off, char *out, int outLen)
   return -1;
 }
 
+// 在 IE 链中查找厂商自定义 IE (id=0xDD): 匹配 3 字节 OUI + 1 字节 OUI Type。
+// 成功返回载荷指针 (跳过 OUI/Type) 并写入载荷长度, 失败返回 nullptr。
+static const uint8_t *ieFindVendor(const uint8_t *f, int len, int off,
+                                   const uint8_t oui[3], uint8_t ouiType, int *outLen) {
+  while (off + 2 <= len) {
+    const uint8_t id = f[off], l = f[off + 1];
+    if (off + 2 + l > len) break;
+    if (id == 0xDD && l >= 4 &&
+        f[off + 2] == oui[0] && f[off + 3] == oui[1] && f[off + 4] == oui[2] &&
+        f[off + 5] == ouiType) {
+      *outLen = l - 4;
+      return f + off + 6;
+    }
+    off += 2 + l;
+  }
+  return nullptr;
+}
+
+// Beacon / ProbeResp 中查找 ASTM F3411 Remote ID 厂商 IE (OUI FA-0B-BC, Type 0x0D)
+static bool ridFromWifiFrame(const uint8_t *f, int len, int8_t rssi, RidData &out) {
+  static const uint8_t kOui[3] = {0xFA, 0x0B, 0xBC};
+  int n = 0;
+  const uint8_t *p = ieFindVendor(f, len, 36, kOui, 0x0D, &n);
+  if (!p || n < 25) return false;
+  if (!ridParsePack(p, n, out)) return false;
+  char bssid[18];
+  macToStr(bssid, f + 16);
+  ridUpsert(bssid, RID_TRANSPORT_WIFI, rssi, out);
+  return true;
+}
+
 // 数据包分析器: 把真实空口帧归类写入滚动缓冲
-static void snifferObserve(const uint8_t *f, int len, int8_t rssi, uint8_t ch) {
+// rid != nullptr 表示该 Beacon/ProbeResp 已由 ridFromWifiFrame 解析出 Remote ID
+static void snifferObserve(const uint8_t *f, int len, int8_t rssi, uint8_t ch,
+                           const RidData *rid) {
   if (len < 10) return;
   const uint8_t fc0 = f[0];
   const uint8_t ftype = (fc0 >> 2) & 0x03;
@@ -1420,7 +1687,8 @@ static void snifferObserve(const uint8_t *f, int len, int8_t rssi, uint8_t ch) {
     strlcpy(type, subNames[sub], sizeof(type));
     if (sub == 8 || sub == 5) {
       char ssid[33];
-      if (ieFindSsid(f, len, 36, ssid, sizeof(ssid)) >= 0) snprintf(info, sizeof(info), "SSID: %s", ssid);
+      if (rid && rid->uasId[0]) snprintf(info, sizeof(info), "RemoteID: %s", rid->uasId);
+      else if (ieFindSsid(f, len, 36, ssid, sizeof(ssid)) >= 0) snprintf(info, sizeof(info), "SSID: %s", ssid);
       else strlcpy(info, "(隐藏 SSID)", sizeof(info));
     } else if (sub == 4) {
       char ssid[33];
@@ -1593,11 +1861,18 @@ static void onPromiscuousFrame(void *buf, wifi_promiscuous_pkt_type_t type) {
   const int8_t rssi = pkt->rx_ctrl.rssi;
   const uint8_t ch = pkt->rx_ctrl.channel ? pkt->rx_ctrl.channel : apChannelActive;
 
-  if (sHandshake.capturing) handleEapolFrame(f, len);
-  if (sSniffer.running) snifferObserve(f, len, rssi, ch);
-
   const uint8_t ftype = (f[0] >> 2) & 0x03;
   const uint8_t sub = (f[0] >> 4) & 0x0F;
+
+  // P4-3: Beacon / ProbeResp 的 Remote ID 每帧只解析一次, 供 Sniffer 展示与 /api/rid 共用
+  RidData rid;
+  bool hasRid = false;
+  if (ftype == 0 && (sub == 8 || sub == 5) && len >= 36) {
+    hasRid = ridFromWifiFrame(f, len, rssi, rid);
+  }
+
+  if (sHandshake.capturing) handleEapolFrame(f, len);
+  if (sSniffer.running) snifferObserve(f, len, rssi, ch, hasRid ? &rid : nullptr);
   if (sKarma.running && ftype == 0 && sub == 4) karmaObserveProbe(f, len, rssi);
   if (sAirodump.running && len >= 24) {
     char ssid[33] = {0};
@@ -2835,12 +3110,16 @@ static void bleAppendDeviceJson(String &json, const BleDeviceEntry &e) {
   json += ",\"lastSeen\":" + String(e.lastSeen);
   json += ",\"rid\":";
   if (e.ridFlags) {
-    json += "{\"flags\":" + String(e.ridFlags);
-    if (e.ridFlags & 0x01) json += ",\"uasId\":\"" + jsonEscape(String(e.ridUasId)) + "\"";
-    if (e.ridFlags & 0x02) {
-      json += ",\"lat\":" + String(e.ridLat) + ",\"lon\":" + String(e.ridLon);
-      json += ",\"alt\":" + String(e.ridAlt);
-    }
+    RidData d;
+    memset(&d, 0, sizeof(d));
+    d.flags = e.ridFlags;
+    d.uaType = e.ridUaType;
+    d.idType = e.ridIdType;
+    memcpy(d.uasId, e.ridUasId, sizeof(d.uasId));
+    d.lat = e.ridLat;   d.lon = e.ridLon;   d.alt = e.ridAlt;
+    d.opLat = e.ridOpLat; d.opLon = e.ridOpLon; d.opAlt = e.ridOpAlt;
+    json += "{";
+    ridAppendFields(json, d);
     json += "}";
   } else {
     json += "null";
@@ -2848,6 +3127,37 @@ static void bleAppendDeviceJson(String &json, const BleDeviceEntry &e) {
   json += "}";
 }
 #endif
+
+// P4-3: Remote ID 汇总 (BLE + WiFi Beacon), 最多 RID_MAX 条, 过期条目自动隐藏。
+// 独立端点, 不挤占 /api/ble/* 与 /api/sniffer/* 的既有字段。
+static void handleRid() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  String json;
+  json.reserve(64 + RID_MAX * 240);
+  json = "[";
+  bool first = true;
+  const uint32_t now = millis();
+  for (int i = 0; i < RID_MAX; i++) {
+    RidEntry e;
+    bool used;
+    portENTER_CRITICAL(&sRidMux);
+    used = sRid[i].used && (uint32_t)(now - sRid[i].lastSeen) <= RID_TTL_MS;
+    if (used) e = sRid[i];
+    portEXIT_CRITICAL(&sRidMux);
+    if (!used) continue;
+    if (!first) json += ",";
+    first = false;
+    json += "{\"mac\":\"" + jsonEscape(String(e.mac)) + "\"";
+    json += ",\"transport\":\"" + String(e.transport == RID_TRANSPORT_BLE ? "ble" : "wifi") + "\",";
+    ridAppendFields(json, e.d);
+    json += ",\"rssi\":" + String(e.rssi);
+    json += ",\"firstSeen\":" + String(e.firstSeen);
+    json += ",\"lastSeen\":" + String(e.lastSeen);
+    json += "}";
+  }
+  json += "]";
+  server.send(200, "application/json", json);
+}
 
 static void handleBleStatus() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -3786,6 +4096,8 @@ void setup() {
   onAdmin("/api/ble/status", HTTP_GET, handleBleStatus);
   onAdmin("/api/ble/devices", HTTP_GET, handleBleDevices);
   onAdmin("/api/ble/clear", HTTP_POST, handleBleClear);
+  // P4-3: Remote ID 汇总 (BLE + WiFi Beacon, 只读)
+  onAdmin("/api/rid", HTTP_GET, handleRid);
   // 802.15.4: 同样全芯片注册, 无该射频的芯片返回 501
   onAdmin("/api/ieee802154/start", HTTP_POST, handleI154Start);
   onAdmin("/api/ieee802154/stop", HTTP_POST, handleI154Stop);

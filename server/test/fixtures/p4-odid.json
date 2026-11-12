@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "vectors": [
+    {
+      "id": "ble-basic-location",
+      "kind": "ble",
+      "note": "两条单消息: Basic ID + Location, 应由调用方合并",
+      "messages": [
+        "02123135383146354248443232353930304430413142000000",
+        "1200000000C8B23716783C08B70000C6080000000000000000"
+      ],
+      "expect": {
+        "flags": 3,
+        "uasId": "1581F5BHD225900D0A1B",
+        "uaType": 2,
+        "idType": 1,
+        "lat": 372749000,
+        "lon": -1224197000,
+        "alt": 123
+      }
+    },
+    {
+      "id": "ble-pack-basic-system",
+      "kind": "ble",
+      "note": "Message Pack 内含 Basic ID + System (操作员位置)",
+      "messages": [
+        "F21902022246412D3132333435363700000000000000000000000000420082BB3716FA6008B70000000000000000BC080000000000"
+      ],
+      "expect": {
+        "flags": 5,
+        "uasId": "FA-1234567",
+        "uaType": 2,
+        "idType": 2,
+        "opLat": 372751234,
+        "opLon": -1224187654,
+        "opAlt": 118
+      }
+    },
+    {
+      "id": "wifi-beacon-basic-location",
+      "kind": "wifi",
+      "note": "Beacon 厂商 IE (FA-0B-BC/0x0D) 带 Basic ID + Location",
+      "frame": "80000000FFFFFFFFFFFFAABBCCDDEEFFAABBCCDDEEFF0000000000000000000000000000000474657374DD39FA0BBC0DF219020212574946492D44524F4E452D30303031000000000000000012000000008F8BD0EBCDCB205A00002A080000000000000000",
+      "expect": {
+        "flags": 3,
+        "uasId": "WIFI-DRONE-0001",
+        "uaType": 2,
+        "idType": 1,
+        "lat": -338654321,
+        "lon": 1512098765,
+        "alt": 45,
+        "mac": "AA:BB:CC:DD:EE:FF",
+        "transport": "wifi"
+      }
+    },
+    {
+      "id": "zero-coords-location",
+      "kind": "ble",
+      "note": "Location 坐标为 (0,0) 表示无值, 不得置 LOCATION 标志",
+      "messages": [
+        "120000000000000000000000000000D0070000000000000000"
+      ],
+      "expect": {
+        "flags": 0
+      }
+    },
+    {
+      "id": "truncated-pack",
+      "kind": "ble",
+      "note": "Message Pack 声明 3 条但只给 2 条, 只解析完整部分 (后者覆盖前者)",
+      "messages": [
+        "F2190302125452554E43415445442D3100000000000000000000000002125452554E43415445442D32000000000000000000000000"
+      ],
+      "expect": {
+        "flags": 1,
+        "uasId": "TRUNCATED-2",
+        "uaType": 2,
+        "idType": 1
+      }
+    },
+    {
+      "id": "short-message",
+      "kind": "ble",
+      "note": "不足 25 字节的 ODID 负载必须整体丢弃",
+      "messages": [
+        "0212544F4F2D53484F5254000000000000000000"
+      ],
+      "expect": {
+        "flags": 0
+      }
+    },
+    {
+      "id": "wrong-oui",
+      "kind": "wifi",
+      "note": "相同布局但 OUI 不是 FA-0B-BC, 必须忽略",
+      "frame": "80000000FFFFFFFFFFFFAABBCCDDEEFFAABBCCDDEEFF0000000000000000000000000000000474657374DD200011220DF21901021257524F4E472D4F55490000000000000000000000000000",
+      "expect": {
+        "flags": 0
+      }
+    },
+    {
+      "id": "wrong-oui-type",
+      "kind": "wifi",
+      "note": "OUI 正确但 OUI Type 不是 0x0D, 必须忽略",
+      "frame": "80000000FFFFFFFFFFFFAABBCCDDEEFFAABBCCDDEEFF0000000000000000000000000000000474657374DD20FA0BBC10F21901021257524F4E472D5459504500000000000000000000000000",
+      "expect": {
+        "flags": 0
+      }
+    },
+    {
+      "id": "sanitize-uas-id",
+      "kind": "ble",
+      "note": "UAS ID 中的不可打印/JSON 敏感字符替换为 \".\"",
+      "messages": [
+        "024F4122425C43014400000000000000000000000000000000"
+      ],
+      "expect": {
+        "flags": 1,
+        "uasId": "A.B.C.D",
+        "uaType": 15,
+        "idType": 4
+      }
+    }
+  ]
+}

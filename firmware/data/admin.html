@@ -285,6 +285,7 @@ const state = {
   deauthStatus: { running: false, count: 0, rate: 10, channel: 6, reason: 1 },
   handshakeStatus: { capturing: false, m1: false, m2: false, m3: false, m4: false, pmkid: false, captured: false, unsupported: false, keyver: 0, frames: 0, cracking: false, progress: 0, total: 7153, crackedPass: '' },
   snifferStatus: { running: false, channel: 6, band: 2, hopping: false, skipDfs: true, total: 0, mgmt: 0, ctrl: 0, data: 0, fps: 0, packets: [] },
+  rid: [],
   airodumpStatus: { running: false, channel: 1, band: 2, hopping: true, skipDfs: true, aps: [], stations: [] },
   karmaStatus: { running: false, probesCaptured: 0, probesBaited: 0, probes: [] },
   i154Status: { supported: true, running: false, phase: 'idle', mode: 'frames', channel: 15, hopping: true, durationSec: 0, initFailed: false, total: 0, uptime: 0, panCount: 0, deviceCount: 0, byType: {}, chFrames: [], ed: [], pans: [], devices: [] },
@@ -606,7 +607,7 @@ function paintScan() {
       <td class="ssid ${n.hidden ? 'hidden-ssid' : ''}" style="font-weight:900;color:var(--yellow)">${n.hidden ? '(隐藏网络)' : esc(n.ssid)}</td>
       <td class="rssi mono" style="color:#4cd964;font-weight:900">${n.rssi}</td>
       <td class="mono" style="color:#ffe14d;font-weight:800">${n.channel}</td>
-      <td class="mono" style="font-size:12px">${esc(n.bssid)}</td>
+      <td class="mono" style="font-size:12px">${esc(n.bssid)}<div style="font-size:11px">${vendorSub(n.bssid)}</div></td>
       <td class="mono" style="font-size:12px">${esc(n.auth || 'OPEN')}</td>
       <td style="white-space:nowrap">
         <button class="tbtn pink" ${state.target && state.target.bssid === n.bssid ? 'disabled' : ''}
@@ -636,6 +637,7 @@ function renderScan() {
   <div class="card" style="padding:10px 14px;margin:0 0 12px;font-size:13px">
     操作顺序: <b>③ 点击开始扫描 → ④ 把其它频段/同名目标设为「+双子」 → ⑤ 把主目标设为「目标」(2.4G${has5g() ? ' 或 5G 非 DFS' : ''}; 5G DFS 只能做双子)</b> → ⑥ 进入「邪恶双子攻击」点击「发起攻击」
   </div>
+  <div class="note">BSSID 下方显示 OUI 厂商名（公开 IEEE 注册表）。标注「随机 MAC」的是本地管理地址（手机 / 手环的随机化 MAC），<b>不能</b>据此反查真实厂商，也不代表设备身份。</div>
   <div class="table-wrap"><table style="background:#1b1b1b">
     <thead id="scanThead"></thead>
     <tbody id="tbody"></tbody>
@@ -687,6 +689,56 @@ async function pickTarget(t, role) {
 }
 
 /* ---------- 2. 数据包分析器 (Packet Analyzer) ---------- */
+/* ---------- P4-3: Remote ID 卡片 ---------- */
+const RID_UA_TYPES = ['未知', '固定翼', '多旋翼/直升机', '旋翼机', '复合翼', '扑翼机', '滑翔机', '风筝',
+  '自由气球', '系留气球', '飞艇', '跳伞', '火箭', '系留动力航空器', '地面障碍物', '其他'];
+const RID_ID_TYPES = ['未指定', '序列号', 'CAA 注册号', 'UTM UUID', '会话 ID'];
+const ridUaLabel = n => RID_UA_TYPES[n] || ('类型 ' + n);
+const ridIdLabel = n => RID_ID_TYPES[n] || ('ID ' + n);
+const ridCoord = (lat, lon) => `${(lat / 1e7).toFixed(6)}, ${(lon / 1e7).toFixed(6)}`;
+function ridCopy(text) {
+  const s = String(text || '');
+  if (!s) return;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(s).then(() => toast('已复制: ' + s)).catch(() => {});
+  } else {
+    toast('复制失败，请手动选择文本');
+  }
+}
+function paintRidCard(list) {
+  const tb = $('#ridBody');
+  if (!tb) return;
+  const rows = (list || []).slice().sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:16px;color:#888">未捕获到 Remote ID 广播</td></tr>';
+    return;
+  }
+  tb.innerHTML = rows.map(r => {
+    const uas = r.uasId ? `<b class="mono">${esc(r.uasId)}</b>` : '<span style="color:#888">—</span>';
+    const kind = r.flags & 1
+      ? `${esc(ridUaLabel(r.uaType || 0))}<div style="font-size:11px;color:#888">${esc(ridIdLabel(r.idType || 0))}</div>`
+      : '<span style="color:#888">—</span>';
+    const loc = (r.flags & 2)
+      ? `<span class="mono" style="cursor:pointer" onclick="ridCopy('${esc(ridCoord(r.lat, r.lon))}')" title="点击复制">${esc(ridCoord(r.lat, r.lon))}</span><div style="font-size:11px;color:#888">${r.alt} m</div>`
+      : '<span style="color:#888">—</span>';
+    const op = (r.flags & 4)
+      ? `<span class="mono" style="cursor:pointer" onclick="ridCopy('${esc(ridCoord(r.opLat, r.opLon))}')" title="点击复制">${esc(ridCoord(r.opLat, r.opLon))}</span>`
+      : '<span style="color:#888">—</span>';
+    const src = r.transport === 'ble'
+      ? '<span class="status-pill idle" style="font-size:11px">BLE</span>'
+      : '<span class="status-pill run" style="font-size:11px">WiFi</span>';
+    return `<tr>
+      <td>${uas}<div style="font-size:11px;color:#888" class="mono">${esc(r.mac)}</div></td>
+      <td>${kind}</td>
+      <td>${loc}</td>
+      <td>${op}</td>
+      <td>${src}</td>
+      <td class="mono">${r.rssi} dBm</td>
+      <td style="white-space:nowrap">${bleAge(r.lastSeen)}</td>
+    </tr>`;
+  }).join('');
+}
+
 function updatePacketUI() {
   const s = state.snifferStatus || {};
   const pill = $('#sniffPill');
@@ -711,12 +763,13 @@ function updatePacketUI() {
         <td class="mono">ch${p.ch}${p.ch > 14 ? ' (5G)' : ''}</td>
         <td class="mono">${p.rssi} dBm</td>
         <td ${typeStyle}>${esc(p.type)}</td>
-        <td class="mono small">${esc(p.src)}</td>
-        <td class="mono small">${esc(p.dst)}</td>
+        <td class="mono small" title="${esc(vendorName(p.src) || '未知厂商')}">${esc(p.src)}</td>
+        <td class="mono small" title="${esc(vendorName(p.dst) || '未知厂商')}">${esc(p.dst)}</td>
         <td class="small">${esc(p.info)}</td>
       </tr>`;
     }).join('');
   }
+  paintRidCard(state.rid);
 }
 
 function renderPacket() {
@@ -748,6 +801,22 @@ function renderPacket() {
       <div class="dg o"><b id="sniffTotal">${s.total || 0}</b><small>总捕获帧数</small></div>
       <div class="dg y"><b id="sniffMgmt">${s.mgmt || 0}</b><small>管理帧 (Mgmt)</small></div>
       <div class="dg p"><b id="sniffData">${s.data || 0}</b><small>数据帧 (Data)</small></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px">
+      <h3 style="margin:0">🛰️ Remote ID (ASTM F3411)</h3>
+      <span class="note" style="margin:0">BLE 0xFFFA / WiFi Beacon 厂商 IE (FA-0B-BC) · 纯被动</span>
+    </div>
+    <p class="note">从已收到的 BLE 广播与 WiFi Beacon / Probe Response 中解析无人机 Remote ID：UAS ID、机型、无人机与操作员位置。坐标只做文本展示，<b>不加载在线地图</b>（AP 模式通常无外网）。</p>
+    <div class="table-wrap" style="max-height:260px;overflow-y:auto">
+      <table>
+        <thead><tr><th>UAS ID</th><th>机型 / ID 类型</th><th>无人机位置</th><th>操作员位置</th><th>来源</th><th>RSSI</th><th>最后出现</th></tr></thead>
+        <tbody id="ridBody">
+          <tr><td colspan="7" style="text-align:center;padding:16px;color:#888">未捕获到 Remote ID 广播</td></tr>
+        </tbody>
+      </table>
     </div>
   </div>
 
@@ -815,7 +884,7 @@ function updateAirodumpUI() {
     const list = state.scan || [];
     apTb.innerHTML = list.length ? list.map((n, idx) => `
       <tr>
-        <td class="mono small">${n.bssid}</td>
+        <td class="mono small">${esc(n.bssid)}<div style="font-size:11px">${vendorSub(n.bssid)}</div></td>
         <td><b>${esc(n.ssid || '(隐藏网络)')}</b></td>
         <td class="mono">ch${n.channel}</td>
         <td class="mono">${n.rssi} dBm</td>
@@ -832,7 +901,7 @@ function updateAirodumpUI() {
   if (staTb && a.stations) {
     staTb.innerHTML = a.stations.length ? a.stations.map(s => `
       <tr>
-        <td class="mono small"><b>${esc(s.mac)}</b></td>
+        <td class="mono small"><b>${esc(s.mac)}</b><div style="font-size:11px">${vendorSub(s.mac)}</div></td>
         <td class="mono small">${esc(s.bssid)}</td>
         <td class="mono">${s.rssi} dBm</td>
         <td class="mono">${s.packets}</td>
@@ -850,6 +919,7 @@ function renderAirodump() {
       <span class="status-pill ${a.running ? 'run' : 'idle'}" id="adPill">${a.running ? '● 侦察中' : '○ 待命'}</span>
     </div>
     <p class="note">全信道跳频被动侦察空中无线接入点及其关联的客户端 Station。实时拦截手机、平板等客户端寻找历史已存网络的探针请求 (Probes)，用于网络指纹分析与目标定向。</p>
+    <div class="note">BSSID / 客户端 MAC 下方显示 OUI 厂商名；「随机 MAC」表示本地管理地址，手机等终端的随机化 MAC 无法反查真实厂商。</div>
     ${band5gNote()}
 
     <div class="frow" style="gap:10px;align-items:center;margin:14px 0">
@@ -1035,6 +1105,27 @@ function bleRssi(r) {
 /* ---------- P4: 厂商 / 类型名称 (vendor_db.js, 缺失时优雅降级) ---------- */
 const vdb = () => window.VENDOR_DB || null;
 const hexNum = (v, pad) => v ? '0x' + Number(v).toString(16).toUpperCase().padStart(pad, '0') : '';
+
+/* P4-2: MAC → OUI 厂商名。首字节 bit1 = 本地管理地址 (手机/手环普遍使用随机 MAC)，
+ * 这类地址不能反查真实厂商，只如实标注。表缺失时返回空串 (UI 显示「未知厂商」)。 */
+function macIsRandom(mac) {
+  const b0 = parseInt(String(mac || '').slice(0, 2), 16);
+  return Number.isFinite(b0) && (b0 & 0x02) !== 0;
+}
+function vendorName(mac) {
+  const hex = String(mac || '').replace(/[^0-9a-fA-F]/g, '').slice(0, 6).toUpperCase();
+  if (hex.length < 6) return '';
+  if (macIsRandom(mac)) return '随机 MAC';
+  const db = vdb();
+  return (db && db.oui && db.oui[hex]) || '';
+}
+// 表格里的次行厂商名 (不新增列, 避免移动端表格过宽)
+function vendorSub(mac) {
+  const v = vendorName(mac);
+  if (!v) return '<span style="color:#888">未知厂商</span>';
+  const color = v === '随机 MAC' ? '#e67e22' : '#888';
+  return `<span style="color:${color}">${esc(v)}</span>`;
+}
 function bleCompanyName(id) {
   const db = vdb();
   return (id && db && db.company && db.company[id]) || '';
@@ -1058,6 +1149,9 @@ function bleVendorCell(d) {
   if (d.svcUuid) h += `<span style="color:#888;font-size:11px"> / ${esc(svc || hexNum(d.svcUuid, 4))}</span>`;
   h += '</div>';
   if (d.randomMac) h += '<div style="color:#888;font-size:11px">随机 MAC</div>';
+  if (d.rid && (d.rid.flags & 2)) {
+    h += `<div style="color:#888;font-size:11px" class="mono">${esc(ridCoord(d.rid.lat, d.rid.lon))}</div>`;
+  }
   return h;
 }
 
@@ -1071,10 +1165,12 @@ function blePaintRows(list) {
   }
   tb.innerHTML = rows.map(d => {
     const name = d.name ? esc(d.name) : '<span style="color:#888">(未广播名称)</span>';
+    const uas = (d.rid && (d.rid.flags & 1) && d.rid.uasId)
+      ? `<div style="font-size:11px;color:#888" class="mono">UAS: ${esc(d.rid.uasId)}</div>` : '';
     const mfg = d.mfgHex ? `<code style="font-size:12px">${esc(d.mfgHex)}</code>` : '<span style="color:#888">—</span>';
     return `<tr>
       <td><code style="font-size:12px">${esc(d.mac)}</code></td>
-      <td>${name}</td>
+      <td>${name}${uas}</td>
       <td style="white-space:nowrap">${bleRssi(d.rssi)} <small style="color:#888">dBm</small></td>
       <td><span class="status-pill idle" style="font-size:11px">${esc(d.advType || '—')}</span></td>
       <td style="font-size:12px;white-space:nowrap">${bleVendorCell(d)}</td>
@@ -2256,6 +2352,7 @@ async function pollModules() {
     if (location.hash === '#packet') {
       const s = await api('/api/sniffer/status');
       state.snifferStatus = s;
+      state.rid = await api('/api/rid');
       updatePacketUI();
     }
     // 轮询 Airodump 侦察 状态
