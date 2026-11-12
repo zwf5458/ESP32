@@ -608,6 +608,22 @@ test('多系统引导(契约): 16MB 三系统镜像已接入构建与烧录台',
     '自动识别不得覆盖手动选择的同芯片变体镜像 (否则 16MB 镜像会被改回 4MB 版)');
 });
 
+test('多系统引导(契约): C5 构建开启原生 USB CDC (真机验收要求)', () => {
+  const ini = readFileSync(join(ROOT, 'firmware', 'platformio.ini'), 'utf-8');
+  const c5Match = /\[env:esp32c5\]([\s\S]*?)(?=\n\[|$)/.exec(ini);
+  assert.ok(c5Match, '必须存在 [env:esp32c5]');
+  // C5 DevKitC-1 只引出原生 USB (USB-Serial/JTAG): 不开 CDC_ON_BOOT 时 Serial 走
+  // UART0 引脚, 原生 USB 上无日志/串口 CLI/首次上电后台口令 (真机验证发现)。
+  assert.ok(c5Match[1].includes('-DARDUINO_USB_MODE=1') &&
+            c5Match[1].includes('-DARDUINO_USB_CDC_ON_BOOT=1'),
+    'esp32c5 必须开启 ARDUINO_USB_MODE=1 + ARDUINO_USB_CDC_ON_BOOT=1 (Serial→HWCDC)');
+  // esp32c5_16mb extends env:esp32c5 → 继承同一份 build_flags, 不得覆盖
+  const mbMatch = /\[env:esp32c5_16mb\]([\s\S]*?)(?=\n\[|$)/.exec(ini);
+  assert.ok(mbMatch, '必须存在 [env:esp32c5_16mb]');
+  assert.ok(!/build_flags/.test(mbMatch[1]),
+    'esp32c5_16mb 不得自定义 build_flags (应通过 extends 继承 esp32c5 的 CDC 配置)');
+});
+
 // ---------------- P4: 设备识别 (BLE 画像 + 厂商表) ----------------
 const p4Adv = JSON.parse(
   readFileSync(join(ROOT, 'server', 'test', 'fixtures', 'p4-ble-adv.json'), 'utf-8'),
