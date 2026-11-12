@@ -299,6 +299,48 @@ export function crackHandshake({
   return { index: -1, candidate: null, attempts: limit, keyver: keyInfo };
 }
 
+/**
+ * crackHandshakeAsync: 异步分批跑包，每执行 batchSize 次 PBKDF2 计算即通过 setImmediate
+ * 让出事件循环，避免长时间计算阻塞 Node.js 处理其他网络请求（心跳、烧录、监控等）。
+ */
+export async function crackHandshakeAsync({
+  essid,
+  candidates,
+  eapol,
+  anonce,
+  aa,
+  spa,
+  keyver,
+  maxCandidates = 0,
+  batchSize = 25,
+}) {
+  if (!Array.isArray(candidates) || candidates.length === 0) {
+    throw new Error('no candidate passwords given');
+  }
+  if (!Buffer.isBuffer(eapol)) throw new Error('a captured EAPOL-Key frame is required');
+  if (!anonce || !aa || !spa) throw new Error('anonce, aa and spa are required');
+  const frame = eapol;
+  const parsed = parseM2(frame);
+  const keyInfo = keyver ?? parsed.keyver;
+  const kddParts = { aa, spa, anonce, snonce: parsed.snonce };
+  const carried = frame.subarray(EAPOL_KEY_MIC_OFFSET, EAPOL_KEY_MIC_OFFSET + MIC_LEN);
+  const limit = maxCandidates > 0 ? Math.min(candidates.length, maxCandidates) : candidates.length;
+  for (let i = 0; i < limit; i++) {
+    const kck = deriveKck({
+      pmk: pbkdf2Sha1(candidates[i], essid),
+      ...kddParts,
+      keyver: keyInfo,
+    });
+    if (crypto.timingSafeEqual(eapolKeyMic({ kck, eapol: frame, keyver: keyInfo }), carried)) {
+      return { index: i, candidate: String(candidates[i]), attempts: i + 1, keyver: keyInfo };
+    }
+    if ((i + 1) % batchSize === 0) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+  return { index: -1, candidate: null, attempts: limit, keyver: keyInfo };
+}
+
 /** parseM2: pull the fields the 4-way handshake needs out of an EAPOL-Key frame. */
 export function parseM2(eapol) {
   if (eapol.length < EAPOL_KEY_MIC_OFFSET + MIC_LEN) {

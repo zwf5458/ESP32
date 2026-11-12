@@ -549,6 +549,13 @@ let customBinData = null;
 let customBinName = '';
 let customBinMd5 = '';
 
+const SLOT_PARTITION_LIMITS = {
+  0x010000: { name: 'ota_0 (Wi-Fi 审计系统)', maxBytes: 0x3F0000 },
+  0x400000: { name: 'ota_1 (ESPsoup 口袋 SDR)', maxBytes: 0x3F0000 },
+  0x7F0000: { name: 'ota_2 (Meta Muse AI 伴侣)', maxBytes: 0x3F0000 },
+  0x000000: { name: '整片 Flash (完整覆盖)', maxBytes: 0x1000000 },
+};
+
 function customFlashProgress(pct, label) {
   const bar = $('customFlashBar');
   const txt = $('customFlashLabel');
@@ -594,8 +601,22 @@ if (btnCustomFlash) {
     const slotSelect = $('customSlotSelect');
     const targetAddr = parseInt(slotSelect ? slotSelect.value : '0x7F0000', 16);
     const slotText = slotSelect ? slotSelect.options[slotSelect.selectedIndex].text : `0x${targetAddr.toString(16)}`;
+    const slotLimit = SLOT_PARTITION_LIMITS[targetAddr] || { name: slotText, maxBytes: 0x3F0000 };
 
-    if (!confirm(`确定将固件【${customBinName}】写入【${slotText}】？\n\n- 写入对应系统分区不会影响其他分区已有数据。\n- 写入完成后可在 Web 后台一键切换或自动重启。`)) {
+    if (customBinData.length > slotLimit.maxBytes) {
+      const fileMb = (customBinData.length / 1024 / 1024).toFixed(2);
+      const maxMb = (slotLimit.maxBytes / 1024 / 1024).toFixed(2);
+      const err = `固件文件过大！\n\n文件大小: ${fileMb} MB (${customBinData.length} 字节)\n目标分区容量上限: ${maxMb} MB (${slotLimit.maxBytes} 字节)\n\n写入将超出目标分区边界并破坏相邻分区数据（可能导致设备变砖），已阻止刷写。`;
+      alert(err);
+      terminalAppend(`\n${nowTs()} [custom][ERROR] 固件大小 (${customBinData.length} B) 超过目标分区上限 (${slotLimit.maxBytes} B)，操作已阻止\n`);
+      return;
+    }
+
+    const fileMb = (customBinData.length / 1024 / 1024).toFixed(2);
+    const maxMb = (slotLimit.maxBytes / 1024 / 1024).toFixed(2);
+    const remainKb = ((slotLimit.maxBytes - customBinData.length) / 1024).toFixed(1);
+
+    if (!confirm(`确定将固件【${customBinName}】写入【${slotText}】？\n\n- 固件大小: ${fileMb} MB (${customBinData.length} 字节)\n- 分区容量: ${maxMb} MB (${slotLimit.maxBytes} 字节，剩余安全空间: ${remainKb} KB)\n- 写入对应系统分区不会影响其他分区已有数据。\n- 写入完成后可在 Web 后台一键切换或自动重启。`)) {
       return;
     }
 

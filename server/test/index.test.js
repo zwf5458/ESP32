@@ -19,7 +19,7 @@ import {
   etagResult, redeemCode, summarizeStats, parseChannel, validateSsid,
 } from '../src/logic.js';
 import {
-  aesCmac, buildEapolM2, crackHandshake, deriveKck, derivePmkid, derivePtk,
+  aesCmac, buildEapolM2, crackHandshake, crackHandshakeAsync, deriveKck, derivePmkid, derivePtk,
   eapolKeyMic, EAPOL_KEY_MIC_OFFSET, MIC_LEN, parseM2, pbkdf2Sha1, verifyM2Mic,
 } from '../src/wpa.js';
 
@@ -151,7 +151,7 @@ test('固件(契约): PMF 网络拒绝板载跑包并可导出握手材料', () 
 test('服务端(契约): /api/wpa/crack 走真实跑包引擎且需管理口令', () => {
   const indexJs = readFileSync(join(ROOT, 'server', 'src', 'index.js'), 'utf-8');
   assert.ok(indexJs.includes("app.post('/api/wpa/crack', requireAdmin"), '跑包接口必须鉴权');
-  assert.ok(indexJs.includes('crackHandshake({'), '必须调用真实跑包实现');
+  assert.ok(indexJs.includes('crackHandshake({') || indexJs.includes('crackHandshakeAsync({'), '必须调用真实跑包实现');
   assert.ok(indexJs.includes("'server', 'data', 'weak-passwords.txt'"), '必须使用内置字典');
 });
 
@@ -927,4 +927,47 @@ test('P4-3(契约): Remote ID 卡片只做文本展示 + 复制, 不加载在线
   for (const bad of ['googleapis', 'maps.google', 'amap.com', 'openstreetmap', 'leaflet']) {
     assert.ok(!html.toLowerCase().includes(bad), `Remote ID 卡片不得加载在线地图: ${bad}`);
   }
+});
+
+// ---------------- 审核加固回归契约 ----------------
+test('审核加固(契约): 烧录台外部固件具有槽位容量校验与越界保护', () => {
+  const appJs = readFileSync(join(ROOT, 'flasher', 'app.js'), 'utf-8');
+  assert.ok(appJs.includes('SLOT_PARTITION_LIMITS'), '必须定义分区容量上限对照表');
+  assert.ok(appJs.includes('0x3F0000'), '每个 OTA 系统分区上限必须为 0x3F0000');
+  assert.ok(appJs.includes('customBinData.length > slotLimit.maxBytes'), '必须做文件大小越界拦截');
+  assert.ok(appJs.includes('剩余安全空间'), '确认弹窗必须提示剩余容量');
+});
+
+test('审核加固(契约): WPA 跑包支持异步非阻塞 yielding 与字典量限流', async () => {
+  const indexJs = readFileSync(join(ROOT, 'server', 'src', 'index.js'), 'utf-8');
+  assert.ok(indexJs.includes('crackHandshakeAsync('), '跑包路由必须调用异步非阻塞版本');
+  assert.ok(indexJs.includes('dictionary 最多 20000 条'), '自定义字典上限必须缩减至 20000');
+
+  // 验证 crackHandshakeAsync 真实执行与 yield
+  const v = wpaVectors.neheb;
+  const sealed = Buffer.from(hex(v.eapol));
+  hex(v.expectedMic).copy(sealed, EAPOL_KEY_MIC_OFFSET);
+  const base = { essid: v.essid, eapol: sealed, anonce: hex(v.anonce), aa: hex(v.bssid), spa: hex(v.stmac) };
+
+  const res = await crackHandshakeAsync({
+    ...base,
+    candidates: ['wrongpass1', 'wrongpass2', v.passphrase],
+    keyver: 3,
+    batchSize: 1, // 强制每次都 yield
+  });
+  assert.equal(res.index, 2);
+  assert.equal(res.candidate, v.passphrase);
+});
+
+test('审核加固(契约): 服务端 HOST 默认绑定 127.0.0.1 且支持环境变量覆盖', () => {
+  const indexJs = readFileSync(join(ROOT, 'server', 'src', 'index.js'), 'utf-8');
+  assert.ok(indexJs.includes("const HOST = process.env.HOST || '127.0.0.1';"), '默认绑定必须为 127.0.0.1');
+  assert.ok(!indexJs.includes("process.env.ADMIN_TOKEN ? '0.0.0.0'"), '不得在配置 ADMIN_TOKEN 后静默监听 0.0.0.0');
+});
+
+test('审核加固(契约): 固件口令比较消除 uint8 长度差截断与客户端 IP 字段名纠正', () => {
+  assert.ok(mainCpp.includes('return (charDiff == 0) && (lenA == lenB);'), 'tokenEquals 必须以完整 size_t 检验长度相等');
+  assert.ok(!mainCpp.includes('uint8_t diff = (uint8_t)(a.length() ^ b.length());'), '不得将长度差异或强制截断为 uint8_t');
+  assert.ok(mainCpp.includes('char clientIp[20];'), 'CredentialEntry 凭据结构体应使用 clientIp');
+  assert.ok(mainCpp.includes(',\\"clientIp\\":\\"'), '凭据 API 必须输出 clientIp 字段');
 });

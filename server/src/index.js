@@ -15,7 +15,7 @@ import {
   makeIsWithinRoot, checkAdminToken, resolveClientIp, makeRegisterNonce, sweepExpired, makeVerifyLimiter,
   etagResult, redeemCode, summarizeStats,
 } from './logic.js';
-import { crackHandshake, EAPOL_KEY_MIC_OFFSET, MIC_LEN, parseM2 } from './wpa.js';
+import { crackHandshake, crackHandshakeAsync, EAPOL_KEY_MIC_OFFSET, MIC_LEN, parseM2 } from './wpa.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const isWithinRoot = makeIsWithinRoot(ROOT);
@@ -23,9 +23,9 @@ const FIRMWARE_DIR = join(ROOT, 'server', 'firmware');
 const DB_PATH = join(ROOT, 'server', 'db.sqlite');
 const WEAK_DICT_PATH = join(ROOT, 'server', 'data', 'weak-passwords.txt');
 const PORT = Number(process.env.PORT || 8787);
-// 安全策略: ADMIN_TOKEN 未显式配置时仅允许回环地址访问管理接口以外的功能太复杂,
-// 直接采用最简单可靠的方式 — 未配置则只绑定 127.0.0.1, 避免弱口令暴露到内网/公网。
-const HOST = process.env.ADMIN_TOKEN ? '0.0.0.0' : '127.0.0.1';
+// 安全策略: 默认严格绑定 127.0.0.1 (本地回环), 杜绝 HTTP 明文管理口令在局域网/公网裸奔。
+// 如需远程多机访问, 请使用反向代理 (Nginx/Caddy) 启用 HTTPS + IP 白名单, 并在必要时显式配置 HOST=0.0.0.0。
+const HOST = process.env.HOST || '127.0.0.1';
 // 仅在确实位于可信反向代理之后时才置 1; 直连/内网部署保持默认, 杜绝 XFF 伪造绕过限流
 const TRUST_PROXY = process.env.TRUST_PROXY === '1';
 
@@ -66,7 +66,15 @@ const sweepNonces = () => sweepExpired(nonceStore);
 setInterval(sweepNonces, 5 * 60 * 1000).unref();
 const registerNonce = makeRegisterNonce(nonceStore, CODE_TTL_MS);
 const readBody = async (c) => {
-  try { return (await c.req.json()) ?? {}; } catch { return {}; }
+  const text = await c.req.text();
+  if (!text || text.trim() === '') return {};
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    const error = new Error('请求体 JSON 格式非法: ' + err.message);
+    error.status = 400;
+    throw error;
+  }
 };
 // 限流客户端标识: 取 TCP 对端地址 (不可伪造); 无 socket 上下文时安全降级为 local
 const clientIp = (c) => {
@@ -82,6 +90,11 @@ const clientIp = (c) => {
 // ---------- App ----------
 const app = new Hono();
 const json = (c, obj, status = 200) => c.json(obj, status);
+
+app.onError((err, c) => {
+  const status = Number(err.status) || 500;
+  return json(c, { error: err.message || '内部服务器错误' }, status);
+});
 
 const requireAdmin = async (c, next) => {
   const denial = checkAdminToken(process.env.ADMIN_TOKEN, c.req.header('x-admin-token'));
@@ -291,7 +304,7 @@ app.post('/api/wpa/crack', requireAdmin, async (c) => {
   let source;
   if (Array.isArray(body.dictionary)) {
     if (body.dictionary.length === 0) return json(c, { error: 'dictionary 不能为空' }, 400);
-    if (body.dictionary.length > 100000) return json(c, { error: 'dictionary 最多 100000 条' }, 400);
+    if (body.dictionary.length > 20000) return json(c, { error: 'dictionary 最多 20000 条' }, 400);
     candidates = body.dictionary.map((p) => String(p));
     source = 'request';
   } else {
@@ -305,7 +318,7 @@ app.post('/api/wpa/crack', requireAdmin, async (c) => {
   const startedAt = process.hrtime.bigint();
   let result;
   try {
-    result = crackHandshake({
+    result = await crackHandshakeAsync({
       essid,
       candidates,
       eapol: eapol.buf,

