@@ -178,12 +178,12 @@ esac
 - 修复：`firmware/src/main.cpp` 该分支改为 `return false` → 400 +「当前正在运行 [...], 无需切换」，不再重启
 - 复测：HTTP 400 + 正确提示 + 设备保持在线 ✓
 
-**遗留发现（未修，待决策）**：
-- C5 自定义 board JSON 未定义 `ARDUINO_USB_CDC_ON_BOOT` → 固件 `Serial` 走 UART0 引脚，
-  原生 USB（USB-Serial/JTAG, COM3）上看不到任何日志/串口 CLI/首次上电后台口令。
-  本机验证时后台口令是从 NVS 转储中解析恢复的（`LijxuqEkT5Wk`）。
-  建议后续给 `[env:esp32c5]` / `[env:esp32c5_16mb]` 加 `ARDUINO_USB_CDC_ON_BOOT=1`
-  （`-DARDUINO_USB_CDC_ON_BOOT=1 -DARDUINO_USB_MODE=1`），需要用户确认是否影响其他使用场景。
+**遗留发现（已修复，`2aa34cf`）**：
+- C5 自定义 board JSON 未定义 `ARDUINO_USB_CDC_ON_BOOT` → 固件 `Serial` 走 UART0 引脚。
+  已在 `[env:esp32c5]` 加 `-DARDUINO_USB_MODE=1 -DARDUINO_USB_CDC_ON_BOOT=1`
+  （`esp32c5_16mb` 经 extends 继承）。真机复测通过：启动日志 + NDJSON 遥测出现在原生 USB COM3；
+  串口 CLI `boot` 输出三槽位正确状态（audit 活跃 ◀ / espsoup 已就绪 / muse 未安装）。
+  体积：esp32c5 97.9%（余 41,781B，CDC 开销 +13,844B）。契约测试 56→57。
 
 **真机测试注意事项**：
 - esptool v5 写入会跳过镜像中的全 FF 区域（如 NVS/otadata），旧数据会遗留——
@@ -226,16 +226,22 @@ esptool --chip esp32c5 erase_region 0xD000 0x2000
 
 ## 七、结论
 
-✅ **16MB 三系统实现完整：离线一致性 51/51 + 真机验收 10/11 通过、1 Bug 现场修复并复测通过**
+✅ **16MB 三系统实现完整：离线一致性 51/51 + 真机验收全项通过（2 项真机发现当场修复并复测）**
 
 - 分区表 / 烧录台 / 固件 / 构建脚本 / 服务端之间偏移与约束完全一致（离线自检 51/51）
 - 真机完成：分区表烧录、API 三槽位、负向切换拒绝、0xE9 安装检测、
-  **audit ↔ espsoup 双向引导切换**（runningPartition 随之变化）、NVS 跨切换持久
-- 真机发现并修复 1 个 Bug（切换到当前系统无谓重启 → 400 提示，已复测）
-- 契约测试 56/56 全绿
-- 遗留决策：C5 构建未开 `ARDUINO_USB_CDC_ON_BOOT`，原生 USB 板无串口输出/CLI/口令显示
+  **audit ↔ espsoup 双向引导切换**（runningPartition 随之变化）、NVS 跨切换持久、
+  串口 CLI `boot` 三槽位状态
+- 真机发现并修复 2 个问题：
+  1. Bug：切换到当前系统无谓重启 → 400 提示（`18dd6f3`）
+  2. 配置：C5 原生 USB 无串口输出 → 开启 CDC（`2aa34cf`，esp32c5 余 41,781B）
+- 契约测试 **57/57** 全绿
+
+**提交记录**（均未推送，等待用户确认）：
+- `18dd6f3` fix(firmware): 切换到当前运行系统时返回提示而非重启
+- `8476894` test(tools): C5 16MB 三系统离线自检脚本 + 真机验收清单/报告
+- `2aa34cf` build(c5): 开启原生 USB CDC
 
 **下一步**：
-1. 提交（分两条）：① main.cpp Bug 修复 ② 验证工具三件套 + package.json
-2. 决策是否给 C5 env 加 `ARDUINO_USB_CDC_ON_BOOT=1`
-3. 拿到 ESPsoup / Muse 真固件后完成剩余验证项
+1. 确认后推送三条提交
+2. 拿到 ESPsoup / Muse 真固件后完成剩余验证项（ota_2 切换、真实固件行为、烧录台 Web Serial 刷写路径）
