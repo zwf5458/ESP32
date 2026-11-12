@@ -40,6 +40,7 @@
 #include "admin_page.h"
 #include "wifi_weak_dict.h"     // 内置 7,153 条弱口令 (与 server/data/weak-passwords.txt 同序)
 #include "mbedtls/md.h"         // PBKDF2-HMAC-SHA1 / HMAC-SHA1 / HMAC-MD5 (板载跑包)
+#include "sdkconfig.h"          // CONFIG_IEEE802154_ENABLED: 802.15.4 组件是否编入框架
 
 /* BLE 能力门控 (P2): 芯片需有 BLE 硬件, 且本构建未被显式裁剪。
  * 经典 ESP32 例外 —— 它的 BLE 走 Bluedroid (比 NimBLE 多约 810KB), 与 min_spiffs 的
@@ -56,6 +57,19 @@
 #include <BLEUtils.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+#endif
+
+/* 802.15.4 能力门控 (P3): 芯片需有 802.15.4 射频 (C5/C6), 且框架确实把该组件编进了
+ * 静态库 (CONFIG_IEEE802154_ENABLED, 见框架包 sdkconfig)。其余芯片编译期裁掉, 源码不分叉。
+ * 纯被动: promiscuous 只收不发, 不自动 ACK, 不做任何注入。 */
+#if SOC_IEEE802154_SUPPORTED && defined(CONFIG_IEEE802154_ENABLED) && !defined(FW_IEEE802154_DISABLED)
+#define FW_IEEE802154_SUPPORTED 1
+#else
+#define FW_IEEE802154_SUPPORTED 0
+#endif
+
+#if FW_IEEE802154_SUPPORTED
+#include "esp_ieee802154.h"
 #endif
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
@@ -889,6 +903,344 @@ static void bleTaskFunc(void *) {
 }
 #endif /* FW_BLE_SUPPORTED */
 
+#if FW_IEEE802154_SUPPORTED
+/* ---------------- 802.15.4 嗅探 (P3) ----------------
+ * 纯被动: promiscuous 模式只接收, 不发帧、不自动 ACK、不做任何注入。
+ * 射频共用: 802.15.4 与 WiFi 2.4G 是同一个 2.4GHz 射频前端, 框架开启了
+ *   CONFIG_ESP_COEX_SW_COEXIST_ENABLE, 由共存仲裁分时。AP 保持在线, 但抓包是
+ *   「采样」而非「全量」: AP 与目标信道重叠时丢帧更明显, 面板如实提示。
+ *   (不采用「停 AP 再扫」: 后台 UI 就跑在 AP 上, 停 AP 等于把控制通道切断。)
+ * 两种模式:
+ *   frames —— 在固定信道或 11..26 跳频收帧, 统计帧类型 / PAN / 源地址;
+ *   energy —— 对 11..26 逐个做能量检测 (ED), 绘制信道占用条。
+ * 生命周期: 所有 802.15.4 栈调用 (enable / set_channel / receive / energy_detect /
+ *   disable) 都集中在 i154TaskFunc 单任务内串行执行; HTTP 层只翻 want。
+ * ISR 约束: receive_done / energy_detect_done 在 ISR 上下文执行, 必须 IRAM_ATTR,
+ *   只允许纯整数解析和临界区内的定长拷贝 (禁止 String / 日志 / 堆分配)。
+ */
+static constexpr int I154_PAN_MAX = 12;
+static constexpr int I154_DEV_MAX = 20;
+static constexpr uint8_t I154_CH_MIN = 11;
+static constexpr uint8_t I154_CH_MAX = 26;
+static constexpr uint32_t I154_DWELL_MS = 500;         // 跳频时单信道驻留
+static constexpr uint32_t I154_ED_SYMBOLS = 320;       // 能量检测时长 (symbol, 16us → 5.12ms)
+static constexpr int I154_TASK_STACK = 6144;
+
+enum I154Phase : uint8_t { I154_IDLE = 0, I154_STARTING, I154_RUNNING, I154_STOPPING };
+enum I154Mode : uint8_t { I154_MODE_FRAMES = 0, I154_MODE_ENERGY = 1 };
+
+struct I154PanEntry {
+  uint16_t panId;
+  uint32_t frames;
+  int8_t rssi;
+  uint8_t ch;
+  uint32_t lastSeen;
+  bool used;
+};
+
+struct I154DevEntry {
+  uint8_t addr[8];   // 扩展地址按帧内字节序 (LSB first) 原样保存
+  uint8_t addrLen;   // 2 = 短地址, 8 = 扩展地址
+  uint16_t panId;
+  uint32_t frames;
+  int32_t rssi;
+  uint8_t lqi;
+  uint8_t ch;
+  uint8_t lastType;
+  uint32_t lastSeen;
+  bool used;
+};
+
+struct I154State {
+  volatile bool want = false;
+  volatile bool initFailed = false;
+  volatile uint8_t phase = I154_IDLE;
+  volatile uint8_t channel = 15;
+  volatile bool edDone = false;
+  volatile int8_t edDbm = 0;
+  volatile uint32_t nowMs = 0;   // 由任务每 50ms 刷新, 供 ISR 打时间戳 (ISR 内不取时间)
+
+  uint8_t mode = I154_MODE_FRAMES;
+  bool hopping = true;
+  uint16_t durationSec = 0;
+  uint32_t startedAt = 0;
+  uint32_t lastHopAt = 0;
+
+  uint32_t total = 0;
+  uint32_t byType[5] = {0, 0, 0, 0, 0};   // beacon / data / ack / cmd / other
+  uint32_t chFrames[16] = {0};            // 11..26
+  int8_t ed[16] = {127, 127, 127, 127, 127, 127, 127, 127,
+                   127, 127, 127, 127, 127, 127, 127, 127};  // 127 = 尚未测量
+
+  I154PanEntry pans[I154_PAN_MAX];
+  uint8_t panCount = 0;
+  I154DevEntry devs[I154_DEV_MAX];
+  uint8_t devCount = 0;
+
+  portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+};
+static I154State sI154;
+
+static void i154ResetEd() {
+  for (int i = 0; i < 16; i++) sI154.ed[i] = 127;
+}
+
+static const char *i154TypeStr(uint8_t t) {
+  switch (t) {
+    case 0: return "beacon";
+    case 1: return "data";
+    case 2: return "ack";
+    case 3: return "cmd";
+    default: return "other";
+  }
+}
+
+// 在 ISR 内调用: 只做整数解析 + 临界区内的定长内存操作
+static IRAM_ATTR void i154HandleFrame(const uint8_t *frame, const esp_ieee802154_frame_info_t *fi) {
+  const uint8_t len = frame[0];          // frame[0] = 长度, frame[1..] = MHR (无 FCS)
+  if (len < 3) return;
+  const uint8_t *p = frame + 1;
+  const uint16_t fcf = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+  uint8_t type = fcf & 0x7;
+  if (type > 3) type = 4;
+  const uint8_t dstMode = (fcf >> 10) & 0x3;
+  const uint8_t srcMode = (fcf >> 14) & 0x3;
+  const bool panComp = ((fcf >> 6) & 0x1) != 0;
+
+  uint8_t off = 3;  // FCF(2) + 序列号(1)
+  if (dstMode != 0 || srcMode != 0) {
+    if (off > len) return;
+  }
+  uint16_t panId = 0xFFFF;
+  if (dstMode != 0) {  // 目的 PAN 一定存在
+    if (off + 2 > len) return;
+    panId = (uint16_t)p[off] | ((uint16_t)p[off + 1] << 8);
+    off += 2 + ((dstMode == 1) ? 2 : 8);
+  }
+  uint8_t srcLen = 0;
+  const uint8_t *srcAddr = nullptr;
+  if (srcMode != 0) {
+    // 源 PAN: 目的地址不存在, 或未做 PAN 压缩时存在
+    if (dstMode == 0 || !panComp) {
+      if (off + 2 > len) return;
+      if (panId == 0xFFFF) panId = (uint16_t)p[off] | ((uint16_t)p[off + 1] << 8);
+      off += 2;
+    }
+    srcLen = (srcMode == 1) ? 2 : 8;
+    if (off + srcLen > len) return;
+    srcAddr = p + off;
+  }
+
+  uint8_t ch = fi->channel;
+  if (ch < I154_CH_MIN || ch > I154_CH_MAX) {
+    ch = sI154.channel;
+    if (ch < I154_CH_MIN || ch > I154_CH_MAX) ch = I154_CH_MIN;
+  }
+  const uint32_t now = sI154.nowMs;
+  const int32_t rssi = fi->rssi;
+
+  portENTER_CRITICAL_ISR(&sI154.mux);
+  sI154.total++;
+  sI154.byType[type]++;
+  sI154.chFrames[ch - I154_CH_MIN]++;
+
+  if (panId != 0xFFFF) {
+    int pi = -1;
+    for (int i = 0; i < I154_PAN_MAX; i++) {
+      if (sI154.pans[i].used && sI154.pans[i].panId == panId) { pi = i; break; }
+    }
+    if (pi < 0) {
+      for (int i = 0; i < I154_PAN_MAX; i++) {
+        if (!sI154.pans[i].used) { pi = i; break; }
+      }
+      if (pi < 0) {  // 表满: 淘汰最久未出现的 PAN
+        uint32_t oldest = UINT32_MAX;
+        for (int i = 0; i < I154_PAN_MAX; i++) {
+          if (sI154.pans[i].lastSeen < oldest) { oldest = sI154.pans[i].lastSeen; pi = i; }
+        }
+      }
+      if (pi >= 0) {
+        sI154.pans[pi].used = true;
+        sI154.pans[pi].panId = panId;
+        sI154.pans[pi].frames = 0;
+      }
+    }
+    if (pi >= 0) {
+      I154PanEntry &pe = sI154.pans[pi];
+      pe.frames++;
+      pe.rssi = rssi;
+      pe.ch = ch;
+      pe.lastSeen = now;
+    }
+  }
+
+  if (srcAddr && srcLen) {
+    int di = -1;
+    for (int i = 0; i < I154_DEV_MAX; i++) {
+      I154DevEntry &d = sI154.devs[i];
+      if (d.used && d.addrLen == srcLen && d.panId == panId) {
+        bool same = true;
+        for (int k = 0; k < srcLen; k++) {
+          if (d.addr[k] != srcAddr[k]) { same = false; break; }
+        }
+        if (same) { di = i; break; }
+      }
+    }
+    if (di < 0) {
+      for (int i = 0; i < I154_DEV_MAX; i++) {
+        if (!sI154.devs[i].used) { di = i; break; }
+      }
+      if (di < 0) {
+        uint32_t oldest = UINT32_MAX;
+        for (int i = 0; i < I154_DEV_MAX; i++) {
+          if (sI154.devs[i].lastSeen < oldest) { oldest = sI154.devs[i].lastSeen; di = i; }
+        }
+      }
+      if (di >= 0) {
+        I154DevEntry &d = sI154.devs[di];
+        d.used = true;
+        d.addrLen = srcLen;
+        for (int k = 0; k < srcLen; k++) d.addr[k] = srcAddr[k];
+        d.panId = panId;
+        d.frames = 0;
+      }
+    }
+    if (di >= 0) {
+      I154DevEntry &d = sI154.devs[di];
+      d.frames++;
+      d.rssi = rssi;
+      d.lqi = fi->lqi;
+      d.ch = ch;
+      d.lastType = type;
+      d.lastSeen = now;
+    }
+  }
+
+  // 计数按表项重算, 避免淘汰/新建分支漏算
+  uint8_t pc = 0, dc = 0;
+  for (int i = 0; i < I154_PAN_MAX; i++) if (sI154.pans[i].used) pc++;
+  for (int i = 0; i < I154_DEV_MAX; i++) if (sI154.devs[i].used) dc++;
+  sI154.panCount = pc;
+  sI154.devCount = dc;
+  portEXIT_CRITICAL_ISR(&sI154.mux);
+}
+
+// ISR: 收帧完成 → 解析 → 归还驱动缓冲
+IRAM_ATTR extern "C" void esp_ieee802154_receive_done(uint8_t *frame, esp_ieee802154_frame_info_t *frame_info) {
+  i154HandleFrame(frame, frame_info);
+  esp_ieee802154_receive_handle_done(frame);
+}
+
+// ISR: 能量检测完成
+IRAM_ATTR extern "C" void esp_ieee802154_energy_detect_done(int8_t power) {
+  sI154.edDbm = power;
+  sI154.edDone = true;
+}
+
+// 一轮 11..26 能量扫描; 只在 energy 模式的运行态调用
+static void i154EdSweep() {
+  for (uint8_t ch = I154_CH_MIN; ch <= I154_CH_MAX && sI154.want; ch++) {
+    esp_ieee802154_set_channel(ch);
+    sI154.edDone = false;
+    if (esp_ieee802154_energy_detect(I154_ED_SYMBOLS) != ESP_OK) continue;
+    for (int i = 0; i < 60 && !sI154.edDone; i++) vTaskDelay(pdMS_TO_TICKS(2));
+    if (sI154.edDone) {
+      portENTER_CRITICAL(&sI154.mux);
+      sI154.ed[ch - I154_CH_MIN] = sI154.edDbm;
+      portEXIT_CRITICAL(&sI154.mux);
+    }
+  }
+  // 一轮结束留出射频给 AP, 再扫下一轮
+  for (int i = 0; i < 10 && sI154.want; i++) vTaskDelay(pdMS_TO_TICKS(50));
+}
+
+static void i154TaskFunc(void *) {
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(50));
+    sI154.nowMs = millis();
+    const uint8_t phase = sI154.phase;
+
+    if (sI154.want && phase == I154_IDLE) {
+      sI154.phase = I154_STARTING;
+      sI154.initFailed = false;
+      log("[i154] 初始化 802.15.4 射频...");
+      esp_err_t err = esp_ieee802154_enable();
+      if (err != ESP_OK) {
+        log("[i154] 802.15.4 初始化失败 (err=" + String((int)err) + "), 可能是共存资源冲突");
+        sI154.initFailed = true;
+        sI154.want = false;
+        sI154.phase = I154_IDLE;
+        continue;
+      }
+      esp_ieee802154_set_promiscuous(true);  // 只收不发, 不自动 ACK
+      portENTER_CRITICAL(&sI154.mux);
+      for (int i = 0; i < I154_PAN_MAX; i++) sI154.pans[i].used = false;
+      for (int i = 0; i < I154_DEV_MAX; i++) sI154.devs[i].used = false;
+      sI154.panCount = sI154.devCount = 0;
+      sI154.total = 0;
+      for (int i = 0; i < 5; i++) sI154.byType[i] = 0;
+      for (int i = 0; i < 16; i++) sI154.chFrames[i] = 0;
+      i154ResetEd();
+      portEXIT_CRITICAL(&sI154.mux);
+      sI154.startedAt = millis();
+      sI154.lastHopAt = sI154.startedAt;
+      sI154.phase = I154_RUNNING;
+      if (!sI154.want) {  // 初始化期间已被请求停止
+        sI154.phase = I154_STOPPING;
+        continue;
+      }
+      if (sI154.mode == I154_MODE_FRAMES) {
+        // rx_when_idle: 收完一帧由硬件自动回到接收, 无需在 ISR 里重新 arm
+        esp_ieee802154_set_rx_when_idle(true);
+        esp_ieee802154_set_channel(sI154.channel);
+        esp_ieee802154_receive();
+        log("[i154] 帧嗅探已启动 (" +
+            String(sI154.hopping ? String("跳频 11-26") : ("信道 " + String(sI154.channel))) +
+            ", 纯被动)");
+      } else {
+        log("[i154] 能量扫描已启动 (11-26, 单信道 " + String((int)I154_ED_SYMBOLS * 16) + "us)");
+      }
+      emitLabState("ieee802154", true);
+      continue;
+    }
+
+    if (sI154.want && phase == I154_RUNNING) {
+      if (sI154.durationSec && (millis() - sI154.startedAt) / 1000 >= sI154.durationSec) {
+        sI154.want = false;
+        sI154.phase = I154_STOPPING;
+        continue;
+      }
+      if (sI154.mode == I154_MODE_ENERGY) {
+        i154EdSweep();
+      } else if (sI154.hopping) {
+        if (millis() - sI154.lastHopAt >= I154_DWELL_MS) {
+          sI154.lastHopAt = millis();
+          uint8_t next = sI154.channel + 1;
+          if (next > I154_CH_MAX) next = I154_CH_MIN;
+          sI154.channel = next;
+          esp_ieee802154_set_channel(next);
+          esp_ieee802154_receive();  // 换信道后重新进入接收
+        }
+      }
+      continue;
+    }
+
+    if (!sI154.want && phase != I154_IDLE) {
+      sI154.phase = I154_STOPPING;
+      esp_ieee802154_disable();  // 归还射频
+      sI154.phase = I154_IDLE;
+      const uint32_t total = sI154.total;
+      const uint8_t pcs = sI154.panCount;
+      const uint8_t dcs = sI154.devCount;
+      log("[i154] 已停止, 累计 " + String(total) + " 帧 / " + String(pcs) + " 个 PAN / " +
+          String(dcs) + " 个设备");
+      emitLabState("ieee802154", false);
+      continue;
+    }
+  }
+}
+#endif /* FW_IEEE802154_SUPPORTED */
+
 static void addKarmaProbe(const char *mac, const char *ssid, int8_t rssi, bool baited) {
   KarmaProbe &p = sKarma.probes[sKarma.probeHead];
   strlcpy(p.mac, mac, sizeof(p.mac));
@@ -1514,6 +1866,14 @@ static void sendInfo() {
           ",\"totalAdv\":" + String(sBLE.totalAdv) + "},";
 #else
   json += "\"ble\":{\"supported\":false},";
+#endif
+#if FW_IEEE802154_SUPPORTED
+  json += "\"ieee802154\":{\"supported\":true,\"running\":" +
+          String(sI154.phase == I154_RUNNING && sI154.want ? "true" : "false") +
+          ",\"total\":" + String(sI154.total) +
+          ",\"devices\":" + String(sI154.devCount) + "},";
+#else
+  json += "\"ieee802154\":{\"supported\":false},";
 #endif
   json += "\"version\":\"" FW_VERSION "\",";
   uint8_t macAddressBytes[6];
@@ -2431,6 +2791,262 @@ static void handleBleClear() {
 #endif
 }
 
+/* ---------------- 802.15.4 API (P3) ----------------
+ * 路由在所有芯片上注册 (路由表不分叉), 无 802.15.4 硬件的芯片返回 501。
+ * 启停只翻 sI154.want, 协议栈的 enable/disable 由 i154TaskFunc 串行完成。
+ */
+#if !FW_IEEE802154_SUPPORTED
+static void i154Unsupported() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(501, "application/json",
+              "{\"ok\":false,\"error\":\"本芯片不支持 802.15.4 (无该射频)\"}");
+}
+#endif
+
+#if FW_IEEE802154_SUPPORTED
+static void i154AddrStr(const I154DevEntry &e, char *out, size_t n) {
+  if (e.addrLen == 2) {
+    snprintf(out, n, "0x%02X%02X", e.addr[1], e.addr[0]);
+    return;
+  }
+  static const char *hex = "0123456789ABCDEF";
+  size_t p = 0;
+  for (int i = 7; i >= 0 && p + 3 <= n; i--) {
+    out[p++] = hex[(e.addr[i] >> 4) & 0xF];
+    out[p++] = hex[e.addr[i] & 0xF];
+    if (i) out[p++] = ':';
+  }
+  out[p < n ? p : n - 1] = '\0';
+}
+
+static void i154AppendPans(String &json) {
+  json += "[";
+  bool first = true;
+  for (int i = 0; i < I154_PAN_MAX; i++) {
+    I154PanEntry e;
+    bool used;
+    portENTER_CRITICAL(&sI154.mux);
+    used = sI154.pans[i].used;
+    if (used) e = sI154.pans[i];
+    portEXIT_CRITICAL(&sI154.mux);
+    if (!used) continue;
+    if (!first) json += ",";
+    first = false;
+    char buf[8];
+    snprintf(buf, sizeof(buf), "0x%04X", e.panId);
+    json += "{\"panId\":\"" + String(buf) + "\"";
+    json += ",\"channel\":" + String(e.ch);
+    json += ",\"frames\":" + String(e.frames);
+    json += ",\"rssi\":" + String(e.rssi);
+    json += ",\"lastSeen\":" + String(e.lastSeen) + "}";
+  }
+  json += "]";
+}
+
+static void i154AppendDevs(String &json) {
+  json += "[";
+  bool first = true;
+  for (int i = 0; i < I154_DEV_MAX; i++) {
+    I154DevEntry e;
+    bool used;
+    portENTER_CRITICAL(&sI154.mux);
+    used = sI154.devs[i].used;
+    if (used) e = sI154.devs[i];
+    portEXIT_CRITICAL(&sI154.mux);
+    if (!used) continue;
+    if (!first) json += ",";
+    first = false;
+    char addr[24];
+    i154AddrStr(e, addr, sizeof(addr));
+    char pan[8];
+    snprintf(pan, sizeof(pan), "0x%04X", e.panId);
+    json += "{\"addr\":\"" + String(addr) + "\"";
+    json += ",\"short\":" + String(e.addrLen == 2 ? "true" : "false");
+    json += ",\"panId\":\"" + String(pan) + "\"";
+    json += ",\"channel\":" + String(e.ch);
+    json += ",\"frames\":" + String(e.frames);
+    json += ",\"rssi\":" + String(e.rssi);
+    json += ",\"lqi\":" + String(e.lqi);
+    json += ",\"type\":\"" + String(i154TypeStr(e.lastType)) + "\"";
+    json += ",\"lastSeen\":" + String(e.lastSeen) + "}";
+  }
+  json += "]";
+}
+#endif /* FW_IEEE802154_SUPPORTED */
+
+static void handleI154Start() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+#if FW_IEEE802154_SUPPORTED
+  if (sI154.want || sI154.phase != I154_IDLE) {
+    server.send(409, "application/json", "{\"ok\":false,\"error\":\"802.15.4 扫描已在运行\"}");
+    return;
+  }
+  // 首次使用时才创建管理任务: 不用该模块的部署不额外占用任务栈
+  static bool sI154TaskStarted = false;
+  if (!sI154TaskStarted) {
+    if (xTaskCreate(i154TaskFunc, "i154_task", I154_TASK_STACK, nullptr, 1, nullptr) != pdPASS) {
+      server.send(500, "application/json", "{\"ok\":false,\"error\":\"802.15.4 任务创建失败 (内存不足)\"}");
+      return;
+    }
+    sI154TaskStarted = true;
+  }
+  uint8_t mode = I154_MODE_FRAMES;
+  uint8_t ch = 15;
+  bool hopping = true;
+  uint16_t dur = 0;
+  if (server.hasArg("plain")) {
+    String body = server.arg("plain");
+    String m = extractJson(body, "mode");
+    if (m == "energy") mode = I154_MODE_ENERGY;
+    String chStr = extractJson(body, "channel");
+    if (chStr.length()) {
+      int v = chStr.toInt();
+      if (v == 0) {
+        hopping = true;
+      } else if (v >= I154_CH_MIN && v <= I154_CH_MAX) {
+        hopping = false;
+        ch = (uint8_t)v;
+      } else {
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"802.15.4 信道必须为 11-26 (0 = 跳频)\"}");
+        return;
+      }
+    }
+    String dStr = extractJson(body, "duration");
+    if (dStr.length()) {
+      int v = dStr.toInt();
+      if (v > 0) dur = (uint16_t)(v > 65535 ? 65535 : v);
+    }
+  }
+  if (mode == I154_MODE_ENERGY) hopping = true;  // 能量扫描总是扫全 11-26
+  sI154.mode = mode;
+  sI154.channel = ch;
+  sI154.hopping = hopping;
+  sI154.durationSec = dur;
+  sI154.initFailed = false;
+  sI154.want = true;  // i154TaskFunc 接管
+  log("[i154] 收到扫描请求 (" + String(mode == I154_MODE_ENERGY ? "能量扫描" : "帧嗅探") + ", " +
+      String(hopping ? String("跳频 11-26") : ("信道 " + String(ch))) + "), 等待射频就绪...");
+  server.send(200, "application/json", "{\"ok\":true,\"status\":\"starting\"}");
+#else
+  i154Unsupported();
+#endif
+}
+
+static void handleI154Stop() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+#if FW_IEEE802154_SUPPORTED
+  if (!sI154.want && sI154.phase == I154_IDLE) {
+    server.send(409, "application/json", "{\"ok\":false,\"error\":\"802.15.4 扫描未在运行\"}");
+    return;
+  }
+  sI154.want = false;
+  server.send(200, "application/json", "{\"ok\":true,\"status\":\"stopping\"}");
+#else
+  i154Unsupported();
+#endif
+}
+
+static void handleI154Status() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+#if FW_IEEE802154_SUPPORTED
+  uint8_t phase, mode, ch, panCount, devCount;
+  bool want, hopping, initFailed;
+  uint16_t durationSec;
+  uint32_t startedAt, total, byType[5], chFrames[16];
+  int8_t ed[16];
+  portENTER_CRITICAL(&sI154.mux);
+  phase = sI154.phase;
+  want = sI154.want;
+  hopping = sI154.hopping;
+  mode = sI154.mode;
+  ch = sI154.channel;
+  durationSec = sI154.durationSec;
+  initFailed = sI154.initFailed;
+  startedAt = sI154.startedAt;
+  total = sI154.total;
+  panCount = sI154.panCount;
+  devCount = sI154.devCount;
+  for (int i = 0; i < 5; i++) byType[i] = sI154.byType[i];
+  for (int i = 0; i < 16; i++) { chFrames[i] = sI154.chFrames[i]; ed[i] = sI154.ed[i]; }
+  portEXIT_CRITICAL(&sI154.mux);
+
+  String json;
+  json.reserve(560 + (size_t)(panCount * 80 + devCount * 130));
+  json = "{\"supported\":true,";
+  json += "\"running\":" + String(phase == I154_RUNNING && want ? "true" : "false") + ",";
+  json += "\"phase\":\"";
+  switch (phase) {
+    case I154_STARTING: json += "starting"; break;
+    case I154_RUNNING:  json += "running"; break;
+    case I154_STOPPING: json += "stopping"; break;
+    default:           json += "idle"; break;
+  }
+  json += "\",";
+  json += "\"mode\":\"" + String(mode == I154_MODE_ENERGY ? "energy" : "frames") + "\",";
+  json += "\"channel\":" + String(ch) + ",";
+  json += "\"hopping\":" + String(hopping ? "true" : "false") + ",";
+  json += "\"durationSec\":" + String(durationSec) + ",";
+  json += "\"initFailed\":" + String(initFailed ? "true" : "false") + ",";
+  json += "\"uptime\":" + String(phase == I154_RUNNING ? (millis() - startedAt) / 1000 : 0) + ",";
+  json += "\"apChannel\":" + String((int)apChannel) + ",";
+  json += "\"apChannelActive\":" + String((int)apChannelActive) + ",";
+  json += "\"total\":" + String(total) + ",";
+  json += "\"byType\":{\"beacon\":" + String(byType[0]) + ",\"data\":" + String(byType[1]) +
+          ",\"ack\":" + String(byType[2]) + ",\"cmd\":" + String(byType[3]) +
+          ",\"other\":" + String(byType[4]) + "},";
+  json += "\"chFrames\":[";
+  for (int i = 0; i < 16; i++) json += (i ? "," : "") + String(chFrames[i]);
+  json += "],\"ed\":[";
+  for (int i = 0; i < 16; i++) json += (i ? "," : "") + String((int)ed[i]);
+  json += "],";
+  json += "\"panCount\":" + String(panCount) + ",\"deviceCount\":" + String(devCount) + ",";
+  json += "\"pans\":";
+  i154AppendPans(json);
+  json += ",\"devices\":";
+  i154AppendDevs(json);
+  json += "}";
+  server.send(200, "application/json", json);
+#else
+  server.send(200, "application/json",
+              "{\"supported\":false,\"running\":false,\"pans\":[],\"devices\":[],\"panCount\":0,\"deviceCount\":0}");
+#endif
+}
+
+static void handleI154Frames() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+#if FW_IEEE802154_SUPPORTED
+  String json;
+  json.reserve(64 + (size_t)(sI154.panCount * 80 + sI154.devCount * 130));
+  json = "{\"total\":" + String(sI154.total) + ",\"pans\":";
+  i154AppendPans(json);
+  json += ",\"devices\":";
+  i154AppendDevs(json);
+  json += "}";
+  server.send(200, "application/json", json);
+#else
+  server.send(200, "application/json", "{\"total\":0,\"pans\":[],\"devices\":[]}");
+#endif
+}
+
+static void handleI154Clear() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+#if FW_IEEE802154_SUPPORTED
+  portENTER_CRITICAL(&sI154.mux);
+  for (int i = 0; i < I154_PAN_MAX; i++) sI154.pans[i].used = false;
+  for (int i = 0; i < I154_DEV_MAX; i++) sI154.devs[i].used = false;
+  sI154.panCount = sI154.devCount = 0;
+  sI154.total = 0;
+  for (int i = 0; i < 5; i++) sI154.byType[i] = 0;
+  for (int i = 0; i < 16; i++) sI154.chFrames[i] = 0;
+  i154ResetEd();
+  portEXIT_CRITICAL(&sI154.mux);
+  log("[i154] 统计与列表已清空 (扫描状态不变)");
+  server.send(200, "application/json", "{\"ok\":true}");
+#else
+  i154Unsupported();
+#endif
+}
+
 /* ---------------- Karma API ---------------- */
 static void handleKarmaStart() {
   sKarma.probesCaptured = 0;
@@ -3007,6 +3623,12 @@ void setup() {
   onAdmin("/api/ble/status", HTTP_GET, handleBleStatus);
   onAdmin("/api/ble/devices", HTTP_GET, handleBleDevices);
   onAdmin("/api/ble/clear", HTTP_POST, handleBleClear);
+  // 802.15.4: 同样全芯片注册, 无该射频的芯片返回 501
+  onAdmin("/api/ieee802154/start", HTTP_POST, handleI154Start);
+  onAdmin("/api/ieee802154/stop", HTTP_POST, handleI154Stop);
+  onAdmin("/api/ieee802154/status", HTTP_GET, handleI154Status);
+  onAdmin("/api/ieee802154/frames", HTTP_GET, handleI154Frames);
+  onAdmin("/api/ieee802154/clear", HTTP_POST, handleI154Clear);
 
   onAdmin("/api/karma/start", HTTP_POST, handleKarmaStart);
   onAdmin("/api/karma/stop", HTTP_POST, handleKarmaStop);

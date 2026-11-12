@@ -14,8 +14,8 @@
 
 - 芯片：**全系列** ESP32 / ESP32-S2 / ESP32-S3 / ESP32-C3 / ESP32-C5 / ESP32-C6
   （C5 为实验性支持：镜像可出、真机待验证）
-- 固件功能：AP 热点 + Web 后台（10 页 SPA，见 §4.1）；v1.1.0 起含 Evil Twin / Deauther /
-  握手包 / Sniffer / Airodump / Karma / BLE 扫描教学验证模块，均为**真实空口实现**，
+- 固件功能：AP 热点 + Web 后台（11 页 SPA，见 §4.1）；v1.1.0 起含 Evil Twin / Deauther /
+  握手包 / Sniffer / Airodump / Karma / BLE 扫描 / 802.15.4 扫描教学验证模块，均为**真实空口实现**，
   使用边界见 §3.1（仅限自有或书面授权的受测环境）
 - 烧录码：**真后端**发码 / 两段式核销（verify → redeem）
 - 部署：先 localhost 跑通（Web Serial 对 localhost 放行），不上云
@@ -30,7 +30,7 @@ ESP32/
 │   ├── src/main.cpp              # 共享固件逻辑（AP + 鉴权 API + 抓包/教学模块 + 日志/扫描/目标）
 │   ├── src/admin_page.h          # 自动生成（data/admin.html deflate 内嵌数据）
 │   ├── src/wifi_weak_dict.h      # 内置 7,153 条弱口令（tools/build-wordlist.mjs 生成）
-│   ├── data/admin.html           # 固件后台 SPA 源文件（10 页）
+│   ├── data/admin.html           # 固件后台 SPA 源文件（11 页）
 │   └── tools/
 │       ├── embed_admin_page.py   # 预构建脚本: admin.html → admin_page.h
 │       └── patch-platformio-c5.py # espressif32 平台 C5 补丁（幂等可重跑）
@@ -58,8 +58,9 @@ ESP32/
   lib-builder `idf-release_v5.5-b774170f` 预编译库 + 平台三处补丁（实验性支持，真机待验证）
 - 工具链/框架包获取见 README「PlatformIO 编译环境搭建」：
   工具链用 espressif 官方 crosstool 注入，框架包用 `tools/dl-resume.sh` 断点续传
-- 共用 `src/main.cpp`；6 个 env 编译同一份源码，5G / BLE 能力差异一律用编译期宏门控
-  （`SOC_WIFI_SUPPORT_5G`、`FW_BLE_SUPPORTED = SOC_BLE_SUPPORTED && !FW_BLE_DISABLED`），
+- 共用 `src/main.cpp`；6 个 env 编译同一份源码，5G / BLE / 802.15.4 能力差异一律用编译期宏门控
+  （`SOC_WIFI_SUPPORT_5G`、`FW_BLE_SUPPORTED = SOC_BLE_SUPPORTED && !FW_BLE_DISABLED`、
+  `FW_IEEE802154_SUPPORTED = SOC_IEEE802154_SUPPORTED && CONFIG_IEEE802154_ENABLED && !FW_IEEE802154_DISABLED`），
   不做源码分叉；经典 ESP32 因 Bluedroid 体积与 4MB 双槽冲突在 `platformio.ini` 里
   `-DFW_BLE_DISABLED` 裁剪 BLE
 - 串口 UART 日志 115200（烧录台串口控制台可见；未启用 USB CDC 宏）
@@ -68,7 +69,7 @@ ESP32/
   `notFound()` 对 iOS(`/hotspot-detect.html`) / Android(`/generate_204`) /
   Windows(`/connecttest.txt`) 探测路径与任意未知路径返回 302 → `/admin.html`，
   连热点自动弹后台；`/api/*` 保持 404 以不破坏后台 SPA fetch 契约
-- 后台：`http://192.168.4.1/admin.html`，deflate 后内嵌（10 页，见 §4.1）：
+- 后台：`http://192.168.4.1/admin.html`，deflate 后内嵌（11 页，见 §4.1）：
   - 设备信息：芯片型号、MAC、固件版本、运行时长、可用内存
   - 主目标 / 双子目标信息（扫描页选定后回填，仅存 RAM）
   - 内存诊断：可用 / 最低水位 / 最大块 / 碎片率
@@ -105,13 +106,13 @@ ESP32/
 ## 3.1 合规边界
 
 v1.1.0 起，教学验证模块（Evil Twin / Deauther / 握手包 / Sniffer / Airodump / Karma /
-BLE 扫描）均为**真实空口实现**，对周边网络有真实影响；本节定义其使用边界，不构成对第三方网络的
+BLE 扫描 / 802.15.4 扫描）均为**真实空口实现**，对周边网络有真实影响；本节定义其使用边界，不构成对第三方网络的
 使用许可。完整能力矩阵（6 颗芯片行为一致，README「功能范围与合规边界」同源）：
 
 | 模块 | 状态 | 说明 |
 |---|---|---|
 | AP 热点 | ✅ 实现 | `WiFi-` + MAC 尾 4 位 / `00000000` / `192.168.4.1` |
-| Web 后台 10 页 | ✅ 实现 | 状态总览 / 扫描与嗅探 / 邪恶双子 / Karma / 取消认证 / 数据包分析器 / Airodump / BLE 扫描 / 捕获凭据 / 配置（内嵌 SPA） |
+| Web 后台 11 页 | ✅ 实现 | 状态总览 / 扫描与嗅探 / 邪恶双子 / Karma / 取消认证 / 数据包分析器 / Airodump / BLE 扫描 / 802.15.4 扫描 / 捕获凭据 / 配置（内嵌 SPA） |
 | 后台口令鉴权 | ✅ 实现 | 每台设备随机初始口令（串口一次性输出）；`/api/*` 需 `X-Admin-Token`，面板内改密 |
 | Captive Portal | ✅ 实现 | UDP 53 通配解析 + OS 探测路径 302 → 连热点自动弹后台 |
 | 周边 AP 扫描 | ✅ 实现 | 被动列出 SSID/RSSI/信道/加密方式（合法观察） |
@@ -125,6 +126,7 @@ BLE 扫描）均为**真实空口实现**，对周边网络有真实影响；本
 | Airodump 侦察 | ✅ 真实实现 | 从真实空口帧按 MAC 聚合对端（RSSI / 帧数 / 探测过的 SSID），支持 1-13 跳频；与 Evil Twin / Deauth / 握手并行时停驻当前信道 |
 | Karma 探针诱捕 | ✅ 真实实现 | 监听真实 Probe Request，记录客户端 MAC / 目标 SSID / RSSI；SSID 命中克隆热点时标记「已诱捕」，并复用握手捕获链路同步收集 4-Way Handshake |
 | BLE 广播嗅探 | ✅ 真实实现 | 纯被动监听周边 BLE 广播（ADV_IND / SCAN_RSP 等），解析 MAC / 名称 / RSSI / 广播类型 / 厂商数据摘要 / 广播计数；**不发 SCAN_REQ、不连接、不读特征值**。C3/C5/C6/S3 开放（NimBLE），经典 ESP32 因 Bluedroid 体积与 4MB 双槽冲突裁剪，S2 无蓝牙硬件 |
+| 802.15.4 嗅探 | ✅ 真实实现 | 纯被动接收 IEEE 802.15.4 帧（Zigbee / Thread），解析帧类型 / PAN ID / 源地址 / RSSI / LQI，并对 11-26 信道做能量检测；**只收不发、不自动 ACK、不注入**。仅 C5/C6 有该射频；与 WiFi 2.4G 共用射频，AP 保持在线、抓包为分时采样 |
 
 **v1.1.0 起定位为「教学验证」**：上述教学模块在**受控教学 / 自有授权设备**范围内启用
 （用户明确决策，见变更记录 2026-11-09 三）。其中 Deauther、握手包、Sniffer、Airodump、
@@ -209,7 +211,7 @@ Web Serial 只在 HTTPS 或 localhost 可用 —— 本地跑 `http://localhost:
 ## 4.1 固件后台（device admin SPA）
 
 `firmware/data/admin.html`（内嵌，访问 `http://192.168.4.1/admin.html`），
-hash 路由 10 页 + 汉堡抽屉。首次打开先显示口令登录层，口令存 `localStorage`，
+hash 路由 11 页 + 汉堡抽屉。首次打开先显示口令登录层，口令存 `localStorage`，
 所有 `api()` / 日志轮询 / POST 操作统一注入 `X-Admin-Token`：
 
 - **状态总览**（`#dash`）：仪表板横幅、模块状态三卡、主/双子目标信息、内存诊断四指标
@@ -225,6 +227,9 @@ hash 路由 10 页 + 汉堡抽屉。首次打开先显示口令登录层，口�
 - **BLE 扫描**（`#ble`）：纯被动广播嗅探，设备表（MAC/名称/RSSI/广播类型/厂商数据/
   广播计数/最后出现）、设备数与累计广播数、可选时长与导出 JSON；扫描期间 AP 保持
   在线但吞吐下降（50% 占空比），页面明确提示。无 BLE 硬件或已裁剪的芯片整页隐藏
+- **802.15.4 扫描**（`#ieee`）：纯被动帧嗅探（固定信道或 11-26 跳频）与信道能量扫描，
+  解析帧类型 / PAN ID / 源地址 / RSSI / LQI，按 PAN 与设备聚合；与 WiFi 2.4G 共用射频，
+  AP 保持在线、抓包为分时采样并提示重叠信道丢帧。仅 C5/C6 开放，其余芯片整页隐藏
 - **捕获的凭据**（`#creds`）：门户提交记录，支持清空
 - **配置**（`#cfg`）：热点 SSID/信道（`POST /api/config` 持久化 NVS）、后台口令修改、
   重启、恢复出厂；修改后需重启生效
@@ -277,7 +282,7 @@ redeem 只在 writeFlash 完整成功后由前端触发，且后端按 nonce+chi
 2. 无板子：verify 通过 → 烧录失败/取消 → DB 状态仍 `未用` ✓
 3. 真机烧录：烧录完成 → 控制台启动日志 → 记录 `redeemed` + flash_log ⬜（待真机）
 4. 手机连 `WiFi-xxxx` / `00000000` → Captive Portal 自动弹窗或手动
-   `http://192.168.4.1/admin.html` → 用串口输出的随机初始口令登录，显示后台 10 页 + 版本 ⬜（待真机）
+   `http://192.168.4.1/admin.html` → 用串口输出的随机初始口令登录，显示后台 11 页 + 版本 ⬜（待真机）
 5. 二次烧用已核销的码 → verify 拒绝 ✓
 6. 可编 6 颗芯片镜像全部产出并出现在 manifest ✓
    （esp32/s2/s3/c3/c5/c6 各 4MB 合并镜像；c5 为本地注入 libs 编出，实验性）
@@ -335,7 +340,8 @@ redeem 只在 writeFlash 完整成功后由前端触发，且后端按 nonce+chi
   **P1** 5G AP（非 DFS）、5G 取消认证/双子（含 DFS 跳频注入），均待 C5 真机验证）；
   **P2** BLE 广播嗅探已实现（纯被动，C3/C5/C6/S3 走 NimBLE，
   经典 ESP32 因 Bluedroid 体积与 4MB 双槽冲突裁剪），待真机验证；
-  802.15.4（P3）无代码
+  **P3** 802.15.4 纯被动帧嗅探 + 信道能量扫描已实现（C5/C6 开放，其余芯片 501），
+  与 WiFi 2.4G 分时共存、不停 AP，待真机验证
 - ~~CDN 本地化~~（已完成）：`flasher/vendor/` 内置 esptool-js 0.7.1 + crypto-js 4.2.0，
   烧录台不再依赖 unpkg，支持断网/内网，同时获得 C5 识别与整片 Flash 备份能力
 - 异步 WiFi 扫描：把同步 `scanNetworks` 改为异步启动 + 轮询，
@@ -351,6 +357,7 @@ redeem 只在 writeFlash 完整成功后由前端触发，且后端按 nonce+chi
 | 2026-11-11 | 后台扩为 9 页并加口令鉴权（设备唯一随机初始口令）；Sniffer / Airodump / Karma 改为真实抓包；删除冗余路由；补 `eviltwin` 遥测；6 芯片镜像全量重建并注册；修正「主动攻击模块不实现」「后台三页」等描述漂移 |
 | 2026-11-11 | 新增 [C5 5GHz / BLE 5 / 802.15.4 能力差距与改造清单](./2026-11-11-c5-5ghz-ble-802154-roadmap.md)；§9 标记录 CDN 本地化已完成（esptool-js 0.7.1 + crypto-js 4.2.0 内置） |
 | 2026-11-11 | 落地 **P2 BLE 广播嗅探**：后台扩为 10 页（新增「BLE 扫描」）、5 个 `/api/ble/*` 路由、`FW_BLE_SUPPORTED` 能力门控；经典 ESP32 因 Bluedroid 体积（+810KB）与 min_spiffs 双 app 槽冲突用 `-DFW_BLE_DISABLED` 裁剪，S2 无 BLE 硬件 |
+| 2026-11-12 | 落地 **P3 802.15.4 纯被动嗅探**：后台扩为 11 页（新增「802.15.4 扫描」）、5 个 `/api/ieee802154/*` 路由、`FW_IEEE802154_SUPPORTED` 门控（仅 C5/C6）；帧解析在 ISR 内完成，生命周期收敛到单任务状态机；与 WiFi 2.4G 分时共存、保持 AP 在线，不做注入 |
 | 2026-11-11 | P0 实现：C5 Sniffer / Airodump 支持 5G 停驻与跳频（含跳过 DFS、`band` 状态字段与 UI 分段），6 芯片编译回归通过，待真机验证 |
 | 2026-11-11 | P1 实现：5G AP（非 DFS 36–48/149–165）与 5G 取消认证 / 双子（含 DFS 跳频注入）；主目标「2.4G 或 5G 非 DFS」，DFS 明确引导改用双子；状态 JSON 加 `band`；esp32c5/s3 编译通过，`npm test` 40/40，待真机验证 |
 

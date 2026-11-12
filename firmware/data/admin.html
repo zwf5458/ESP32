@@ -232,10 +232,14 @@ select.mini{padding:8px 12px;font-weight:800;border:var(--bd);border-radius:10px
     取消认证器
   </div>
 
-  <div class="dr-sec" id="navBleSec">蓝牙模块</div>
+  <div class="dr-sec" id="navLpSec">低功耗无线</div>
   <div class="dr-item" data-page="ble" id="navBle">
     <svg class="dr-svg" viewBox="0 0 24 24" fill="currentColor"><path d="M17.71 7.71L12 2h-1v7.59L6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 11 14.41V22h1l5.71-5.71-4.3-4.29 4.3-4.29zM13 5.83l1.88 1.88L13 9.59V5.83zm1.88 10.46L13 18.17v-3.76l1.88 1.88z"/></svg>
     BLE 扫描
+  </div>
+  <div class="dr-item" data-page="ieee" id="navI154">
+    <span class="dr-glyph" style="font-size:15px">≋</span>
+    802.15.4 扫描
   </div>
 
   <div class="dr-sec">系统</div>
@@ -282,6 +286,7 @@ const state = {
   snifferStatus: { running: false, channel: 6, band: 2, hopping: false, skipDfs: true, total: 0, mgmt: 0, ctrl: 0, data: 0, fps: 0, packets: [] },
   airodumpStatus: { running: false, channel: 1, band: 2, hopping: true, skipDfs: true, aps: [], stations: [] },
   karmaStatus: { running: false, probesCaptured: 0, probesBaited: 0, probes: [] },
+  i154Status: { supported: true, running: false, phase: 'idle', mode: 'frames', channel: 15, hopping: true, durationSec: 0, initFailed: false, total: 0, uptime: 0, panCount: 0, deviceCount: 0, byType: {}, chFrames: [], ed: [], pans: [], devices: [] },
   bleStatus: { supported: true, running: false, phase: 'idle', initFailed: false, continuous: true, durationSec: 0, totalAdv: 0, uptime: 0, deviceCount: 0, devices: [] },
   etCloneSsid: '',  // 邪恶双子页「克隆 SSID」输入框草稿 (页面重建时保留)
   creds: []
@@ -414,6 +419,7 @@ const pages = {
   karma: 'Karma攻击',
   deauth: '取消认证器',
   ble: 'BLE 扫描',
+  ieee: '802.15.4 扫描',
   creds: '捕获的凭据',
   cfg: '配置'
 };
@@ -435,6 +441,7 @@ function go(p) {
   else if (p === 'karma') renderKarma();
   else if (p === 'deauth') renderDeauth();
   else if (p === 'ble') renderBle();
+  else if (p === 'ieee') renderI154();
   else if (p === 'creds') renderCreds();
   else if (p === 'cfg') renderCfg();
 }
@@ -1154,6 +1161,246 @@ function renderBle() {
     } catch (e) { toast('导出失败: ' + e.message); }
   };
   blePaintRows(b.devices);
+}
+
+/* ---------- 802.15.4 扫描 (P3) ---------- */
+const i154Supported = () => !(state.info && state.info.ieee802154 && state.info.ieee802154.supported === false);
+
+function i154PhaseText(s) {
+  if (s.initFailed) return '初始化失败';
+  switch (s.phase) {
+    case 'starting': return '初始化中';
+    case 'running': return '扫描中';
+    case 'stopping': return '停止中';
+    default: return '待命';
+  }
+}
+
+// 802.15.4 信道 11-26 → 中心频率 2405 + 5*(ch-11) MHz
+const i154Freq = ch => 2405 + 5 * (ch - 11);
+// WiFi 2.4G 信道 20MHz 带宽，与 2MHz 的 802.15.4 信道重叠判断
+function i154Overlap(ch, ap) {
+  if (!ap || ap < 1 || ap > 14 || !ch) return false;
+  return Math.abs(i154Freq(ch) - (2407 + 5 * ap)) < 11;
+}
+
+function i154EdBars(s) {
+  const ed = s.ed || [];
+  return Array.from({ length: 16 }, (_, i) => {
+    const ch = 11 + i;
+    const v = ed[i];
+    const known = typeof v === 'number' && v !== 127;
+    const pct = known ? Math.max(0, Math.min(100, Math.round(v + 100))) : 0;
+    const color = !known ? '#ddd' : (v > -55 ? '#d9534f' : (v > -75 ? '#e0a800' : '#35c04a'));
+    const hot = i154Overlap(ch, s.apChannelActive);
+    return `<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:3px">
+      <div title="${known ? v + ' dBm' : '未测量'}" style="height:76px;width:100%;display:flex;align-items:flex-end;background:#f2f2f2;border:2px solid ${hot ? '#d9534f' : '#111'};border-radius:4px">
+        <div style="height:${pct}%;width:100%;background:${color};transition:height .3s"></div>
+      </div>
+      <small style="font-size:10px;font-weight:900">${ch}</small>
+      <small style="font-size:10px;color:#666">${known ? v : '—'}</small>
+    </div>`;
+  }).join('');
+}
+
+function i154PaintPans(list) {
+  const tb = $('#i154PanRows');
+  if (!tb) return;
+  const rows = (list || []).slice().sort((a, b) => (b.frames || 0) - (a.frames || 0));
+  if (!rows.length) {
+    tb.innerHTML = `<tr><td colspan="5" style="text-align:center;color:#888;padding:16px">暂无 PAN — 802.15.4 网络会周期性发送 Beacon</td></tr>`;
+    return;
+  }
+  tb.innerHTML = rows.map(p => `<tr>
+    <td><code style="font-size:12px">${esc(p.panId)}</code></td>
+    <td>${p.channel}</td>
+    <td>${bleRssi(p.rssi)} <small style="color:#888">dBm</small></td>
+    <td>${p.frames || 0}</td>
+    <td style="white-space:nowrap">${bleAge(p.lastSeen)}</td>
+  </tr>`).join('');
+}
+
+function i154PaintDevs(list) {
+  const tb = $('#i154DevRows');
+  if (!tb) return;
+  const rows = (list || []).slice().sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
+  if (!rows.length) {
+    tb.innerHTML = `<tr><td colspan="7" style="text-align:center;color:#888;padding:16px">暂无设备 — 点击「开始扫描」被动接收 802.15.4 帧</td></tr>`;
+    return;
+  }
+  tb.innerHTML = rows.map(d => `<tr>
+    <td><code style="font-size:12px">${esc(d.addr)}</code> <small style="color:#888">${d.short ? '短地址' : '扩展'}</small></td>
+    <td><code style="font-size:12px">${esc(d.panId)}</code></td>
+    <td>${d.channel}</td>
+    <td><span class="status-pill idle" style="font-size:11px">${esc(d.type || '—')}</span></td>
+    <td style="white-space:nowrap">${bleRssi(d.rssi)} <small style="color:#888">dBm</small></td>
+    <td>${d.lqi ?? '—'}</td>
+    <td style="white-space:nowrap">${bleAge(d.lastSeen)}</td>
+  </tr>`).join('');
+}
+
+function i154OverlapNote(s) {
+  const ap = s.apChannelActive || s.apChannel;
+  if (!ap || ap > 14) return `<span style="color:#35c04a;font-weight:800">AP 工作在 5G，与 802.15.4 不同频段</span>`;
+  if (s.hopping) {
+    return `<span style="color:#e67e22;font-weight:800">AP 在 2.4G 信道 ${ap}：跳频会周期性扫过 AP 频段，扫到重叠信道时丢帧明显增多</span>`;
+  }
+  if (i154Overlap(s.channel, ap)) {
+    return `<span style="color:#d9534f;font-weight:800">当前 802.15.4 信道 ${s.channel} 与 AP 信道 ${ap} 重叠，抓包率会明显下降</span>`;
+  }
+  return `<span style="color:#35c04a;font-weight:800">当前 802.15.4 信道 ${s.channel} 与 AP 信道 ${ap} 不重叠</span>`;
+}
+
+function i154Update(s) {
+  if (!s) return;
+  const pill = $('#i154Pill');
+  if (pill) {
+    pill.className = 'status-pill ' + (s.running ? 'run' : 'idle');
+    pill.textContent = s.running ? '● 扫描中' : (s.initFailed ? '✕ 初始化失败' : '○ 待命');
+  }
+  const set = (sel, v) => { const el = $(sel); if (el) el.textContent = v; };
+  set('#i154Total', s.total || 0);
+  set('#i154Pan', s.panCount || 0);
+  set('#i154Dev', s.deviceCount || 0);
+  set('#i154Phase', i154PhaseText(s));
+  const bt = s.byType || {};
+  set('#i154Beacon', bt.beacon || 0);
+  set('#i154Data', bt.data || 0);
+  set('#i154Ack', bt.ack || 0);
+  set('#i154Cmd', bt.cmd || 0);
+  set('#i154Other', bt.other || 0);
+  const ed = $('#i154Ed');
+  if (ed) ed.innerHTML = i154EdBars(s);
+  const ov = $('#i154Overlap');
+  if (ov) ov.innerHTML = i154OverlapNote(s);
+  const bs = $('#btnI154Start'), bp = $('#btnI154Stop'), bc = $('#btnI154Clear'), be = $('#btnI154Export');
+  if (bs) bs.disabled = !i154Supported() || !!s.running || s.phase === 'starting';
+  if (bp) bp.disabled = !i154Supported() || (!s.running && s.phase === 'idle');
+  if (bc) bc.disabled = !i154Supported();
+  if (be) be.disabled = !i154Supported() || !(s.total || 0);
+  ['#i154Mode', '#i154Ch', '#i154Dur'].forEach(sel => { const el = $(sel); if (el) el.disabled = !!s.running; });
+  i154PaintPans(s.pans);
+  i154PaintDevs(s.devices);
+}
+
+function renderI154() {
+  const s = state.i154Status || {};
+  const ok = i154Supported();
+  const startDis = !ok || s.running || s.phase === 'starting';
+  const chOpts = [0, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26].map(ch =>
+    `<option value="${ch}" ${(s.hopping ? ch === 0 : ch === s.channel) ? 'selected' : ''}>${ch === 0 ? '自动跳频 11-26' : '信道 ' + ch + ' (' + i154Freq(ch) + ' MHz)'}</option>`
+  ).join('');
+  $('#view').innerHTML = `
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:10px">
+      <h3 style="margin:0">📶 802.15.4 扫描</h3>
+      <span class="status-pill ${s.running ? 'run' : 'idle'}" id="i154Pill">${s.running ? '● 扫描中' : (s.initFailed ? '✕ 初始化失败' : '○ 待命')}</span>
+    </div>
+    <p class="note">被动接收 IEEE 802.15.4 帧（Zigbee / Thread / 智能家居），解析帧类型、PAN ID、源地址、RSSI / LQI。本页<b>只收不发</b>：promiscuous 模式不发送任何帧、不自动 ACK、不做注入。</p>
+    <div class="note" style="color:#e67e22;font-weight:700">802.15.4 与 WiFi 2.4G 共用同一射频前端：扫描期间 AP 保持在线，但抓包是「分时采样」而非全量，丢帧属正常；需要更高抓包率时请在下方把信道与 AP 错开。</div>
+    ${ok ? '' : `<div class="note" style="color:#d9534f;font-weight:800">本芯片不支持 802.15.4（仅 ESP32-C5 / C6 具备该射频）。</div>`}
+    <div id="i154Overlap" class="note" style="font-size:12px">${ok ? i154OverlapNote(s) : ''}</div>
+    <div class="frow" style="gap:10px;align-items:center;margin:14px 0">
+      <label style="width:auto">模式:</label>
+      <select class="mini" id="i154Mode" style="max-width:150px" ${s.running ? 'disabled' : ''}>
+        <option value="frames" ${s.mode !== 'energy' ? 'selected' : ''}>帧嗅探</option>
+        <option value="energy" ${s.mode === 'energy' ? 'selected' : ''}>能量扫描</option>
+      </select>
+      <label style="width:auto">信道:</label>
+      <select class="mini" id="i154Ch" style="max-width:210px" ${s.running || s.mode === 'energy' ? 'disabled' : ''}>${chOpts}</select>
+      <label style="width:auto">时长:</label>
+      <select class="mini" id="i154Dur" style="max-width:130px" ${s.running ? 'disabled' : ''}>
+        <option value="0" ${!s.durationSec ? 'selected' : ''}>持续</option>
+        <option value="60" ${s.durationSec === 60 ? 'selected' : ''}>60 秒</option>
+        <option value="300" ${s.durationSec === 300 ? 'selected' : ''}>5 分钟</option>
+      </select>
+    </div>
+    <div class="frow" style="gap:10px;align-items:center;margin-bottom:6px">
+      <button class="btn green sm" id="btnI154Start" ${startDis ? 'disabled' : ''}>▶ 开始扫描</button>
+      <button class="btn gray sm" id="btnI154Stop" ${!ok || !s.running ? 'disabled' : ''}>⏹ 停止扫描</button>
+      <button class="btn pink sm" id="btnI154Clear" ${!ok ? 'disabled' : ''}>🗑️ 清空统计</button>
+      <button class="btn gray sm" id="btnI154Export" ${!ok || !(s.total || 0) ? 'disabled' : ''}>⬇ 导出 JSON</button>
+    </div>
+    <div class="diag" style="margin-top:16px">
+      <div class="dg v"><b id="i154Total">${s.total || 0}</b><small>累计帧</small></div>
+      <div class="dg o"><b id="i154Pan">${s.panCount || 0}</b><small>已发现 PAN</small></div>
+      <div class="dg y"><b id="i154Dev">${s.deviceCount || 0}</b><small>已发现设备</small></div>
+      <div class="dg p"><b id="i154Phase">${i154PhaseText(s)}</b><small>引擎状态</small></div>
+    </div>
+  </div>
+  <div class="card">
+    <h3 style="margin:0 0 4px">信道占用（能量检测）</h3>
+    <p class="note" style="font-size:12px;margin:0 0 10px">每轮对 11-26 逐个测量，单位 dBm（越接近 0 越忙）；红框表示与 AP 当前信道重叠。数值为 <code>—</code> 表示该轮尚未测到。</p>
+    <div id="i154Ed" style="display:flex;gap:5px;align-items:flex-end">${i154EdBars(s)}</div>
+    <div class="diag" style="margin-top:14px">
+      <div class="dg v"><b id="i154Beacon">${(s.byType || {}).beacon || 0}</b><small>Beacon</small></div>
+      <div class="dg o"><b id="i154Data">${(s.byType || {}).data || 0}</b><small>Data</small></div>
+      <div class="dg y"><b id="i154Ack">${(s.byType || {}).ack || 0}</b><small>ACK</small></div>
+      <div class="dg p"><b id="i154Cmd">${(s.byType || {}).cmd || 0}</b><small>MAC 命令</small></div>
+      <div class="dg v"><b id="i154Other">${(s.byType || {}).other || 0}</b><small>其他</small></div>
+    </div>
+  </div>
+  <div class="card">
+    <h3 style="margin:0 0 8px">PAN 列表</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>PAN ID</th><th>信道</th><th>RSSI</th><th>帧数</th><th>最后出现</th></tr></thead>
+      <tbody id="i154PanRows"></tbody>
+    </table></div>
+  </div>
+  <div class="card">
+    <h3 style="margin:0 0 8px">设备列表</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>地址</th><th>PAN ID</th><th>信道</th><th>末帧类型</th><th>RSSI</th><th>LQI</th><th>最后出现</th></tr></thead>
+      <tbody id="i154DevRows"></tbody>
+    </table></div>
+  </div>
+  ${legal()}`;
+  if (!ok) return;
+
+  $('#btnI154Start').onclick = async () => {
+    const mode = $('#i154Mode').value;
+    const ch = parseInt($('#i154Ch').value, 10) || 0;
+    const dur = parseInt($('#i154Dur').value, 10) || 0;
+    try {
+      await api('/api/ieee802154/start', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode, channel: mode === 'energy' ? 0 : ch, duration: dur }) });
+      toast('802.15.4 扫描正在启动…');
+      log('[i154] 请求开始' + (mode === 'energy' ? '能量扫描' : '帧嗅探') + ' (' + (ch ? '信道 ' + ch : '跳频 11-26') + ')');
+      state.i154Status.phase = 'starting';
+      i154Update(state.i154Status);
+    } catch (e) { toast('启动失败: ' + e.message); }
+  };
+  $('#btnI154Stop').onclick = async () => {
+    try {
+      await api('/api/ieee802154/stop', { method: 'POST' });
+      toast('802.15.4 扫描正在停止…');
+      log('[i154] 请求停止扫描');
+      state.i154Status.phase = 'stopping';
+      i154Update(state.i154Status);
+    } catch (e) { toast('停止失败: ' + e.message); }
+  };
+  $('#btnI154Clear').onclick = async () => {
+    try {
+      await api('/api/ieee802154/clear', { method: 'POST' });
+      toast('统计与列表已清空');
+      Object.assign(state.i154Status, { total: 0, panCount: 0, deviceCount: 0, pans: [], devices: [], byType: {}, ed: [], chFrames: [] });
+      i154Update(state.i154Status);
+    } catch (e) { toast('清空失败: ' + e.message); }
+  };
+  $('#btnI154Export').onclick = async () => {
+    try {
+      const d = await api('/api/ieee802154/frames');
+      const blob = new Blob([JSON.stringify(d, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'ieee802154-frames.json';
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+      toast('已导出 ' + (d.devices || []).length + ' 个设备');
+      log('[i154] 导出 ' + (d.pans || []).length + ' 个 PAN / ' + (d.devices || []).length + ' 个设备');
+    } catch (e) { toast('导出失败: ' + e.message); }
+  };
+  i154Update(s);
 }
 
 function renderEvilTwin() {
@@ -1916,6 +2163,13 @@ async function pollInfo() {
       if (el) el.style.display = bleChipOk ? '' : 'none';
     });
     if (!bleChipOk && location.hash === '#ble') { go('dash'); return; }
+    // 802.15.4 页同理: 只有 C5/C6 有该射频
+    const i154ChipOk = !(i.ieee802154 && i.ieee802154.supported === false);
+    ['#navI154'].forEach(sel => {
+      const el = $(sel);
+      if (el) el.style.display = i154ChipOk ? '' : 'none';
+    });
+    if (!i154ChipOk && location.hash === '#ieee') { go('dash'); return; }
     $('#up').textContent = fmtUp(i.uptime);
     $('#memBar').style.width = (i.memUsedPct ?? 0) + '%';
     $('#memTxt').textContent = (i.memUsedPct ?? 0) + '%';
@@ -1949,6 +2203,13 @@ async function pollModules() {
       const supportChanged = (state.bleStatus.supported !== false) !== (b.supported !== false);
       state.bleStatus = b;
       if (supportChanged) renderBle(); else bleUpdate(b);
+    }
+    // 轮询 802.15.4 扫描状态: 同样按能力标记决定整页重绘或定向刷新
+    if (location.hash === '#ieee') {
+      const x = await api('/api/ieee802154/status');
+      const supportChanged = (state.i154Status.supported !== false) !== (x.supported !== false);
+      state.i154Status = x;
+      if (supportChanged) renderI154(); else i154Update(x);
     }
     // 轮询 双子攻击 状态: 仅更新状态条与统计, 不重建整页
     if (location.hash === '#eviltwin' && state.info) etUpdateLive();
