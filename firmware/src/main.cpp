@@ -4277,18 +4277,42 @@ void setup() {
   });
 
   // 任务看门狗 (panic 模式): 主循环/空闲任务 60s 未喂狗 → panic 打印各任务 backtrace 后自动重启。
-  // 动机: 真机发现 802.15.4 长时间嗅探后 WiFi/主循环挂死 (无 panic 文本、不复位、热点消失),
-  // TWDT panic 既让设备自愈, 又把挂死现场 (被卡任务的栈) 打到串口供诊断。
+  // 注意 idle_core_mask 只能包含实际存在的核: C5 是单核 (CONFIG_FREERTOS_NUMBER_OF_CORES=1),
+  // 早期写死 (1<<0)|(1<<1) 会被 IDF 判 ESP_ERR_INVALID_ARG, init/reconfigure 双双失败 → TWDT
+  // 从未真正启用却打印"已启用"。改为按核数动态生成, 并如实打印每个返回值/错误码。
   {
     esp_task_wdt_config_t wdtCfg = {};
     wdtCfg.timeout_ms = 60000;
-    wdtCfg.idle_core_mask = (1 << 0) | (1 << 1);  // 两个核的 idle 都监控
+    wdtCfg.idle_core_mask = (1u << portNUM_PROCESSORS) - 1u;  // 单核=0x1, 双核=0x3
     wdtCfg.trigger_panic = true;
-    if (esp_task_wdt_init(&wdtCfg) != ESP_OK) {
-      esp_task_wdt_reconfigure(&wdtCfg);   // Arduino 已初始化过 (5s, 无 panic) → 重配置为 60s + panic
+    esp_err_t wdtErr = esp_task_wdt_init(&wdtCfg);
+    if (wdtErr == ESP_ERR_INVALID_STATE) {
+      // Arduino 核心已初始化过 TWDT (短超时/无 panic) → 重配置为 60s + panic
+      wdtErr = esp_task_wdt_reconfigure(&wdtCfg);
     }
-    esp_task_wdt_add(nullptr);    // 订阅当前任务 (loopTask)
-    Serial.println("[wdt] 任务看门狗已启用 (60s panic 模式)");
+    esp_err_t addErr = esp_task_wdt_add(nullptr);   // 订阅当前任务 (loopTask)
+    if (wdtErr == ESP_OK && addErr == ESP_OK) {
+      Serial.printf("[wdt] 已启用 (60s panic, idle_mask=0x%X cores=%d)\n",
+                    (unsigned)wdtCfg.idle_core_mask, (int)portNUM_PROCESSORS);
+    } else {
+      Serial.printf("[wdt] 启用失败! init/reconfigure err=0x%X add err=0x%X (panic 自愈不可用)\n",
+                    (unsigned)wdtErr, (unsigned)addErr);
+    }
+  }
+
+  // 诊断自检: coredump 分区 + flash 容量 + WDT 订阅状态 (解释启动期 "No core dump partition found")
+  {
+    const esp_partition_t *cd = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_COREDUMP, NULL);
+    if (cd) {
+      Serial.printf("[diag] coredump 分区: label=%s off=0x%X size=0x%X\n", cd->label,
+                    (unsigned)cd->address, (unsigned)cd->size);
+    } else {
+      Serial.println("[diag] coredump 分区: 未找到 (esp_partition_find_first 返回 NULL)");
+    }
+    Serial.printf("[diag] flash 容量(SDK)=%u bytes, WDT 订阅状态=0x%X (0=已订阅)\n",
+                  (unsigned)ESP.getFlashChipSize(),
+                  (unsigned)esp_task_wdt_status(nullptr));
   }
 
   Serial.println();
