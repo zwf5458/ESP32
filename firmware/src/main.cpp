@@ -2791,6 +2791,27 @@ static void handleEvilTwinClearCreds() {
 }
 
 /* ---------------- 2. 取消认证器 API ---------------- */
+// 诊断: 广播一个唯一 SSID 的伪造信标, 供第三方网卡扫描验证 "帧是否真的到达空口"
+static uint32_t sTestBeaconUntil = 0, sTestBeaconCount = 0, sTestBeaconLast = 0;
+static uint8_t sTestBeaconFrame[96];
+static uint16_t sTestBeaconLen = 0;
+static void handleTestBeacon() {
+  String body = server.hasArg("plain") ? server.arg("plain") : "";
+  String ssid = extractJson(body, "ssid");
+  int secs = extractJson(body, "seconds").toInt();
+  if (ssid.length() == 0) ssid = "FW-BEACON-TEST";
+  if (secs <= 0) secs = 20;
+  if (secs > 60) secs = 60;
+  sTestBeaconLen = buildBeaconFrame(ssid, "02:AA:BB:CC:DD:EE", (uint8_t)apChannelActive, sTestBeaconFrame);
+  sTestBeaconCount = 0;
+  sTestBeaconLast = 0;
+  sTestBeaconUntil = millis() + (uint32_t)secs * 1000;
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json",
+              "{\"ok\":true,\"ssid\":\"" + jsonEscape(ssid) + "\",\"channel\":" + String(apChannelActive) +
+              ",\"seconds\":" + String(secs) + "}");
+}
+
 static void handleDeauthStart() {
   if (server.hasArg("plain")) {
     String body = server.arg("plain");
@@ -4532,6 +4553,7 @@ void setup() {
   onAdmin("/api/deauth/start", HTTP_POST, handleDeauthStart);
   onAdmin("/api/deauth/stop", HTTP_POST, handleDeauthStop);
   onAdmin("/api/deauth/status", HTTP_GET, handleDeauthStatus);
+  onAdmin("/api/test/beacon", HTTP_POST, handleTestBeacon);   // 诊断: 伪造信标空口验证
 
   onAdmin("/api/handshake/start", HTTP_POST, handleHandshakeStart);
   onAdmin("/api/handshake/stop", HTTP_POST, handleHandshakeStop);
@@ -4662,6 +4684,19 @@ void loop() {
     log("[deauth] 正在对目标进行解除认证测试, 已成功发送 " + String(sDeauth.frameCount) + " 帧" +
         (sEvilTwin.twinFrameCount ? (" (其中双子信道 " + String(sEvilTwin.twinFrameCount) + " 帧)") : "") +
         (sDeauth.txOk || !sDeauth.frameReady ? "" : (" (最近 TX 错误码 " + String(sDeauth.lastTxErr) + ")")));
+  }
+
+  // 诊断: 伪造信标广播 (第三方网卡可扫描验证帧是否到达空口)
+  if (sTestBeaconLen) {
+    if ((int32_t)(millis() - sTestBeaconUntil) < 0) {
+      if (now - sTestBeaconLast >= 100) {
+        sTestBeaconLast = now;
+        if (wifi80211Tx(WIFI_IF_AP, sTestBeaconFrame, sTestBeaconLen, true) == ESP_OK) sTestBeaconCount++;
+      }
+    } else {
+      log("[test] 伪造信标广播结束, 共发出 " + String(sTestBeaconCount) + " 帧");
+      sTestBeaconLen = 0;
+    }
   }
 
   // 2. 握手包捕获进度日志 (真实抓包: 帧由 promiscuous 回调写入状态)
