@@ -110,6 +110,16 @@ static uint32_t sLogId   = 0;     // 单调递增
 
 static String jsonEscape(const String &in);   // 前置声明 (emitJson/log 需要)
 
+// USB CDC (HWCDC) 背压防护: 主机端口真正连接时才允许串口输出, 且 TX 环形缓冲空闲量足够。
+// 真机事故 (coredump 双次实证): 端口打开但主机不读取 (背压) 或端口刚关闭的标志翻转窗口,
+// HWCDC::write 每行最多阻塞 ~2s (20×100ms 封顶); WiFi 事件风暴 (软 AP 重启/收尾) 下
+// 单次 handleClient 内累计 >60s 不喂 TWDT → panic 重启 (TWDT 救活并留了 coredump)。
+// isConnected 为假时整行丢弃 — 循环日志/遥测/网页均不受影响, 串口恢复后新日志照常。
+static bool serialSafe(size_t len) {
+  if (!Serial.isConnected()) return false;
+  return (size_t)Serial.availableForWrite() >= len + 1;   // +1 给 println 的换行
+}
+
 /* ---------------- Serial JSON 遥测 (NDJSON, 只读镜像) ---------------- */
 // 统一事件发射: 串口输出一行 {"v":1,"ts":...,"event":...,<fields>}
 // fields 需为已拼好的合法 JSON 片段 (不含最外层花括号), 例如 "\"clients\":2"
@@ -118,7 +128,7 @@ static void emitJson(const String &event, const String &fields) {
   String out = "{\"v\":1,\"ts\":" + String(millis()) + ",\"event\":\"" + event + "\"";
   if (fields.length()) out += "," + fields;
   out += "}";
-  Serial.println(out);
+  if (serialSafe(out.length())) Serial.println(out);
 }
 
 // 教学模块状态遥测: 只发模块名与 running 布尔, 不携带任何敏感载荷
@@ -128,7 +138,7 @@ static void emitLabState(const char *module, bool running) {
 }
 
 static void log(const String &line) {
-  Serial.println(line);
+  if (serialSafe(line.length())) Serial.println(line);
   LogEntry &e = sLogs[sLogHead];
   e.id = ++sLogId;
   strlcpy(e.line, line.c_str(), sizeof(e.line));
