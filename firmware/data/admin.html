@@ -1131,8 +1131,9 @@ function paintCreds() {
       <td class="mono">${c.id}</td>
       <td class="mono">${esc(c.mac)}</td>
       <td><b style="color:#d9534f;font-size:15px" class="mono">${esc(c.pass)}</b></td>
+      <td>${c.verified ? '<b style="color:#35c04a">✓ 已验真</b>' : '<span style="color:#8a7f6d">未校验</span>'}</td>
       <td>${esc(c.time)}</td>
-    </tr>`).join('') : `<tr><td colspan="4" style="text-align:center;padding:16px;color:#888">暂无捕获凭据 (等待目标连接假热点并在认证页输入密码)</td></tr>`;
+    </tr>`).join('') : `<tr><td colspan="5" style="text-align:center;padding:16px;color:#888">暂无捕获凭据 (等待目标连接假热点并在认证页输入密码)</td></tr>`;
 }
 /* ---------- 邪恶双子: 实时统计 (定点更新, 不重建整页) ---------- */
 function etFmtDur(ms) {
@@ -1700,6 +1701,9 @@ function renderEvilTwin() {
              style="flex:1;padding:8px 10px;border:var(--bd);border-radius:10px;font-weight:800;background:#fff">
     </div>
     <div class="sub" style="font-size:12px;color:#8a7f6d">可显式覆盖克隆热点名称；留空则自动与主目标 SSID 完全一致（推荐，受害设备更难分辨）。最长 32 字节。</div>
+    <div class="sub" style="font-size:12px;margin-top:8px">密码验真：${hs.verifiable
+      ? '<b style="color:#35c04a">已具备</b> — 已抓到该网络完整 M1/M2，门户里输入的假密码会被打回要求重输，只有真密码才入库'
+      : '未具备 — 请先在本页「握手包捕获」对目标抓一次 M1/M2，否则门户只能记录、无法判断密码真假'}</div>
   </div>
 
   <div class="card solid-orange">
@@ -2262,11 +2266,12 @@ function updateCredsUI() {
         <td><b style="color:#d9534f">${esc(state.info?.evilTwin?.cloneSsid || state.target?.ssid || 'WiFi-AP')}</b></td>
         <td class="mono small">${esc(c.mac)}</td>
         <td><b class="mono" style="font-size:16px;background:#111;color:#ffe14d;padding:2px 8px;border-radius:6px">${esc(c.pass)}</b></td>
+        <td>${c.verified ? '<b style="color:#35c04a">✓ 已验真</b>' : '<span style="color:#8a7f6d">未校验</span>'}</td>
         <td>${esc(c.time)}</td>
         <td>
           <button class="tbtn" onclick="copyPass('${esc(c.pass)}')">📋 复制</button>
         </td>
-      </tr>`).join('') : `<tr><td colspan="6" style="text-align:center;padding:24px;color:#888">暂无捕获凭据 (受测端连接克隆热点并在认证门户提交密码后，将在此实时显示)</td></tr>`;
+      </tr>`).join('') : `<tr><td colspan="7" style="text-align:center;padding:24px;color:#888">暂无捕获凭据 (受测端连接克隆热点并在认证门户提交密码后，将在此实时显示)</td></tr>`;
   }
 }
 
@@ -2303,9 +2308,9 @@ function renderCreds() {
     <h3>📋 捕获凭据明细记录</h3>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>ID</th><th>仿冒/目标网络 (SSID)</th><th>受害端 IP / MAC</th><th>捕获密码</th><th>捕获时间</th><th>操作</th></tr></thead>
+        <thead><tr><th>ID</th><th>仿冒/目标网络 (SSID)</th><th>受害端 IP / MAC</th><th>捕获密码</th><th>验真</th><th>捕获时间</th><th>操作</th></tr></thead>
         <tbody id="credsTableBody">
-          <tr><td colspan="6" style="text-align:center;padding:20px;color:#888">读取凭据列表中…</td></tr>
+          <tr><td colspan="7" style="text-align:center;padding:20px;color:#888">读取凭据列表中…</td></tr>
         </tbody>
       </table>
     </div>
