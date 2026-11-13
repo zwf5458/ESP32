@@ -2868,7 +2868,10 @@ static void handleEvilTwinClearCreds() {
 /* ---------------- 2. 取消认证器 API ---------------- */
 // 诊断: 广播一个唯一 SSID 的伪造信标, 供第三方网卡扫描验证 "帧是否真的到达空口"
 static uint32_t sTestBeaconUntil = 0, sTestBeaconCount = 0, sTestBeaconLast = 0;
-static uint8_t sTestBeaconFrame[96];
+static uint32_t sTestBeaconErr = 0;
+static int32_t sTestBeaconLastErr = 0;
+static int sTestBeaconIface = 0;   // 0=AP 接口, 1=STA 接口 (诊断发送路径差异)
+static uint8_t sTestBeaconFrame[128];
 static uint16_t sTestBeaconLen = 0;
 static void handleTestBeacon() {
   String body = server.hasArg("plain") ? server.arg("plain") : "";
@@ -2877,14 +2880,18 @@ static void handleTestBeacon() {
   if (ssid.length() == 0) ssid = "FW-BEACON-TEST";
   if (secs <= 0) secs = 20;
   if (secs > 60) secs = 60;
+  sTestBeaconIface = extractJson(body, "iface").toInt() == 1 ? 1 : 0;
   sTestBeaconLen = buildBeaconFrame(ssid, "02:AA:BB:CC:DD:EE", (uint8_t)apChannelActive, sTestBeaconFrame);
   sTestBeaconCount = 0;
+  sTestBeaconErr = 0;
+  sTestBeaconLastErr = 0;
   sTestBeaconLast = 0;
   sTestBeaconUntil = millis() + (uint32_t)secs * 1000;
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json",
               "{\"ok\":true,\"ssid\":\"" + jsonEscape(ssid) + "\",\"channel\":" + String(apChannelActive) +
-              ",\"seconds\":" + String(secs) + "}");
+              ",\"seconds\":" + String(secs) + ",\"iface\":\"" +
+              String(sTestBeaconIface ? "sta" : "ap") + "\"}");
 }
 
 static void handleDeauthStart() {
@@ -4768,10 +4775,16 @@ void loop() {
     if ((int32_t)(millis() - sTestBeaconUntil) < 0) {
       if (now - sTestBeaconLast >= 100) {
         sTestBeaconLast = now;
-        if (wifi80211Tx(WIFI_IF_AP, sTestBeaconFrame, sTestBeaconLen, true) == ESP_OK) sTestBeaconCount++;
+        esp_err_t e = esp_wifi_80211_tx(sTestBeaconIface ? WIFI_IF_STA : WIFI_IF_AP,
+                                        sTestBeaconFrame, sTestBeaconLen, true);
+        sTestBeaconLastErr = (int32_t)e;
+        if (e == ESP_OK) sTestBeaconCount++;
+        else sTestBeaconErr++;
       }
     } else {
-      log("[test] 伪造信标广播结束, 共发出 " + String(sTestBeaconCount) + " 帧");
+      log("[test] 伪造信标广播结束 (" + String(sTestBeaconIface ? "STA" : "AP") + " 接口): ok=" +
+          String(sTestBeaconCount) + " err=" + String(sTestBeaconErr) +
+          " lastErr=0x" + String((uint32_t)sTestBeaconLastErr, HEX));
       sTestBeaconLen = 0;
     }
   }
