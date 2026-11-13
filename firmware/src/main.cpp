@@ -4425,9 +4425,10 @@ void loop() {
           sDeauth.txOk = (sDeauth.lastTxErr == ESP_OK);
           if (sDeauth.txOk) sDeauth.frameCount++;
           else if (sDeauth.lastTxErr == 258 && !sDeauth.platformBlocked) {
-            // 自检测: C5 WiFi 库白名单拒绝 → 标记平台限制 (双子场景首次触发时避免静默空转)
+            // 自检测: C5 WiFi 库白名单拒绝 → 停止引擎 (否则驱动 unsupport frame type 刷屏且空转)
             sDeauth.platformBlocked = true;
             log("[deauth] 平台限制: 本芯片 WiFi 库拒绝 Deauth 帧注入 (错误码 258), 帧注入停用");
+            stopDeauthEngine();
           }
         }
       }
