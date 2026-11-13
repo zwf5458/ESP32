@@ -614,20 +614,91 @@ static bool csaPrepare(const String &ssid, const String &bssid, uint8_t curCh) {
   return sDeauth.csaBeaconLen > 0;
 }
 
+// 国家信道计划: 默认 "01"(world) 的 5G 可用信道极少 (不含 149-165), 对 5G 高信道做
+// AP 切换 / 帧注入会返回 0x102 (ESP_ERR_INVALID_ARG)。显式设为 CN:
+// 2.4G 1-13 + 5G 36-64 / 149-165, 覆盖国内路由常用频段。
+static void applyWifiCountry() {
+  wifi_country_t c = {};
+  memcpy(c.cc, "CN", 2);
+  c.schan = 1;
+  c.nchan = 13;
+  c.max_tx_power = 20;
+  c.policy = WIFI_COUNTRY_POLICY_MANUAL;
+  esp_err_t e = esp_wifi_set_country(&c);
+  log("[wifi] 国家信道计划 CN (2.4G 1-13 / 5G 36-64,149-165) err=0x" +
+      String((uint32_t)e, HEX));
+}
+
+// 前置声明: 射频重启后需按当前模块状态恢复 promiscuous 过滤
+static bool syncPromiscuousEngine();
+
+// 跨频段切换 (2.4G ↔ 5G) 或软 AP 运行中切不过去时的硬重配:
+// 停射频 → 重启 → 切频段模式 → 写 AP 信道 → 切信道。SSID/密码/网关不变,
+// 客户端短暂掉线后在新频段重连; 失败可断电/复位回落到 NVS 里的 2.4G 配置。
+// 顺序有讲究: 停射频后调 esp_wifi_set_band_mode 返回 ESP_ERR_WIFI_NOT_STARTED (0x3002),
+// 必须在 esp_wifi_start() 之后再切频段, 否则 5G 信道仍被拒 (0x102)。
+static bool reconfigApChannelHard(uint8_t ch) {
+  wifi_config_t cfg;
+  if (esp_wifi_get_config(WIFI_IF_AP, &cfg) != ESP_OK) return false;
+  cfg.ap.channel = ch;
+  // 顺序很关键: 停射频 → 重启 (此时才能改频段) → 切频段 → 写 AP 信道 → 切信道
+  const esp_err_t stopErr = esp_wifi_stop();
+  const esp_err_t startErr = esp_wifi_start();
+#if defined(SOC_WIFI_SUPPORT_5G) && SOC_WIFI_SUPPORT_5G
+  const esp_err_t bandErr =
+      esp_wifi_set_band_mode(isBand5G(ch) ? WIFI_BAND_MODE_5G_ONLY : WIFI_BAND_MODE_2G_ONLY);
+#else
+  const esp_err_t bandErr = ESP_OK;   // 单频芯片无需切频段模式
+#endif
+  const esp_err_t cfgErr = esp_wifi_set_config(WIFI_IF_AP, &cfg);
+  esp_err_t chErr = esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+  uint8_t cur = 0;
+  wifi_second_chan_t sec;
+  bool onCh = (esp_wifi_get_channel(&cur, &sec) == ESP_OK && cur == ch);
+  if (!onCh) {   // 有些驱动版本在 AP 重启后才接受目标信道, 再试一次
+    chErr = esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    onCh = (esp_wifi_get_channel(&cur, &sec) == ESP_OK && cur == ch);
+  }
+  log("[rf] 硬重配信道 " + String(ch) + (isBand5G(ch) ? " (5G)" : " (2.4G)") +
+      ": stop=0x" + String((uint32_t)stopErr, HEX) + " start=0x" + String((uint32_t)startErr, HEX) +
+      " band=0x" + String((uint32_t)bandErr, HEX) + " cfg=0x" + String((uint32_t)cfgErr, HEX) +
+      " ch=0x" + String((uint32_t)chErr, HEX) + " -> ch=" + String(cur));
+  if (stopErr == ESP_OK && startErr == ESP_OK && cfgErr == ESP_OK && onCh) {
+    apChannelActive = ch;
+    syncPromiscuousEngine();   // 射频重启会清掉 promiscuous 过滤, 按需恢复
+    return true;
+  }
+  return false;
+}
+
 // 临时切换 AP 空口信道到 ch (不修改 NVS 配置); 成功返回 true。ch 支持 2.4G(1-14) 与 5G(32-177, 仅双频芯片)。
 // 目的: 单射频只能在本机信道上发帧 → 先对齐目标信道, Deauth 才能真实到达目标。
 // 副作用: 已连热点的受测设备会短暂掉线 (未发 CSA 公告), 重新扫描后自动重连, Captive Portal 仍生效。
 static bool applyApChannel(uint8_t ch) {
   if (ch < 1 || ch > 177) return false;
   if (ch == apChannelActive) return true;
+#if defined(SOC_WIFI_SUPPORT_5G) && SOC_WIFI_SUPPORT_5G
+  // C5 双频: 跨频段切信道必须先切频段模式, 否则 ch>14 直接返回 ESP_ERR_INVALID_ARG。
+  esp_wifi_set_band_mode(isBand5G(ch) ? WIFI_BAND_MODE_5G_ONLY : WIFI_BAND_MODE_2G_ONLY);
+#endif
   esp_err_t err = esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
   if (err != ESP_OK) {
-    // 失败原因留证 (软 AP 运行时切信道被拒的根因定位): 只在失败时打, 不刷屏
-    log("[rf] 切换信道 " + String(ch) + " 失败 (err=0x" + String((uint32_t)err, HEX) + ")");
-    return false;
+    // 软 AP 默认 HT40 运行时带固定副信道 (如 ch6 的副信道是 ch10), 直接单信道切换会被
+    // 驱动拒绝 (ESP_FAIL)。先降到 HT20 再切, 成功率最高且不重启 AP。
+    esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
+    err = esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
   }
-  apChannelActive = ch;
-  return true;
+  uint8_t cur = 0;
+  wifi_second_chan_t sec;
+  if (err == ESP_OK && esp_wifi_get_channel(&cur, &sec) == ESP_OK && cur == ch) {
+    apChannelActive = ch;
+    return true;
+  }
+  // 兜底: 停射频后重配频段与 AP 信道再启动 (跨 2.4G/5G 只能走这条路)
+  if (reconfigApChannelHard(ch)) return true;
+  // 失败原因留证 (软 AP 运行时切信道被拒的根因定位): 只在失败时打, 不刷屏
+  log("[rf] 切换信道 " + String(ch) + " 失败 (err=0x" + String((uint32_t)err, HEX) + ")");
+  return false;
 }
 
 /* ---------------- 3. 握手包捕获与离线弱口令跑包 (Handshake & Crack) ----------------
@@ -4065,6 +4136,7 @@ static void restartWifiAp() {
   delay(200);
   esp_wifi_start();
   WiFi.mode(WIFI_AP_STA);
+  applyWifiCountry();   // 射频重启后国家信道计划会回默认, 必须重新应用
   if (!WiFi.softAP(apSsid.c_str(), AP_PASSWORD, apChannel, false, 4)) {
     log("[wifi] 重启后 softAP 启动失败, 将重试 …");
     delay(2000);
@@ -4474,6 +4546,7 @@ void setup() {
 
   WiFi.persistent(false);
   WiFi.mode(WIFI_AP_STA);
+  applyWifiCountry();   // 默认 world 计划不含 5G 149-165, 会让 5G 目标无法切信道
 
   sPrefs.begin("esp32-cfg", false);
   apChannel = sPrefs.getUChar("channel", AP_CHANNEL_DEFAULT);
