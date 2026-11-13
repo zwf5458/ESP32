@@ -1199,9 +1199,12 @@ static bool startSoftApOnChannel(const String &ssid, const char *pass, uint8_t c
                                  int hidden, uint8_t maxConn) {
   if (!isValidApChannel(ch)) return false;
 #if defined(SOC_WIFI_SUPPORT_5G) && SOC_WIFI_SUPPORT_5G
-  // 5G AP 带宽统一 HT20: 与目标 AP 带宽不一致时部分手机会拒绝关联
-  esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
+  // 顺序必须是「先切频段模式, 再设带宽」: 默认 band mode 为 AUTO 时
+  // esp_wifi_set_bandwidth 直接报错 ("can not set wifi Bandwidth under WiFi band mode AUTO"),
+  // 带宽会留在驱动默认值, 单信道切换/5G 驻留更容易失败。
   esp_wifi_set_band_mode(isBand5G(ch) ? WIFI_BAND_MODE_5G_ONLY : WIFI_BAND_MODE_2G_ONLY);
+  // AP 带宽统一 HT20: 与目标 AP 带宽不一致时部分手机会拒绝关联
+  esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
 #endif
   const String useSsid = ssid.length() ? ssid : apSsid;
   if (!WiFi.softAP(useSsid.c_str(), pass, ch, hidden, maxConn)) return false;
