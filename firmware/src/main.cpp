@@ -43,6 +43,12 @@
 #include "mbedtls/md.h"         // PBKDF2-HMAC-SHA1 / HMAC-SHA1 / HMAC-MD5 (板载跑包)
 #include "sdkconfig.h"          // CONFIG_IEEE802154_ENABLED: 802.15.4 组件是否编入框架
 
+/* 解除 802.11 raw 注入的帧类型白名单。
+ * C5 的 libnet80211 在 esp_wifi_80211_tx 前调用本函数校验帧, 对 Deauth(0xC0)/Disassoc(0xA0)
+ * 打印 "unsupport frame type" 并返回 258 (ESP_ERR_INVALID_ARG), 导致远程压制完全无效。
+ * 该符号为库内弱校验函数, 覆盖后返回 0 (放行) 即可发送任意管理帧 —— ESP32 Marauder 同法。 */
+extern "C" int ieee80211_raw_frame_sanity_check(int32_t, int32_t, int32_t) { return 0; }
+
 /* BLE 能力门控 (P2): 芯片需有 BLE 硬件, 且本构建未被显式裁剪。
  * 经典 ESP32 例外 —— 它的 BLE 走 Bluedroid (比 NimBLE 多约 810KB), 与 min_spiffs 的
  * 双 app 槽 (三系统引导 esp_ota_set_boot_partition 依赖) 在 4MB Flash 上无法共存,
