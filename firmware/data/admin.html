@@ -1714,6 +1714,11 @@ function renderEvilTwin() {
       <button class="btn red" id="btnStopET" ${!active ? 'disabled' : ''}>⏹ 停止</button>
       <a class="btn yellow" href="/portal.html" target="_blank" rel="noopener">👁 预览钓鱼门户</a>
     </div>
+    <div class="sub" style="font-size:12px;color:#a08a4a;margin:-4px 0 10px;line-height:1.5">
+      ⚠ 发起瞬间热点会改名为目标 SSID, 管理连接会断开 (属预期) — 重新连接该开放热点即可继续管理。
+      本芯片 Deauth 帧注入受平台限制 (自动跳过压制组件), 克隆热点 + 门户 + 凭据捕获链路完整可用;
+      但受害设备不会被强制踢离真实网络, 需其在扫描时手动接入克隆热点才会进入门户。
+    </div>
     ${active ? `<div class="sub" style="font-size:13px;margin-bottom:12px" id="etLive">${etLiveHtml(et, de, state.info?.clients)}</div>` : ''}
     <div class="diag">
       <div class="dg v"><b id="etElapsed">${etFmtDur(et.elapsedMs)}</b><small>运行时长</small></div>
@@ -1839,6 +1844,16 @@ function renderEvilTwin() {
     try {
       await api('/api/eviltwin/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cloneSsid, template }) });
     } catch (e) {
+      // 软 AP 改名会踢断管理连接, 成功响应常送不回 (Failed to fetch 属预期路径之一):
+      // 等 2.5s 后轮询真实状态 — 攻击已激活则按成功处理, 否则才报失败
+      await new Promise(r => setTimeout(r, 2500));
+      await pollInfo();
+      if (state.info && state.info.evilTwin && state.info.evilTwin.active) {
+        toast('攻击已发起: 热点已切换为克隆 SSID (管理连接被断开属预期, 需重连克隆热点)');
+        log('[eviltwin] 攻击已发起, 等待目标设备接入钓鱼热点…', 't-ok');
+        renderEvilTwin();
+        return;
+      }
       let msg = e.message; try { msg = JSON.parse(e.message).error || msg; } catch (_) {}
       toast('发起失败: ' + msg); log('[eviltwin] 发起失败: ' + msg, 't-warn');
       return;
