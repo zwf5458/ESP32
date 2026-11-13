@@ -5,10 +5,12 @@
 关键: 死亡仅在 '端口打开过再关闭' 时发生, 所以攻击发起后再次短暂开/关端口 (模拟用户用完串口),
 然后完全关闭串口, 纯 WiFi 扫描监控 4 分钟: 克隆热点消失且原热点重现 = 重启。
 """
-import serial, time, subprocess, sys, json, urllib.request, threading
+import serial, time, subprocess, sys, json, urllib.request, threading, os
 
 sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
-HDR = {"X-Admin-Token": "LijxuqEkT5Wk", "Content-Type": "application/json"}
+# 默认 admin888 (固件初始口令期的万能口令, 重刷后稳定可用); 正式设备可用 ADMIN_TOKEN 环境变量覆盖
+TOKEN = os.environ.get("ADMIN_TOKEN", "admin888")
+HDR = {"X-Admin-Token": TOKEN, "Content-Type": "application/json"}
 MODE = sys.argv[1] if len(sys.argv) > 1 else "twin"
 CLONE = "Bisect-ET" if MODE == "twin" else "Bisect-NoTwin"
 
