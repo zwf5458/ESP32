@@ -398,6 +398,24 @@ function showLogin(msg) {
   }
   if (msg) { const m = $('#loginMsg'); if (m) m.textContent = msg; }
 }
+// 改名断连引导: 独立 body 节点, 不受 #view 重绘影响, 不依赖网络响应。
+function etModal(title, bodyHtml) {
+  let mask = $('#etGuideMask');
+  if (!mask) {
+    mask = document.createElement('div');
+    mask.id = 'etGuideMask';
+    mask.style.cssText = 'position:fixed;inset:0;z-index:9998;background:#0009;display:none;align-items:center;justify-content:center;padding:20px;overflow:auto';
+    document.body.appendChild(mask);
+  }
+  mask.innerHTML = `<div class="card" style="max-width:520px;width:100%;margin:0">
+    <h3 style="font-size:16px;margin:0 0 10px">${title}</h3>
+    <div class="note" style="text-align:left;line-height:1.7;font-size:13px">${bodyHtml}</div>
+    <div class="note mono" style="margin-top:10px;font-size:12px">管理页: http://192.168.4.1/admin.html (原口令登录, 不会被钓鱼页劫持)</div>
+    <button class="btn green" id="etMOk" style="width:100%;margin-top:12px">知道了</button>
+  </div>`;
+  mask.style.display = 'flex';
+  $('#etMOk').onclick = () => { mask.style.display = 'none'; };
+}
 function log(line, cls = '') {
   const c = $('#logc'); if (!c) return;
   const d = new Date(), ts = `[${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}]`;
@@ -1715,9 +1733,8 @@ function renderEvilTwin() {
       <a class="btn yellow" href="/portal.html" target="_blank" rel="noopener">👁 预览钓鱼门户</a>
     </div>
     <div class="sub" style="font-size:12px;color:#a08a4a;margin:-4px 0 10px;line-height:1.5">
-      ⚠ 发起瞬间热点会改名为目标 SSID, 管理连接会断开 (属预期) — 重新连接该开放热点即可继续管理。
-      本芯片 Deauth 帧注入受平台限制 (自动跳过压制组件), 克隆热点 + 门户 + 凭据捕获链路完整可用;
-      但受害设备不会被强制踢离真实网络, 需其在扫描时手动接入克隆热点才会进入门户。
+      ⚠ 发起/停止都会令热点改名、连接断开 (属预期, <b>不是死机</b>), 点按钮弹重连引导。
+      Deauth 注入受芯片平台限制 (自动跳过), 受害设备需手动接入克隆热点才会进门户。
     </div>
     ${active ? `<div class="sub" style="font-size:13px;margin-bottom:12px" id="etLive">${etLiveHtml(et, de, state.info?.clients)}</div>` : ''}
     <div class="diag">
@@ -1837,35 +1854,43 @@ function renderEvilTwin() {
   const cloneInput = $('#etCloneSsid');
   if (cloneInput) cloneInput.oninput = (e) => { state.etCloneSsid = e.target.value; };
 
+  const etName = () => (state.etCloneSsid || '').trim() || state.target?.ssid || '与主目标同名';
   $('#btnStartET').onclick = async () => {
     const cloneSsid = (state.etCloneSsid || '').trim();
     if (cloneSsid.length > 32) { toast('克隆 SSID 最长 32 字节'); return; }
     const template = parseInt($('#etTpl').value) || 1;
+    const name = esc(etName());
+    let respOk = false, bizErr = '';
     try {
       await api('/api/eviltwin/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cloneSsid, template }) });
+      respOk = true;
     } catch (e) {
-      // 软 AP 改名会踢断管理连接, 成功响应常送不回 (Failed to fetch 属预期路径之一):
-      // 等 2.5s 后轮询真实状态 — 攻击已激活则按成功处理, 否则才报失败
-      await new Promise(r => setTimeout(r, 2500));
-      await pollInfo();
-      if (state.info && state.info.evilTwin && state.info.evilTwin.active) {
-        toast('攻击已发起: 热点已切换为克隆 SSID (管理连接被断开属预期, 需重连克隆热点)');
-        log('[eviltwin] 攻击已发起, 等待目标设备接入钓鱼热点…', 't-ok');
-        renderEvilTwin();
-        return;
-      }
-      let msg = e.message; try { msg = JSON.parse(e.message).error || msg; } catch (_) {}
-      toast('发起失败: ' + msg); log('[eviltwin] 发起失败: ' + msg, 't-warn');
+      // 前置校验失败时不调用 softAP、连接不断、能正常返回 4xx; 其余断连/超时 = 改名已执行 = 发起成功。
+      let msg = e.message || '';
+      try { const j = JSON.parse(msg); if (j && j.error) bizErr = j.error; } catch (_) {}
+      if (!bizErr && !/Failed to fetch|NetworkError|timeout|超时|Load failed|aborted/i.test(msg)) bizErr = msg;
+    }
+    if (!respOk && bizErr) {
+      toast('发起失败: ' + bizErr); log('[eviltwin] 发起失败: ' + bizErr, 't-warn');
       return;
     }
-    toast(cloneSsid ? '攻击已发起: 克隆热点「' + cloneSsid + '」' : '攻击已发起: 同名克隆热点 + 双频段压制');
-    log('[eviltwin] 攻击已发起, 等待目标设备接入钓鱼热点…', 't-ok');
-    await pollInfo(); renderEvilTwin();
+    toast('攻击已发起: 热点已切换为克隆 SSID');
+    log('[eviltwin] 攻击已发起, 克隆热点=' + etName() + ' (开放), 等待目标接入…', 't-ok');
+    etModal('⚡ 攻击已发起 · 热点改名属预期', `
+      热点已从 <b>WiFi-12F9</b> 改名为 <b style="color:#d9534f">${name}</b> (开放无密码),
+      当前管理连接会<b>立刻断开、原热点名消失</b> —— <b>不是死机</b>, 设备一直在运行。<br><br>
+      ① 在 Wi-Fi 列表连接 <b>${name}</b> (无需密码);<br>
+      ② 系统自动弹出的「需登录」页是给受害设备看的<b>钓鱼门户</b>, 可关闭;<br>
+      ③ 用下方地址进管理页, 点「停止实验」即可恢复 WiFi-12F9。`);
   };
   $('#btnStopET').onclick = async () => {
-    await api('/api/eviltwin/stop', { method: 'POST' });
-    toast('攻击已停止, 原热点已恢复');
-    await pollInfo(); renderEvilTwin();
+    // 停止时 AP 改回原名, 连接同样被踢断, 响应通常送不回 → 不当作错误
+    try { await api('/api/eviltwin/stop', { method: 'POST' }); } catch (e) {}
+    toast('攻击已停止, 原热点恢复中');
+    log('[eviltwin] 攻击已停止, 原热点恢复中 (需重连)…', 't-ok');
+    etModal('⏹ 攻击已停止 · 请重连原热点', `
+      热点正改回 <b>WiFi-12F9</b> (密码 00000000), 当前连接会再次断开, 属预期。<br>
+      请重新连接 <b>WiFi-12F9</b>, 再打开下方管理页地址。`);
   };
 
   $('#btnEtHsStart').onclick = async () => {
