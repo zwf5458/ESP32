@@ -1159,7 +1159,8 @@ function etLiveHtml(et = {}, de = {}, clients = 0) {
       <span class="status-pill ${de.running ? 'run' : 'idle'}">当前技术: ${atkName(de.tech)}</span>
       <span class="status-pill ${de.running ? 'run' : 'idle'}">剩余: ${atkFmtRemain(de.remain)}</span>
       <span class="status-pill ${et.hopEnabled ? 'run' : 'idle'}">双子跳频: ${et.hopEnabled ? ((et.hopping ? '跳频中… ' : '') + (et.hopCount || 0) + ' 次 / ' + (et.twinFrames || 0) + ' 帧') : '未启用'}</span>
-      <span class="status-pill ${clients ? 'run' : 'idle'}">已接入设备: ${clients ?? 0} 台</span>`;
+      <span class="status-pill ${clients ? 'run' : 'idle'}">已接入设备: ${clients ?? 0} 台</span>
+      <span class="status-pill ${de.knownStas ? 'run' : 'idle'}">定向踢线: ${de.knownStas || 0} 台${de.unicast ? ' / 单播 ' + de.unicast + ' 帧' : ''}</span>`;
 }
 function etUpdateLive() {
   const i = state.info; if (!i) return;

