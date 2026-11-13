@@ -2895,6 +2895,9 @@ static bool eviltwinStartAttack(String &err) {
   }
   sEvilTwin.hopEnabled = (usable > 0);
   sEvilTwin.caught = false;
+  // 阶段 2 直接起克隆热点时, WiFi.softAP 重配会清掉 promiscuous 状态;
+  // 这里必须恢复 — Deauth 注入与「客户端 MAC 学习/定向单播」都依赖它。
+  syncPromiscuousEngine();
   return true;
 }
 
