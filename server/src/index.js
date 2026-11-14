@@ -146,6 +146,30 @@ app.get('/api/firmware/bin/:chip', (c) => {
   return c.body(new Uint8Array(buf));
 });
 
+// 下载已适配三系统的 Meta Muse 固件 (按 partitions-16mb-triple.csv 重编, 写入 ota_2 可启动)
+// 官方原始发布的 muse-gadget.bin 用官方布局 (表 0x10000 / 应用 0x20000), 与本工程不兼容,
+// 重编步骤见 docs/firmware-flashing.md §6.9
+app.get('/api/firmware/muse', (c) => {
+  const p = join(FIRMWARE_DIR, 'muse-gadget.bin');
+  if (!existsSync(p)) return json(c, { error: 'muse-gadget.bin 不存在 (需按 §6.9 重编后放入 server/firmware/)' }, 404);
+  const buf = readFileSync(p);
+  c.header('Content-Type', 'application/octet-stream');
+  c.header('Content-Disposition', 'inline; filename="muse-gadget.bin"');
+  c.header('Cache-Control', 'public, max-age=600');
+  return c.body(new Uint8Array(buf));
+});
+
+// 下载空白 otadata 扇区镜像 (用于将多系统引导槽位复位至 ota_0)
+// 4KB 全 0xFF: 现生成, 不再依赖 tools/otadata-blank.bin (那是被 .gitignore 忽略的本地产物,
+// clone 下来不存在会让「复位引导」直接 404)
+app.get('/api/firmware/otadata-blank', (c) => {
+  const blank = new Uint8Array(4096).fill(0xff);
+  c.header('Content-Type', 'application/octet-stream');
+  c.header('Content-Disposition', 'inline; filename="otadata-blank.bin"');
+  c.header('Cache-Control', 'public, max-age=600');
+  return c.body(blank);
+});
+
 // ---------- 烧录码 ----------
 // 轻量滑动窗口限流: 单 IP 每分钟最多 N 次 (防烧录码暴力枚举)
 // 仅内存态, 重启清零; 本地/内网使用足够, 云部署时应放到网关层 + 持久化
@@ -396,7 +420,12 @@ app.post('/api/admin/firmware/:chip', requireAdmin, async (c) => {
 // ---------- 静态托管 ----------
 // 用绝对路径绑定 flasher/, 不依赖进程 cwd (ROOT 已由 import.meta.url 算出)
 // no-store: 烧录台前端属迭代频繁的开发工具, 强制浏览器每次取最新 (避免旧 JS/样式)
-app.use('/flasher/*', async (c, next) => { await next(); c.header('Cache-Control', 'no-store'); });
+app.use('/flasher/*', async (c, next) => {
+  await next();
+  c.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');
+  c.header('Pragma', 'no-cache');
+  c.header('Expires', '0');
+});
 app.use('/flasher/*', serveStatic({ root: join(ROOT, 'flasher'), rewriteRequestPath: (p) => p.replace(/^\/flasher\/?/, '') || 'index.html' }));
 app.get('/', (c) => c.redirect('/flasher/index.html'));
 

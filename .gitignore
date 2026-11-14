@@ -28,5 +28,9 @@ tools/disasm.txt
 tools/cd-stack*.txt
 tools/coredump.bin
 tools/otadata-blank.bin
-server/firmware/muse-gadget.bin
 server/firmware/sketch_nov13a.ino.bin
+# 注: server/firmware/muse-gadget.bin 是「已适配三系统」的重编产物 (1.7MB), 需要入库,
+# 否则烧录台「载入 Muse」在别人 clone 下来后会 404 —— 不要再把它加回忽略列表。
+
+# 项目级 AGENTS.md (新对话自动加载的一次性交接/状态快照, 不入库)
+AGENTS.md

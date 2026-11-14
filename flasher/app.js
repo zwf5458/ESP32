@@ -588,6 +588,97 @@ if (btnChooseCustomFile && customFileInput) {
   };
 }
 
+const btnLoadMusePreset = $('btnLoadMusePreset');
+const MUSE_PRESET_LABEL = '📦 载入已适配的 Muse 固件（写入 ota_2）';
+if (btnLoadMusePreset) {
+  btnLoadMusePreset.onclick = async () => {
+    try {
+      btnLoadMusePreset.disabled = true;
+      btnLoadMusePreset.textContent = '载入中…';
+      const res = await fetch('/api/firmware/muse');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const ab = await res.arrayBuffer();
+      customBinData = new Uint8Array(ab);
+      customBinName = 'muse-gadget.bin';
+      customBinMd5 = typeof CryptoJS !== 'undefined'
+        ? CryptoJS.MD5(CryptoJS.enc.Latin1.parse(u8ToLatin1(customBinData))).toString()
+        : '';
+      const sizeMb = (customBinData.length / 1024 / 1024).toFixed(2);
+      $('customFileName').textContent = `${customBinName} (${sizeMb} MB, 已适配三系统 · ota_2)`;
+      const slotSelect = $('customSlotSelect');
+      // 服务端提供的是按 partitions-16mb-triple.csv 重编的版本（分区表 0x8000），
+      // 只能写 ota_2(0x7F0000)。绝不能写 ota_0(0x10000)：那会覆盖审计固件。
+      if (slotSelect) slotSelect.value = '0x7F0000';
+      if (btnCustomFlash) btnCustomFlash.disabled = false;
+      terminalAppend(`${nowTs()} [custom] 已载入 Muse 固件（三系统适配版）: ${customBinName} (${customBinData.length} 字节, md5=${customBinMd5})\n`);
+      terminalAppend(`${nowTs()} [custom] 目标分区: ota_2 (0x7F0000)\n`);
+      terminalAppend(`${nowTs()} [custom] 刷完用串口 "boot muse" 切过去；配对前先发 >sdk_token=mgst_... 写入个人 Token。\n`);
+      msg('已载入 Muse 固件（三系统适配版，将写入 ota_2）', 'ok');
+    } catch (e) {
+      msg('载入 Muse 固件失败: ' + e.message, 'err');
+      terminalAppend(`${nowTs()} [custom][ERROR] 载入失败: ${e.message}\n`);
+      terminalAppend(`${nowTs()} [custom][ERROR] 若服务端缺该文件，按 docs/firmware-flashing.md §6.9 重编后放到 server/firmware/muse-gadget.bin。\n`);
+    } finally {
+      btnLoadMusePreset.disabled = false;
+      btnLoadMusePreset.textContent = MUSE_PRESET_LABEL;
+    }
+  };
+}
+
+// otadata 引导扇区的偏移随分区表布局变化，写错位置会把 4KB 0xFF 灌进 nvs 尾部，
+// 清掉设备已存的配置（后台口令 / sysmode 等）：
+//   16MB 三系统表 (partitions-16mb-triple.csv)  -> otadata @0xD000
+//   4MB 单槽表 (partitions-c5-4mb-single.csv)   -> otadata @0xE000（nvs 0x9000+0x5000）
+//   其他 min_spiffs 布局                        -> otadata @0xE000
+function otadataAddrFor(chipKey) {
+  return chipKey === 'esp32c5_16mb' ? 0x00D000 : 0x00E000;
+}
+
+const btnResetToAudit = $('btnResetToAudit');
+if (btnResetToAudit) {
+  btnResetToAudit.onclick = async () => {
+    if (state.flashing || state.backingUp) {
+      msg('设备正忙, 请稍后再试', 'warn');
+      return;
+    }
+    const otaAddr = otadataAddrFor(state.chip);
+    const otaAddrHex = '0x' + otaAddr.toString(16).toUpperCase().padStart(6, '0');
+    if (!confirm(`确定将开发板引导槽位重置回【Wi-Fi 安全审计平台 (ota_0)】？\n\n这会清空 otadata 引导扇区 (${otaAddrHex})，使芯片重启后默认加载 ota_0 原生审计热点固件。`)) {
+      return;
+    }
+    btnResetToAudit.disabled = true;
+    try {
+      if (!state.esploader || state.consoleConn) {
+        msg('正在连接并进入下载模式…', '');
+        await enterDownloadMode();
+      }
+      terminalAppend(`\n${nowTs()} [boot] 正在获取 otadata 清空扇区…\n`);
+      const res = await fetch('/api/firmware/otadata-blank');
+      if (!res.ok) throw new Error('获取 otadata-blank 失败');
+      const blankData = new Uint8Array(await res.arrayBuffer());
+      terminalAppend(`${nowTs()} [boot] 正在写入 otadata 分区 (${otaAddrHex}, 4096 字节 0xFF)…\n`);
+      await state.esploader.writeFlash({
+        fileArray: [{ data: blankData, address: otaAddr }],
+        flashSize: 'keep',
+        flashMode: 'keep',
+        flashFreq: 'keep',
+        eraseAll: false,
+        compress: true,
+        reportProgress: () => {},
+        calculateMD5Hash: (img) => CryptoJS.MD5(CryptoJS.enc.Latin1.parse(u8ToLatin1(img))).toString(),
+      });
+      terminalAppend(`${nowTs()} [boot] ✓ otadata 重置完成！重启后将引导 ota_0 (Wi-Fi 安全审计系统)\n`);
+      msg('✓ 已成功重置引导至 Wi-Fi 审计系统 (ota_0)', 'ok');
+      setTimeout(() => { startConsole().catch(() => {}); }, 1500);
+    } catch (e) {
+      terminalAppend(`${nowTs()} [boot][ERROR] 复位引导失败: ${e.message}\n`);
+      msg('复位引导失败: ' + e.message, 'err');
+    } finally {
+      btnResetToAudit.disabled = false;
+    }
+  };
+}
+
 if (btnCustomFlash) {
   btnCustomFlash.onclick = async () => {
     if (!customBinData || customBinData.length === 0) {
@@ -629,11 +720,40 @@ if (btnCustomFlash) {
         await enterDownloadMode();
       }
 
-      terminalAppend(`\n${nowTs()} [custom] 开始写入: ${customBinName} -> 0x${targetAddr.toString(16).toUpperCase()} (${customBinData.length} bytes)\n`);
-      customFlashProgress(10, '正在写入 Flash…');
+      // 0x400000 / 0x7F0000 只存在于 16MB 三系统布局；4MB 板物理上没有这两段，
+      // 写 0x7F0000 会直接越界失败，写 0x400000 则会把文件截断成半份（Flash 到 0x3FFFFF 止）。
+      if (targetAddr >= 0x400000) {
+        let flashBytes = 0;
+        try {
+          const sizeStr = await state.esploader.detectFlashSize();
+          flashBytes = state.esploader.flashSizeBytes(sizeStr) || 0;
+          terminalAppend(`${nowTs()} [custom] 实测 Flash 容量: ${sizeStr} (${flashBytes} bytes)\n`);
+        } catch { /* 探测失败就交给 esptool 自己报错 */ }
+        if (flashBytes && targetAddr + customBinData.length > flashBytes) {
+          const msgTxt = `目标槽位超出本板 Flash 容量！\n\n槽位: ${slotText} (0x${targetAddr.toString(16).toUpperCase()})\n本板 Flash: 0x${flashBytes.toString(16).toUpperCase()}\n\n0x400000 / 0x7F0000 只有 16MB 三系统布局才有。要保留三系统，请先整片刷入 firmware-esp32c5_16mb-*.bin；否则请改选 ota_0 (0x10000)。`;
+          alert(msgTxt);
+          throw new Error('目标槽位超出本板 Flash 容量');
+        }
+      }
+
+      terminalAppend(`\n${nowTs()} [custom] 开始写入: ${customBinName} -> 0x${targetAddr.toString(16).toUpperCase()} (${customBinData.length} bytes)\n`);      customFlashProgress(10, '正在写入 Flash…');
+
+      const fileList = [{ data: customBinData, address: targetAddr }];
+      if (targetAddr === 0x10000) {
+        try {
+          const rBlank = await fetch('/api/firmware/otadata-blank');
+          if (rBlank.ok) {
+            const bBuf = await rBlank.arrayBuffer();
+            const otaAddr = otadataAddrFor(state.chip);
+            const otaAddrHex = '0x' + otaAddr.toString(16).toUpperCase().padStart(6, '0');
+            fileList.push({ data: new Uint8Array(bBuf), address: otaAddr });
+            terminalAppend(`${nowTs()} [custom] 自动重置 otadata (${otaAddrHex})，确保重启后直接引导 ota_0\n`);
+          }
+        } catch { /* ignore */ }
+      }
 
       await state.esploader.writeFlash({
-        fileArray: [{ data: customBinData, address: targetAddr }],
+        fileArray: fileList,
         flashSize: 'keep',
         flashMode: 'keep',
         flashFreq: 'keep',
@@ -714,6 +834,59 @@ $('btnCopy').onclick = async () => {
   $('btnCopy').textContent = '已复制';
   setTimeout(() => ($('btnCopy').textContent = '复制'), 1200);
 };
+
+// ---------- 串口控制台命令发送 ----------
+async function sendConsoleCmd(rawCmd) {
+  const cmd = (rawCmd || '').trim();
+  if (!cmd) return;
+  if (!state.port) {
+    terminalAppend('\n[console] 提示: 尚未授权串口。请先在左侧「① 串口连接」点击「+ 选择串口」。\n');
+    return;
+  }
+  // 若未在控制台模式 (例如左侧连接刚进入了 921600 下载模式), 自动无缝切换到 115200 交互控制台
+  if (!state.consoleConn) {
+    terminalAppend('\n[console] 正在切换至 115200 交互控制台模式…\n');
+    startConsole().catch(() => {});
+    for (let i = 0; i < 20; i++) {
+      await sleep(100);
+      if (state.consoleConn) break;
+    }
+    await sleep(200); // 稍微等待设备固件完成初始化并就绪
+  }
+  try {
+    const enc = new TextEncoder();
+    if (state.transport && state.transport.device && state.transport.device.writable) {
+      const writer = state.transport.device.writable.getWriter();
+      await writer.write(enc.encode(cmd + '\r\n'));
+      writer.releaseLock();
+      terminalAppend(`\n> ${cmd}\n`);
+    } else {
+      terminalAppend('\n[console] 错误: 串口写入通道不可用。\n');
+      return;
+    }
+  } catch (e) {
+    terminalAppend(`\n[console] 发送失败: ${e.message || e}\n`);
+  }
+}
+
+const consoleInput = $('consoleInput');
+const btnSendConsole = $('btnSendConsole');
+if (btnSendConsole && consoleInput) {
+  btnSendConsole.onclick = () => {
+    sendConsoleCmd(consoleInput.value);
+    consoleInput.value = '';
+  };
+  consoleInput.onkeydown = (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      btnSendConsole.click();
+    }
+  };
+}
+if ($('btnQuickBootMuse')) $('btnQuickBootMuse').onclick = () => sendConsoleCmd('boot muse');
+if ($('btnQuickBootAudit')) $('btnQuickBootAudit').onclick = () => sendConsoleCmd('boot audit');
+if ($('btnQuickBootStatus')) $('btnQuickBootStatus').onclick = () => sendConsoleCmd('boot status');
+if ($('btnQuickHelp')) $('btnQuickHelp').onclick = () => sendConsoleCmd('help');
 
 // ---------- 启动 ----------
 if (localStorage.getItem('theme') === 'dark') document.documentElement.classList.add('dark');

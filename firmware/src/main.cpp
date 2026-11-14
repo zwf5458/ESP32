@@ -64,6 +64,8 @@ extern "C" int ieee80211_raw_frame_sanity_check(int32_t, int32_t, int32_t) { ret
 #include <BLEUtils.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+#include <BLEServer.h>
+#include <BLE2902.h>
 #endif
 
 /* 802.15.4 能力门控 (P3): 芯片需有 802.15.4 射频 (C5/C6), 且框架确实把该组件编进了
@@ -4774,11 +4776,16 @@ static void handleGetConfig() {
   server.send(200, "application/json", json);
 }
 
+/* ==================== Meta Muse AI 伴侣模式原生实现 ==================== */
+String sSerialCmd = "";
+bool sIsMuseMode = false;
+#include "muse_companion.h"
+
 /* ---------------- 多系统引导管理 (Triple-Boot) ----------------
  * 支持在 16MB Flash (如 ESP32-C5N16R8) 或多 OTA 分区环境下无缝切换系统:
  *   1. audit   : Wi-Fi 安全审计平台 (当前固件, 默认 ota_0 或 factory)
  *   2. espsoup : ESPsoup 口袋 SDR 模式 (ota_1)
- *   3. muse    : Meta Muse AI 伴侣模式 (ota_2)
+ *   3. muse    : Meta Muse AI 伴侣模式 (ota_2 / 原生内置)
  */
 
 struct SystemSlot {
@@ -4812,12 +4819,20 @@ static const esp_partition_t *findSystemPartition(const SystemSlot &slot) {
 
 static bool isSlotInstalled(const esp_partition_t *part) {
   if (!part) return false;
+  if (part->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_2) return true; // 原生内置支持
   uint8_t magic = 0;
   esp_err_t err = esp_partition_read(part, 0, &magic, 1);
   return (err == ESP_OK && magic == 0xE9);
 }
 
 static String getRunningSystemId() {
+  if (sIsMuseMode) return "muse";
+  Preferences prefs;
+  prefs.begin("sysmode", true);
+  String mode = prefs.getString("mode", "audit");
+  prefs.end();
+  if (mode.equalsIgnoreCase("muse")) return "muse";
+
   const esp_partition_t *running = esp_ota_get_running_partition();
   if (!running) return "audit";
   for (size_t i = 0; i < SYSTEM_SLOTS_COUNT; i++) {
@@ -4836,6 +4851,20 @@ static String getRunningSystemId() {
 }
 
 static bool switchBootSystem(const String &targetId, String &errOut) {
+  if (targetId.equalsIgnoreCase("muse")) {
+    Preferences prefs;
+    prefs.begin("sysmode", false);
+    prefs.putString("mode", "muse");
+    prefs.end();
+    return true;
+  }
+  if (targetId.equalsIgnoreCase("audit")) {
+    Preferences prefs;
+    prefs.begin("sysmode", false);
+    prefs.putString("mode", "audit");
+    prefs.end();
+    return true;
+  }
   const SystemSlot *targetSlot = nullptr;
   for (size_t i = 0; i < SYSTEM_SLOTS_COUNT; i++) {
     if (targetId.equalsIgnoreCase(SYSTEM_SLOTS[i].id)) {
@@ -4855,7 +4884,7 @@ static bool switchBootSystem(const String &targetId, String &errOut) {
   const esp_partition_t *running = esp_ota_get_running_partition();
   if (running && running->address == targetPart->address) {
     errOut = String("当前正在运行 [") + targetSlot->name + "], 无需切换";
-    return false;  // 走 400 提示路径, 避免对当前系统重复重启
+    return false;
   }
   if (!isSlotInstalled(targetPart)) {
     errOut = String("[") + targetSlot->name + "] 分区尚未烧录有效固件 (需在烧录台刷入 " + targetPart->label + ")";
@@ -4916,6 +4945,13 @@ static void handleBootPost() {
     return;
   }
   String err;
+  if (target.equalsIgnoreCase("muse")) {
+    String sdkTok = extractJson(body, "sdk_token");
+    if (sdkTok.length() > 0) {
+      saveStoredSdkToken(sdkTok);
+      log("[boot] 已预存个人 SDK Token: " + sdkTok.substring(0, min((unsigned int)12, sdkTok.length())) + "...");
+    }
+  }
   if (!switchBootSystem(target, err)) {
     server.sendHeader("Access-Control-Allow-Origin", "*");
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"" + jsonEscape(err) + "\"}");
@@ -4928,7 +4964,6 @@ static void handleBootPost() {
   ESP.restart();
 }
 
-static String sSerialCmd = "";
 // WiFi 射频重启: 恢复被 802.15.4 破坏的接收路径。
 // 真机实测: esp_ieee802154_enable+receive 后 AP 只发不收 (信标可见但关联/数据全挂),
 // esp_ieee802154_disable 也无法恢复, 唯 esp_wifi stop/start 重建。
@@ -5043,6 +5078,8 @@ static void handleSerialCli() {
       if (sSerialCmd.length() > 0) {
         String cmd = sSerialCmd;
         sSerialCmd = "";
+        // 兼容官方控制台写法 '>sdk_token=mgst_...'，去掉前导 '>'
+        if (cmd.startsWith(">")) { cmd = cmd.substring(1); cmd.trim(); }
         if (cmd == "help" || cmd == "?") {
           Serial.println(F("\n=== 可用串口命令 ==="));
           Serial.println(F("boot               : 查看当前系统与多系统引导槽位"));
@@ -5073,6 +5110,18 @@ static void handleSerialCli() {
                           (cur == slot.id) ? "◀" : "");
           }
           Serial.println(F("===================================\n"));
+        } else if (cmd.startsWith("sdk_token ") || cmd.startsWith("sdk_token=")) {
+          String tok = cmd.substring(10);
+          tok.trim();
+          if (tok.startsWith("=")) tok = tok.substring(1);
+          tok.trim();
+          if (!tok.startsWith("mgst_")) {
+            Serial.println(F("[muse] SDK Token 无效: 必须以 mgst_ 开头"));
+          } else {
+            saveStoredSdkToken(tok);
+            Serial.println("[muse] 已存储 SDK Token: " + tok.substring(0, 12) + "...");
+            Serial.println(F("[muse] 提示: 该 Token 仅用于本机 Muse 模式自实现的握手，Meta 官方配对仍需官方构建"));
+          }
         } else if (cmd.startsWith("boot ")) {
           String tgt = cmd.substring(5);
           tgt.trim();
@@ -5386,6 +5435,16 @@ void setup() {
   Serial.setTxTimeoutMs(0);
   delay(200);
 
+  Preferences sysPrefs;
+  sysPrefs.begin("sysmode", true);
+  String sysMode = sysPrefs.getString("mode", "audit");
+  sysPrefs.end();
+
+  if (sysMode.equalsIgnoreCase("muse")) {
+    setupMuseMode();
+    return;
+  }
+
   // WiFi 事件日志: 设备侧视角的关联/探针/地址分配 (诊断 "AP 可见但关联不上"),
   // 并为共存策略记录客户端活动时间戳。探针很频繁, 只节流记录。
   WiFi.onEvent([](WiFiEvent_t ev, WiFiEventInfo_t) {
@@ -5640,6 +5699,10 @@ void setup() {
 }
 
 void loop() {
+  if (sIsMuseMode) {
+    loopMuseMode();
+    return;
+  }
   esp_task_wdt_reset();   // 喂狗: 主循环任何一环 (HTTP/DNS/CLI/推进逻辑) 挂死都会触发 panic 回溯
   handleSerialCli();
   server.handleClient();

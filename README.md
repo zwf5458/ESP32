@@ -67,7 +67,7 @@ BLE 扫描 / 802.15.4 扫描 / 捕获凭据 / 配置）。**首次上电时设�
 | 事件日志 | ✅ 实现 | 64 条环形缓冲，`GET /api/log?since=` 增量拉取 |
 | 内存/运行诊断 | ✅ 实现 | 堆、PSRAM、信道、uptime |
 | 脱机便携扩展 (OLED + 蜂鸣器) | ✅ 深度实现 (`esp32c5_16mb_portable`) | 自研纯 Wire.h 极简驱动 `ssd1306_tiny.h`（零外部依赖，仅占 1KB 显存），支持 0.96/1.3 寸 I2C OLED (SDA=IO4, SCL=IO5)。双模式智能切屏：常规仪表盘 + 捕获密码时大字明文直显；配合蜂鸣器 (IO13) 声学提醒（成功三音/未校验双音） |
-| Evil Twin（邪恶双子） | ✅ 真实实现（C5 真机已验证） | 攻击时把本机热点**真实改名**为与主目标一模一样的 SSID（开放无密码、信道对齐主目标）→ 目标设备免密直连；主目标可为 2.4G 或 5G 非 DFS（5G 克隆先切 `WIFI_BAND_MODE_5G_ONLY` 再起 AP，并以 `esp_wifi_get_channel` 校验真实驻留信道，避免「`softAP(ch149)` 返回 true 却停在 2.4G」）。同时自动对主目标持续注入**定向单播 Deauth**，并对双子目标（同一路由器另一频段 BSSID）每 2s 跳频连发注入 → 单射频也能让目标两个频段都无法联网（2026-11-13 真机：主 5G ch149 + 双子 2.4G ch11，两个频段在线设备均被打掉）；Captive Portal 自动弹钓鱼页，捕获第一条凭据后自动停止干扰，手动停止恢复原热点名/密码/信道 |
+| Evil Twin（邪恶双子） | ✅ 真实实现（C5 真机已验证） | 攻击时把本机热点**真实改名**为与主目标一模一样的 SSID（开放无密码、信道对齐主目标）→ 目标设备免密直连；主目标可为 2.4G 或 5G 非 DFS（5G 克隆先切 `WIFI_BAND_MODE_5G_ONLY` 再起 AP，并以 `esp_wifi_get_channel` 校验真实驻留信道，避免「`softAP(ch149)` 返回 true 却停在 2.4G」）。同时自动对主目标持续注入**定向单播 Deauth**，并对双子目标（同一路由器另一频段 BSSID）每 2s 跳频连发注入 → 单射频也能让目标两个频段都无法联网（2026-11-13 真机：主 5G ch149 + 双子 2.4G ch11，两个频段在线设备均被打掉）；Captive Portal 提供钓鱼门户页，捕获第一条凭据后自动停止干扰，手动停止恢复原热点名/密码/信道。**验证边界**：门户弹窗链路只在 Windows PC 上真机验证过；iPhone 侧 2026-11-14 复测未通过（未连上克隆热点、无弹窗，详见 `tools/c5-feature-acceptance-report.md` §5.7） |
 | Deauther（WiFi 杀手） | ✅ 真实实现（C5 真机已验证） | 经 `esp_wifi_80211_tx` 注入真实 Deauthentication 管理帧（0x00c0）。C5 的帧类型白名单由覆盖 `ieee80211_raw_frame_sanity_check`（链接加 `-Wl,--allow-multiple-definition`）解除，Deauth/Disassoc 真机可发。为应对 Wi-Fi 6 终端静默丢弃广播 Deauth，运行期开 promiscuous 从空口数据帧学习目标 AP 下客户端 MAC（最多 12 个），改为**单播定向踢线**（DA=客户端、TA/BSSID=目标 AP，原因码 1/3/7/15 轮换，每 4 帧留 1 帧广播兜底）。带 Reason Code / `unicast` / `knownStas` / `prom` / `rxFrames·rxData·rxMatch` 诊断计数遥测。启动时自动把热点切到目标信道，停止时恢复；探测前先开 promiscuous |
 | Handshake / 握手包与跑包 | ✅ 真实实现 | `esp_wifi_set_promiscuous` 真实空口捕获 4-Way Handshake（M1~M4，含 PMKID KDE）；板载用内置 7,153 条弱口令逐条跑包（PMK=PBKDF2-HMAC-SHA1 4096 轮 → PTK → 重算 M2 的 MIC 比对，支持 keyver 1/2）。keyver 3（802.11w PMF）导出后交服务端 `/api/wpa/crack`（SHA256-KDF + AES-CMAC） |
 | 数据包分析器 (Sniffer) | ✅ 真实实现 | 共用 promiscuous 回调抓真实 802.11 管理/控制/数据帧，解析帧类型、源/目的 MAC、SSID、Deauth Reason；支持单信道停驻与 1-13 自动跳频，实时帧率统计；源/目的 MAC 悬停显示 OUI 厂商名。同一回调顺带解析 Beacon / Probe Response 中的 ASTM F3411 Remote ID 厂商 IE |
@@ -228,10 +228,25 @@ docs/firmware-flashing.md  刷固件说明（网页烧录台 + 命令行 esptool
 | `ota_2` | `0x7F0000` | Meta Muse AI 伴侣 |
 
 - 分区表 `firmware/partitions-16mb-triple.csv`（纯 ASCII，Windows 下 PlatformIO 按系统编码解析）；
-- 4MB 版 `esp32c5` 仍用 `min_spiffs.csv`，两个镜像在烧录台里分开注册（key 分别为
+- 4MB 版 `esp32c5` 改为单 app 槽（`firmware/partitions-c5-4mb-single.csv`，`app0` 3.75MB）：
+  审计固件已超过 `min_spiffs` 双槽每槽 1,966,080 B 的上限（当前 2,031,617 B），而 4MB 板上
+  双 OTA 槽本来也无 `ota_1/ota_2` 可切；`nvs/otadata/spiffs/coredump` 偏移与 `min_spiffs`
+  一致，已存配置与 SPIFFS 数据不受影响；两个镜像在烧录台里分开注册（key 分别为
   `esp32c5` / `esp32c5_16mb`，后者显示为「ESP32-C5 (16MB 三系统)」）；
 - 合并镜像仍按 4MB pad，只覆盖 `ota_0`，重刷审计固件不会抹掉 `ota_1`/`ota_2`；
 - 切换：后台「多系统引导管理」卡片、串口 `boot audit|espsoup|muse`，或 `POST /api/system/boot`。
+- **Muse 槽位**：Meta 官方发布的 `muse-gadget.bin` 按官方布局编译（分区表 `0x10000` /
+  app `0x20000` / 4M 槽位），与本表不兼容，直接写入 `ota_2` 不会启动、也无法完成官方
+  App 配对（官方配对是 NimBLE 加密会话 + 设备按键确认 + 每台设备独立的 `mgst_` Token）。
+  仓库内 `server/firmware/muse-gadget.bin` 是**已按本表重编**的版本（1.70MB），烧录台
+  「📦 载入已适配的 Muse 固件（写入 ota_2）」直接用它；配对前用串口
+  `>sdk_token=mgst_…` 写个人 Token。重编步骤见
+  [docs/firmware-flashing.md §6.9](docs/firmware-flashing.md)。
+  **真机已启动验证（2026-11-14）**：写入后正常引导，`ble_name=MuseGadget-8A12F8`、
+  `SDK token: (none)`、BLE 广播正常、无 panic；`>sdk_token=` 通道可用。
+  官方 App 的实际配对仍未闭环（只差用户自己的 `mgst_` Token）。
+  本工程 `muse_companion.h` 的 Muse 模式仍是**自实现 GATT 演示**（UUID `4d757365-…`），
+  只能广播相近设备名，不等于官方固件。
 
 完整部署步骤、构建自检、真机验证清单与常见问题见
 [docs/firmware-flashing.md §6](docs/firmware-flashing.md#6-附16mb-flash-三系统-triple-boot-部署说明)。
@@ -349,10 +364,86 @@ unused ──verify──▶ verified(15min) ──烧录成功/pair nonce──
 - ✅ 2026-11-13 `pio run -e esp32c5_16mb -t upload` 烧录闭环（bootloader 自动写 0x2000，
   串口无 `invalid header`、正常打印 v1.1.0 启动横幅）
 - ⬜ 真机烧录 + 热点后台端到端（ESP32/S2/S3/C3/C6 板待补；C5 已验证）
-- ⬜ 16MB 三系统剩余项（ota_2 / ESPsoup·Muse 真实固件行为 / Web Serial 刷写，
+- ⬜ 16MB 三系统剩余项（ESPsoup 真实固件行为 / Web Serial 刷写，
   见 `tools/C5-16MB-VERIFICATION-REPORT.md` §五）
+- ❌ Muse 槽位定性（2026-11-14）：官方原始 `muse-gadget.bin` 与三系统布局不兼容，
+  直接写入既不起也没法配对；要跑官方固件须按本表重编或改用官方单系统布局，
+  见 `docs/firmware-flashing.md` §6.6 / §6.9
+- ✅ 2026-11-14 按本工程分区表重编官方 Muse SDK 成功（ESP-IDF v6.0.3）：
+  `muse-gadget.bin` 1,708,032 B，表 `0x8000` / `ota_2 @0x7F0000`，镜像含官方
+  GATT 服务 UUID `7fdd3d1c-…`，`CONFIG_GADGET_SDK_TOKEN` 为空（串口注入）；
+  **真机配对未验证**（见 `docs/firmware-flashing.md` §6.9）
 
 ## 变更记录
+
+### 2026-11-14 Muse 槽位纠偏：官方镜像不再写 ota_0，移除硬编码 Token
+
+- **对照 Meta 官方仓库核实**：`esp32/partitions_muse.csv`（表 `0x10000` / app `0x20000` /
+  4M 槽位 / `prod_data 0x820000` 等）与本工程三系统布局互斥；官方 `ble_server.c` 的服务
+  UUID 是 `7fdd3d1c-…`，配对必须走加密会话 + 设备按键确认 + 每台设备独立的 `mgst_` Token。
+- **烧录台**：Muse 预设不再把官方布局镜像推给 `ota_0 (0x10000)`（那会覆盖审计固件，
+  且应用启动后读自身镜像头当分区表而崩溃），改为选中 `ota_2` 并下发**已按本表重编**的
+  `server/firmware/muse-gadget.bin`；`ota_0` 选项文案去掉「官方原版 Muse 推荐」。
+- **固件**：`muse_companion.h` / `main.cpp` 删除硬编码 `mgst_` Token（3 处），未配置时只告警；
+  串口同时接受官方写法 `>sdk_token=mgst_…`；日志与后台弹窗不再暗示能完成官方配对。
+- **文档**：新增 `docs/firmware-flashing.md` §6.6（不兼容性说明）与 §6.9（按本表重编官方 SDK 的
+  构建步骤），README 三系统段补「Muse 槽位验证边界」（后续更新为真机已启动）。
+
+### 2026-11-14 4MB C5 改单 app 槽分区表 + 烧录台 otadata/越界纠偏
+
+- **4MB C5 编译失败根因**：审计固件已 2,031,617 B，`min_spiffs.csv` 双 OTA 槽每槽仅
+  1,966,080 B（`app0 @0x10000` / `app1 @0x1F0000`）——装不下且 4MB 板上本来也无
+  `ota_1/ota_2` 可切。新增 `firmware/partitions-c5-4mb-single.csv`：`app0` 单槽
+  3.75MB（`0x10000 + 0x3C0000`），`nvs/otadata/spiffs/coredump` 偏移与 `min_spiffs`
+  完全一致（已存配置与 SPIFFS 数据不丢）；`[env:esp32c5]` 改用它，
+  `[env:esp32c5_16mb]` 仍用 `partitions-16mb-triple.csv`。契约测试覆盖两表与 ASCII。
+- **烧录台 otadata 偏移**：`复位引导至 ota_0` 与写 `0x10000` 时自动清 otadata 原先硬编码
+  `0xD000`——那是三系统表的偏移，在 4MB 板上 `0xD000–0xDFFF` 属于 nvs 最后一页，
+  写 4KB `0xFF` 会抹掉后台口令 / `sysmode`。现由 `otadataAddrFor()` 选地址
+  （`esp32c5_16mb` → `0xD000`，其余 → `0xE000`），并先用 `detectFlashSize()` 实测容量，
+  目标 ≥ `0x400000` 时在 4MB 板上直接拦下。
+- **清理**：删除非官方混合分区表 `tools/partitions_muse.bin`，以及按官方布局合并的
+  整片镜像 `server/firmware/muse-factory-0x0.bin`、`muse-official-complete.bin`
+  （与「官方 Muse 不得写入 ota_0」的结论冲突，避免被误刷/误提交）。
+- **镜像重出**：`firmware-esp32c5-1.1.0.bin`（单槽表，`app0` 3840K）与
+  `firmware-esp32c5_16mb-1.1.0.bin` 均重新 4MB pad 合并，`mgst_` 命中 0。
+- **路线 C 构建打通**：用 ESP-IDF v6.0.3 把官方 Muse Gadget SDK 按本工程三系统表重编成功
+  （`firmware/muse-sdk/` 提供分区表镜像 + sdkconfig overlay + 同步脚本）：产物
+  `muse-gadget.bin` **1,708,032 B**，`partition-table.bin` 解出与本工程表逐行一致
+  （表 `0x8000`、`ota_2 @0x7F0000` 4032K，应用槽剩余 59%），`CONFIG_GADGET_SDK_TOKEN`
+  为空（配对时串口注入），镜像内可检索到官方 GATT 服务/UUID。工具链侧两个坑
+  （component manager 二次 configure 解析、GBK 控制台编码）已写进 §6.9。
+- **路线 C 真机启动通过（2026-11-14 22:30，C5N16R8）**：该镜像正常引导 ——
+  `app_init: Project name: muse-gadget`、`link.identity: ble_name=MuseGadget-8A12F8`、
+  `SDK token: (none)`、LED ok，BLE 正常广播，无 panic / 重启循环；`>sdk_token=` 令牌
+  通道已验证（非法前缀回 `@sdk_token error invalid`）。提交的正是实测通过的那份
+  （`build-triple`，SHA256 `C5C18D45…45033`）。**官方 App 配对只差真 `mgst_` Token**。
+  踩到两个坑：① 整片擦写后 `0x8000` 分区表可能整块变 `0xFF`（bootloader 报
+  `partition 0 invalid magic number 0xffff`），补写 `partition-table.bin` 即可；
+  ② 该板 RTS 接复位脚、DTR 脉冲不复位，抓开机日志要用 RTS 单次脉冲。
+- **烧录台下发改用适配版**：`server/firmware/muse-gadget.bin` 换成真机实测通过的重编版
+  并**纳入 git 跟踪**（1,708,032 B，SHA256 `C5C18D45…`；原先被 `.gitignore` 忽略，
+  clone 下来会 404），
+  「📦 载入已适配的 Muse 固件（写入 ota_2）」按钮与文案同步；11/13 的官方布局旧版已替换。
+- **otadata 空白扇区改为现生成**：`GET /api/firmware/otadata-blank` 直接返回
+  `new Uint8Array(4096).fill(0xff)`，不再依赖被忽略的 `tools/otadata-blank.bin`。
+- 契约测试新增 `Muse 预设是已适配三系统的重编固件`（校验首字节 `0xE9`、体积落在槽位内、
+  `.gitignore` 不再忽略该文件、otadata 现生成），**66 / 66 通过**。
+
+### 2026-11-14 C5 手机侧复测：iPhone 未弹窗（未验证项落地）+ 脚本编码修复
+
+- **复测结论**：主 5G ch149 + 双子 2.4G ch11 跳频下，两台 iPhone **从未关联到克隆热点**
+  （`client_join` = 0），因而门户不可能弹出；期间 `AP_STOP` 884 次 / 约 7 分钟，克隆 AP
+  近乎每秒被拆建一次。详见 `tools/c5-feature-acceptance-report.md` §5.7。
+- **两个根因**：① 跨频段跳频（5G↔2.4G）只能走 `reconfigApChannelHard()` 重启 softAP，
+  AP 稳不住；② 真网络是 WPA2、克隆是开放，iOS 对同名开放网络有自动加入降级保护。
+- **文档纠偏**：README 邪恶双子条目不再表述「自动弹钓鱼页」，改为「门户页 + 验证边界
+  （仅 Windows PC 验证过）」，避免把未验证能力写成已通过。
+- **脚本修复**：`tools/reset_c5.ps1`、`tools/run-txtest.ps1` 补 UTF-8 BOM——原先无 BOM
+  的 UTF-8 在 **Windows PowerShell 5.1** 下被按 ANSI 解码，中文破坏引号配对导致整脚本
+  解析失败（`-File` 直接报 ParserError）。已用 5.1 复核：解析通过、中文可正确匹配。
+- **附带发现**：打开 COM3（原生 USB CDC）即触发复位（DTR/RTS）；本次 CH340 COM5 未枚举；
+  `?band=5` 扫描必然超窗断连（单射频离站），`?band=2` 正常。
 
 ### 2026-11-13（五）C5 真机：定向单播 Deauth 双频压制 + bootloader 烧录偏移修复
 

@@ -266,7 +266,8 @@ esptool --chip esp32c5 -p COM5 -b 460800 write-flash 0x0 server\firmware\firmwar
 ```
 
 - 必须从 `0x0` 写整片，**不要**写 `0x2000` 或 `0x10000`；
-- ESP32-C5 有两个镜像，别选错：`firmware-esp32c5-*.bin` 是 4MB/min_spiffs 版，
+- ESP32-C5 有两个镜像，别选错：`firmware-esp32c5-*.bin` 是 4MB/单 app 槽版
+  （`partitions-c5-4mb-single.csv`），
   `firmware-esp32c5_16mb-*.bin` 才是 16MB 三系统分区表版（见 §6，做 Triple-Boot 必须用后者）；
 - 保持镜像原样写入，写到 16MB 板子的前 4MB 是安全的（不会动 `0x400000` 之后的 ota_1/ota_2）；
 - esptool **v5 没有 `--verify` 选项**，需要回读校验时用
@@ -399,7 +400,7 @@ C5 有两个镜像，烧录台里分开注册，**别选错**：
 
 | chip key / env | 分区表 | 适用板子 | 说明 |
 |---|---|---|---|
-| `esp32c5` | `min_spiffs.csv` | 4MB Flash C5 | 双 app 槽（`app0 @0x10000` / `app1 @0x1F0000`），无 `ota_2` |
+| `esp32c5` | `partitions-c5-4mb-single.csv` | 4MB Flash C5 | 单 app 槽（`app0 @0x10000`，3.75MB）；`nvs/otadata/spiffs/coredump` 偏移与 `min_spiffs` 相同，无 `ota_1/ota_2` |
 | `esp32c5_16mb` | `partitions-16mb-triple.csv` | 16MB Flash C5（C5N16R8） | `ota_0/1/2` 各 3.9375MB + 共享 spiffs |
 
 - `esp32c5_16mb` 通过 `extends = env:esp32c5` 复用 4MB 版配置，只覆盖分区表与
@@ -409,6 +410,10 @@ C5 有两个镜像，烧录台里分开注册，**别选错**：
 - 合并镜像仍按 **4MB** pad（`merge-bin --pad-to-size 4MB`），只覆盖
   `0x10000–0x3FFFFF` 的 `ota_0` 范围，不会碰 `0x400000` 的 `ota_1` 与 `0x7F0000` 的
   `ota_2`，因此重复刷新审计固件不会抹掉另外两个系统。
+- ⚠️ **`otadata` 偏移两套表不同**：三系统表在 `0xD000`，4MB 单槽表在 `0xE000`
+  （`nvs` 为 `0x9000 + 0x5000`）。烧录台的「复位引导至 ota_0」以及写 `0x10000` 时的
+  自动清 otadata 都按所选型号取址（`esp32c5_16mb` → `0xD000`，其余 → `0xE000`）。
+  在 4MB 板上对 `0xD000` 写 4KB `0xFF` 会抹掉 nvs 最后一页，**不要手写 `0xD000`**。
 
 ### 6.2 分区规划（`firmware/partitions-16mb-triple.csv`）
 
@@ -430,8 +435,8 @@ C5 有两个镜像，烧录台里分开注册，**别选错**：
 
 **前置：先把 16MB 三系统基础镜像刷进 `ota_0`**
 
-三系统分区表只内建在 `esp32c5_16mb` 这个专用构建里（4MB 版 `esp32c5` 仍是
-min_spiffs，`0x400000` / `0x7F0000` 在它下面不可引导）。先构建并注册该镜像：
+三系统分区表只内建在 `esp32c5_16mb` 这个专用构建里（4MB 版 `esp32c5` 是单 app 槽表，
+`0x400000` / `0x7F0000` 在它下面不可引导）。先构建并注册该镜像：
 
 ```bash
 tools/build-firmware.sh            # 产出 server/firmware/firmware-esp32c5_16mb-<版本>.bin
@@ -452,7 +457,10 @@ ESPsoup / Muse。
 1. 访问本地烧录台（如 `http://127.0.0.1:8787`）；
 2. 连上开发板后，在步骤 ③ 卡片下方的 **「🧩 多系统 / 外部固件刷写」** 区域：
    - 目标系统分区选择：`ota_2 (0x7F0000) — Meta Muse AI 伴侣模式`；
-   - 点击「📁 选择本地 .bin 固件」选中你的 `muse.bin`；
+   - 直接点 **「📦 载入已适配的 Muse 固件（写入 ota_2）」**：它从
+     `GET /api/firmware/muse` 取仓库内置的重编版（1.70MB，已按本工程分区表编译），
+     自动选中 `ota_2`；也可「📁 选择本地 .bin 固件」自己上传重编产物。
+     官方原始发布的 `muse-gadget.bin` 直接写入不会启动（原因见 §6.6）；
    - 点击 **「⚡ 刷入指定系统分区」**，进度条跑满即可完成烧录，不影响其他分区！
    - 同理，刷写 ESPsoup 固件只需选择 `ota_1 (0x400000)` 并上传对应镜像即可。
 
@@ -500,7 +508,54 @@ $d = [IO.File]::ReadAllBytes('merged-16mb.bin')
 cd ..\server; npm test
 ```
 
-### 6.6 真机验证清单（有 16MB 板时按序执行）
+### 6.6 为什么 Meta 官方 Muse 固件不能直接塞进 `ota_2`（重要）
+
+Meta 仓库里的预编译镜像**不是**按本工程的分区表编译的，两者互斥：
+
+| 项 | Meta 官方（`esp32/partitions_muse.csv`，16MB 板） | 本工程三系统 |
+|---|---|---|
+| 分区表位置 | `0x10000`（Secure Boot V2 bootloader 需要空间） | `0x8000` |
+| nvs / otadata / phy_init | `0x11000` / `0x1D000` / `0x1F000` | `0x9000` / `0xD000` / `0xF000` |
+| app 槽 | `ota_0 @0x20000`（4M）、`ota_1 @0x420000`（4M） | `0x10000` / `0x400000` / `0x7F0000`，各 3.9375MB |
+| 其他数据分区 | `prod_data 0x820000`、`prod_bak 0x821000`、`apps 0x830000`、`files 0xA30000` | 无（共享 `spiffs @0xBE0000`） |
+
+后果（真机已复现）：把官方 app 写进 `0x10000` 后，它按自己编译时的
+`CONFIG_PARTITION_TABLE_OFFSET=0x10000` 去读分区表，读到的却是自身镜像头 →
+`esp_ota_get_running_partition()` 断言失败/崩溃；而 `0x10000` 本来是本工程的 `ota_0`，
+审计固件也被一起覆盖（这正是需要「复位引导至 ota_0」的原因）。
+
+蓝牙层同样不兼容。官方 `esp32/main/ble_server.c` 是 NimBLE + 加密配对会话：
+
+- Service `7fdd3d1c-38ea-46cf-8b46-314ecf5f240c`
+- RX（手机写入）`4d593029-28a2-4a6e-a1f0-3c2d5e8f9b01`
+- TX（通知）`d75dc4ca-7b2b-4e9c-8f0a-1d2e3f4a5b6c`
+- 流程：`pairing_client_hello` → 加密通道 → `pairing_client_finished`（**必须按设备按键确认**），
+  且每台设备都需要自己的 `mgst_` Token（官方网页烧录器在安装后经串口写入，等价于
+  `>sdk_token=mgst_…`，存 NVS）。
+
+本工程 `firmware/src/muse_companion.h` 里的 Muse 模式是**项目自实现**的 GATT 演示
+（UUID `4d757365-…`、明文 JSON），只能广播相近的设备名，**无法完成官方配对**。
+
+两条可行路径：
+
+1. **官方布局（放弃三系统）**：用 Meta 官方烧录器覆盖整套 bootloader + 官方分区表 + app，
+   再写入个人 Token。真机可按官方流程配对，但审计固件需要按官方布局重刷才能回来。
+2. **按本工程布局重编官方 SDK**：在 ESP-IDF 6.0.3 下以 `CONFIG_PARTITION_TABLE_OFFSET=0x8000`
+   + 镜像本工程分区表的 CSV 编译，产物写 `ota_2 (0x7F0000)`，Token 走串口。
+
+> **路径 2 已完成并已真机启动（2026-11-14）**：重编产物已提交到
+> `server/firmware/muse-gadget.bin`（1,708,032 B，SHA256
+> `C5C18D45…45033`），烧录台的「📦 载入已适配的 Muse 固件（写入 ota_2）」直接下发
+> 该文件，`GET /api/firmware/muse`。构建步骤与工具链坑见 §6.9。
+>
+> **真机实测（22:30，C5N16R8）**：写入后正常启动 —— `app_init: Project name: muse-gadget`、
+> `link.identity: ble_name=MuseGadget-8A12F8`、`SDK token: (none)`、LED ok，无 panic、
+> 无重启循环，BLE 正常广播；令牌通道 `>sdk_token=` 也已验证（非 `mgst_` 前缀回
+> `@sdk_token error invalid`，合法前缀回 `@sdk_token ok`）。
+> **官方 App 的配对仍未闭环**——只差用户自己的真 `mgst_` Token（从
+> <https://gadgets.muse.ai> 取，串口写入后建议断电重启再发一次确认已持久化）。
+
+### 6.7 真机验证清单（有 16MB 板时按序执行）
 
 | # | 操作 | 期望结果 |
 |---|---|---|
@@ -511,11 +566,12 @@ cd ..\server; npm test
 | 5 | `boot espsoup` 或后台点「切换至 ESPsoup」 | 重启进入 ESPsoup；反向 `boot audit` 能切回 |
 | 6 | 再刷一次审计固件（`0x0` 整片 4MB 镜像） | 审计固件正常启动，且 `boot` 里 espsoup/muse 仍显示已安装 |
 | 7 | 重复步骤 5 | 两个外部系统仍可正常切换启动 |
+| 8 | 烧录台点「📦 载入已适配的 Muse 固件」→ 刷入 `ota_2`，串口 `boot muse` | 重启进入 Muse：串口 `app_init: Project name: muse-gadget`、`ble_name=MuseGadget-XXXXXX`，无 panic；`>sdk_token=mgst_…` 后官方 App 预期可配对（**待真令牌验证**） |
 
 > 第 6 步是关键回归：验证 4MB pad 的合并镜像只覆盖 `ota_0`，不会清掉
 > `0x400000` / `0x7F0000` 的外部系统。
 
-### 6.7 常见问题
+### 6.8 常见问题
 
 | 现象 | 原因 / 处理 |
 |---|---|
@@ -524,6 +580,86 @@ cd ..\server; npm test
 | 构建报 `UnicodeDecodeError: 'gbk' codec ...` | `partitions-16mb-triple.csv` 混入了非 ASCII 字符（注释也算） |
 | `merge-bin` 报镜像超过 4MB | `ota_0` 只有 3.9375MB；需裁剪固件或调整分区表 |
 | 写入 `0x400000` 后无法引导 | 确认写入的是**应用镜像**（`firmware.bin` / 厂商 app bin），不是整片合并镜像 |
+| 写入官方 `muse-gadget.bin` 后不断重启/断言崩溃 | 官方原始发布版按官方布局（表 `0x10000`、app `0x20000`）编译，与三系统布局不兼容；用仓库内 `server/firmware/muse-gadget.bin`（已按本表重编）或按 §6.9 自行重编 |
+| 整片擦写后 bootloader 报 `partition 0 invalid magic number 0xffff` / `load partition table error!` | `0x8000` 的分区表被整块擦成 `0xFF`（连带 `nvs@0x9000`、`phy_init@0xF000` 也可能为空）。补写 `partition-table.bin` 到 `0x8000` 即可恢复；**每次整片擦写/换镜像后先回读确认 `0x8000`** |
+| 抓不到开机日志，只能看到「中途接上」的内容 | 该板 **RTS 接复位脚、DTR 脉冲不复位**：用 RTS 单次脉冲（约 150 ms）抓开机横幅，不要长期保持 RTS 断言 |
+| 手机能看到 `MuseGadget-XXXXXX` 但 Muse App 配不上 | 本项目自实现 GATT（UUID `4d757365-…`）不是官方服务 `7fdd3d1c-…`，也没有官方加密会话与按键确认；仅重编官方固件才能配官方 App |
+
+### 6.9 按本工程分区表重编 Meta Muse 官方固件（可选进阶）
+
+> 目标：让官方 SDK 编译出来的 app 认识本工程的分区表（表 `0x8000`、`ota_2 @0x7F0000`），
+> 从而在三系统里运行，并保留 `ota_0` 审计固件。覆盖文件在本工程仓库
+> `firmware/muse-sdk/`（分区表镜像 + sdkconfig overlay + 同步脚本）。
+
+前提：ESP-IDF **v6.0.3**（官方只支持该版本）+ Meta 官方 SDK 克隆。
+
+```powershell
+# 1) 准备工具链（一次性，约 2-4GB；浅克隆快很多）
+git clone --depth 1 -b v6.0.3 --recurse-submodules --shallow-submodules --jobs 8 \
+  https://github.com/espressif/esp-idf.git E:\code\esp-idf-v6.0.3
+cd E:\code\esp-idf-v6.0.3
+.\install.ps1 esp32c5
+. .\export.ps1
+
+# 2) 取官方 SDK，并把 firmware/muse-sdk 的覆盖文件同步进去
+git clone https://github.com/facebookincubator/muse-gadget-sdk E:\code\muse-gadget-sdk
+powershell -ExecutionPolicy Bypass -File E:\code\ESP32\firmware\muse-sdk\sync-to-sdk.ps1
+
+# 3) 构建（C5 DevKitC-1 无屏配置，约 1.7MB）
+cd E:\code\muse-gadget-sdk\esp32
+idf.py -B build-c5-16mb-triple -DIDF_TARGET=esp32c5 `
+  -DSDKCONFIG=build-c5-16mb-triple/sdkconfig `
+  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;devices/sdkconfig.c5-16mb-triple" `
+  build
+
+# 4) 产物写到 ota_2（不要写 ota_data_initial.bin：那会清掉当前引导选择）
+cd E:\code\ESP32
+esptool --chip esp32c5 -p COM5 -b 460800 write-flash 0x7F0000 `
+  E:\code\muse-gadget-sdk\esp32\build-c5-16mb-triple\muse-gadget.bin
+
+# 5) 让烧录台也能下发这份重编版（server/firmware/muse-gadget.bin 必须入库）
+Copy-Item E:\code\muse-gadget-sdk\esp32\build-c5-16mb-triple\muse-gadget.bin `
+  E:\code\ESP32\server\firmware\muse-gadget.bin -Force
+```
+
+> **实测（2026-11-14，ESP-IDF v6.0.3 + idf-component-manager 3.1.2）**：构建通过，
+> `muse-gadget.bin` **1,708,032 B**（0x1A1000，应用槽剩余 59%），`partition-table.bin`
+> 解出与本工程三系统表逐行一致（表 `0x8000`、`ota_2 @0x7F0000` 4032K）；
+> `CONFIG_GADGET_SDK_TOKEN=""`（空值 + 警告，配对时用串口注入），镜像内可检索到官方
+> GATT 服务 UUID `7fdd3d1c-…` 与 RX 特征 `4d593029-…` 的 128 位二进制。
+> **真机（C5N16R8）已启动验证**：写入 `ota_0@0x10000` 与 `ota_2@0x7F0000` 后正常引导，
+> 串口 `app_init: Project name: muse-gadget` / `ble_name=MuseGadget-8A12F8` / `SDK token: (none)`，
+> BLE 正常广播，无 panic；`>sdk_token=` 通道可用。仓库内提交的就是这次实测通过的那份
+> （`build-triple/muse-gadget.bin`，SHA256 `C5C18D45…45033`）。
+> 注：`build-triple` 与 `build-c5-16mb-triple` 的 `sdkconfig` 逐行相同（都开 16MB +
+> `0x8000` 表 + PSRAM），产物哈希只因编译时间戳不同——两者功能等价。
+> 两个环境坑（与工程代码无关）：
+> 1. 二次 configure 报 `Cannot parse CMake requirements line:
+>    idf_build_get_property(__cm_sdkconfig SDKCONFIG)` —— component manager 会往
+>    `component_requires.temp.cmake` 追加原生 CMake 语句，却在自己 `load()` 时当需求行解析。
+>    需给它打最小补丁：`cmake_component_requirements.py` 的 `load()` 只解析
+>    `__component_set_property` 开头的行。
+> 2. `idf.py` 在 GBK 控制台输出编译日志遇到 `ϵ` 之类字符会 `UnicodeEncodeError` 崩掉，
+>    构建前设 `PYTHONIOENCODING=utf-8`、`PYTHONUTF8=1`（或 `chcp 65001`）。
+
+> 网络受限时：源码可用 gitee 镜像 `https://gitee.com/EspressifSystems/esp-idf.git`；
+> 但 `EspressifSystems/*-lib` 子模块在 gitee 返回 401，需给 `https://github.com/` 配代理，
+> 例如 `git config --local url."https://ghproxy.net/https://github.com/".insteadOf "https://github.com/"`。
+
+overlay 的关键两行（`firmware/muse-sdk/sdkconfig.c5-16mb-triple`）：
+
+```ini
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_c5_16mb_triple.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+```
+
+刷完用串口发 `>sdk_token=mgst_…` 写入个人 Token（构建时不内置），再在后台
+「切换至 Meta Muse」或串口 `boot muse` 重启进入。
+
+> ⚠️ 该构建默认关闭 OTA（`CONFIG_HOMEHUB_OTA_ENABLED=n`）。三系统场景必须保持关闭：
+> 官方 OTA 会写「非运行槽位」，可能覆盖 `ota_1` 的 ESPsoup。
+> 更细的说明与已知限制见 `firmware/muse-sdk/README.md`。
 
 ---
 

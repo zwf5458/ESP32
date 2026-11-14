@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   ESP32-C5N16R8 一键复位 (经 CH340 UART 口拉 DTR/EN), 可选打印启动横幅。
 .DESCRIPTION

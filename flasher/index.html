@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ESP32无线网络开发固件烧录台 · WEB SERIAL FLASHER</title>
-  <link rel="stylesheet" href="/flasher/style.css">
+  <link rel="stylesheet" href="/flasher/style.css?v=1.1.2">
   <script src="/flasher/vendor/crypto-js-4.2.0.js"></script>
 </head>
 <body>
@@ -103,21 +103,27 @@
         <p class="hint">支持上传外部固件直接写入对应系统分区（无需烧录码，按指定偏移写入，不影响已有系统）：</p>
         <label class="field-label">写入目标系统分区</label>
         <select class="sel-box yellow" id="customSlotSelect" style="width:100%;margin-bottom:10px">
-          <option value="0x7F0000" selected>ota_2 (0x7F0000) — Meta Muse AI 伴侣模式</option>
+          <option value="0x10000" selected>ota_0 (0x010000) — 审计系统主分区 (写入将覆盖当前审计固件)</option>
+          <option value="0x7F0000">ota_2 (0x7F0000) — Meta Muse AI 伴侣模式 (三系统预留槽位)</option>
           <option value="0x400000">ota_1 (0x400000) — ESPsoup 口袋 SDR 模式</option>
-          <option value="0x10000">ota_0 (0x010000) — Wi-Fi 安全审计固件</option>
           <option value="0x0">0x000000 — 整片写入 (完整覆盖，慎用)</option>
         </select>
         <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
           <input type="file" id="customFileInput" accept=".bin" style="display:none">
           <button class="btn yellow" id="btnChooseCustomFile" type="button">📁 选择本地 .bin 固件</button>
+          <button class="btn cyan" id="btnLoadMusePreset" type="button">📦 载入已适配的 Muse 固件（写入 ota_2）</button>
           <span id="customFileName" class="muted2" style="font-size:12px;font-family:monospace">未选择文件</span>
         </div>
+        <p class="hint" style="margin-top:4px">ℹ️ 这里内置的 <span class="mono">muse-gadget.bin</span> 已按本工程三系统分区表<b>重编</b>（分区表 <span class="mono">0x8000</span> / 应用写入 ota_2 <span class="mono">0x7F0000</span>），可直接刷入并切换启动；配对用的个人 Token 由串口 <span class="mono">&gt;sdk_token=mgst_…</span> 注入，不编进固件。<br>⚠️ Meta <b>官方发布</b>的原始镜像则是按官方布局编译的（分区表 <span class="mono">0x10000</span> / 应用 <span class="mono">0x20000</span> / 4M 槽位），与本机布局不兼容：写进去既不会启动，也无法完成配对（官方配对是 NimBLE 加密会话 + 设备按键确认）。要用官方原始镜像请改用 Meta 官方烧录器（会使用官方单系统布局并覆盖三系统引导）。</p>
         <div class="progress-wrap">
           <div id="customFlashBar" class="progress"></div>
           <div class="bar-label" id="customFlashLabel">待命</div>
         </div>
         <button class="btn pale-green wide" id="btnCustomFlash" disabled>⚡ 刷入指定系统分区</button>
+        <div style="margin-top:12px;padding-top:10px;border-top:1px dashed #d0c8b0">
+          <button class="btn pink sm wide" id="btnResetToAudit" type="button">🔄 复位引导至 Wi-Fi 审计系统 (ota_0)</button>
+          <p class="hint" style="margin-top:4px">若开发板当前停留在 Muse 或其他外部固件中，点击此按钮可重置 otadata 引导扇区，重启后恢复热点审计固件。</p>
+        </div>
       </div>
     </section>
 
@@ -148,6 +154,19 @@
       </div>
       <div class="console-hint" id="consoleHint">控制台就绪 · 115200 输出文本日志 + NDJSON 遥测（以 { 开头的行为 JSON 事件，可用 tools/serial-telemetry.py 解析）</div>
       <pre id="console" class="console"></pre>
+      <div class="console-cmd-bar">
+        <div class="cmd-quick-row">
+          <span class="cmd-label">快捷指令:</span>
+          <button class="btn sm yellow" id="btnQuickBootMuse" type="button" title="发送 boot muse 并重启切换系统">⚡ boot muse</button>
+          <button class="btn sm pink" id="btnQuickBootAudit" type="button" title="发送 boot audit 并重启恢复审计系统">🔄 boot audit</button>
+          <button class="btn sm yellow" id="btnQuickBootStatus" type="button" title="发送 boot status 查看当前系统与槽位">ℹ️ boot status</button>
+          <button class="btn sm yellow" id="btnQuickHelp" type="button" title="发送 help 查看固件所有支持指令">❓ help</button>
+        </div>
+        <div class="cmd-input-row">
+          <input type="text" id="consoleInput" placeholder="输入串口命令 (如 boot muse, boot audit, help) 回车发送..." autocomplete="off" />
+          <button class="btn yellow sm" id="btnSendConsole" type="button">发送</button>
+        </div>
+      </div>
     </section>
 
     <!-- 使用条款 -->
@@ -180,6 +199,6 @@
 
 <footer>ESP32无线网络开发固件烧录台 · WEB SERIAL · 2026</footer>
 
-<script src="/flasher/app.js" type="module"></script>
+<script src="/flasher/app.js?v=1.1.6" type="module"></script>
 </body>
 </html>

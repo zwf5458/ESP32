@@ -1,0 +1,28 @@
+# sdkconfig overlay: build the Meta Muse Gadget SDK (esp32/) into this project's
+# ESP32-C5N16R8 triple-boot layout, so the Muse app can live in ota_2 (0x7F0000)
+# next to the audit firmware (ota_0) and ESPsoup (ota_1).
+#
+# Copy this file and partitions_c5_16mb_triple.csv into the SDK clone first:
+#   E:\code\muse-gadget-sdk\esp32\devices\sdkconfig.c5-16mb-triple
+#   E:\code\muse-gadget-sdk\esp32\partitions_c5_16mb_triple.csv
+#
+# Why the overlay exists: the stock build puts the partition table at 0x10000 and
+# the app at 0x20000 (sdkconfig.defaults). On a board carrying the triple-boot
+# table (table at 0x8000, ota_0 at 0x10000) such an app reads its own image header
+# where it expects the table, finds no app partition and aborts in
+# esp_ota_get_running_partition() (esp_ota_ops.c). Flashing it at 0x10000 also
+# overwrites the audit firmware.
+#
+# Build (ESP-IDF v6.0.3):
+#   idf.py -B build-c5-16mb-triple -DIDF_TARGET=esp32c5 \
+#     -DSDKCONFIG=build-c5-16mb-triple/sdkconfig \
+#     -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;devices/sdkconfig.c5-16mb-triple" \
+#     build
+
+# Partition table at the IDF default offset, matching the triple-boot table.
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_c5_16mb_triple.csv"
+
+# The triple-boot table reaches 0xFF0000, so the build must target 16MB.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"

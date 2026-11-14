@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import Database from 'better-sqlite3';
 import { resolve, join } from 'node:path';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { inflateSync, inflateRawSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import {
@@ -601,11 +601,160 @@ test('多系统引导(契约): 16MB 三系统镜像已接入构建与烧录台',
   assert.ok(/CHIPS=\([^)]*\besp32c5_16mb\b/.test(buildSh), '构建脚本必须编译 16MB 镜像');
   assert.ok(/esp32c5_16mb\)\s*BL_OFFSET="0x2000";\s*ESPTOOL_CHIP="esp32c5"/.test(buildSh),
     '16MB 变体的 bootloader 偏移 0x2000 且 esptool 芯片型号仍须是 esp32c5');
-
   const appJs = readFileSync(join(ROOT, 'flasher', 'app.js'), 'utf-8');
   assert.ok(appJs.includes("key === 'esp32c5_16mb'"), '烧录台必须能正确显示 16MB 变体名称');
   assert.ok(/startsWith\(detected \+ '_'\)/.test(appJs),
     '自动识别不得覆盖手动选择的同芯片变体镜像 (否则 16MB 镜像会被改回 4MB 版)');
+});
+
+test('构建(契约): 4MB C5 改用单 app 槽分区表 (min_spiffs 双槽已装不下)', () => {
+  const ini = readFileSync(join(ROOT, 'firmware', 'platformio.ini'), 'utf-8');
+  const c5 = /\[env:esp32c5\]([\s\S]*?)(?=\n\[|$)/.exec(ini);
+  assert.ok(c5, '必须存在 [env:esp32c5]');
+  assert.ok(/board_build\.partitions = partitions-c5-4mb-single\.csv/.test(c5[1]),
+    'esp32c5 (4MB) 必须使用单 app 槽分区表');
+  assert.ok(!/min_spiffs\.csv/.test(c5[1]),
+    'esp32c5 不得再继承 min_spiffs (双槽每槽 1,966,080 B, 固件已 2,031,617 B)');
+
+  const csv = readFileSync(join(ROOT, 'firmware', 'partitions-c5-4mb-single.csv'), 'utf-8');
+  assert.ok(/^[\x00-\x7F]*$/.test(csv), '分区表必须纯 ASCII (PlatformIO 按系统编码解析)');
+  assert.ok(/^app0,\s+app,\s+ota_0,\s+0x10000,\s+0x3C0000,\s*$/m.test(csv),
+    'app0 必须为 0x10000 起 0x3C0000 长 (3.75MB)');
+  // nvs / spiffs / coredump 偏移必须与 min_spiffs 一致, 否则已存配置与 SPIFFS 数据会被当成新分区
+  assert.ok(/^nvs,\s+data,\s+nvs,\s+0x9000,\s+0x5000,/m.test(csv), 'nvs 必须保持 min_spiffs 的 0x9000/0x5000');
+  assert.ok(/^spiffs,\s+data,\s+spiffs,\s+0x3D0000,\s*0x20000,/m.test(csv), 'spiffs 必须保持 0x3D0000/0x20000');
+  assert.ok(/^coredump,\s+data,\s+coredump,\s*0x3F0000,\s*0x10000,/m.test(csv), 'coredump 必须保持 0x3F0000/0x10000');
+
+  assert.ok(/^otadata,\s+data,\s+ota,\s+0xe000,\s*0x2000,/m.test(csv),
+    'otadata 必须保持 min_spiffs 的 0xe000/0x2000');
+
+  // 16MB 变体必须仍然用三系统表, 不能被 4MB 表顶掉
+  const mb = /\[env:esp32c5_16mb\]([\s\S]*?)(?=\n\[|$)/.exec(ini);
+  assert.ok(mb && /board_build\.partitions = partitions-16mb-triple\.csv/.test(mb[1]),
+    'esp32c5_16mb 必须继续使用 partitions-16mb-triple.csv');
+});
+
+test('烧录台(契约): otadata 复位偏移随分区布局切换 (16MB 0xD000 / 4MB 0xE000)', () => {
+  const appJs = readFileSync(join(ROOT, 'flasher', 'app.js'), 'utf-8');
+  assert.ok(/function otadataAddrFor\(chipKey\)/.test(appJs),
+    '必须由 otadataAddrFor() 按芯片变体决定 otadata 偏移');
+  assert.ok(/return chipKey === 'esp32c5_16mb' \? 0x00D000 : 0x00E000;/.test(appJs),
+    '16MB 三系统表 otadata 在 0xD000, 4MB 单槽表在 0xE000');
+  // 复位引导与自定义刷写都不得再硬编码 0xD000: 4MB 板上 0xD000 属于 nvs 最后一页,
+  // 写 4KB 0xFF 会清掉已存配置 (后台口令 / sysmode)。
+  const hardcoded = appJs.match(/address:\s*0x0*D000/g) || [];
+  assert.equal(hardcoded.length, 0, 'app.js 不得再硬编码写入 0xD000');
+
+  const csv4mb = readFileSync(join(ROOT, 'firmware', 'partitions-c5-4mb-single.csv'), 'utf-8');
+  assert.ok(/^otadata,\s+data,\s+ota,\s+0xe000,/m.test(csv4mb),
+    '4MB 单槽表 otadata 必须是 0xe000, 与 otadataAddrFor() 的默认分支一致');
+  const triple = readFileSync(join(ROOT, 'firmware', 'partitions-16mb-triple.csv'), 'utf-8');
+  assert.ok(/^otadata,\s+data,\s+ota,\s+0x0*d000,/im.test(triple),
+    '16MB 三系统表 otadata 必须是 0xD000, 与 otadataAddrFor() 的 16MB 分支一致');
+});
+
+test('烧录台(契约): 4MB 板不得写 0x400000 / 0x7F0000 槽位', () => {
+  const appJs = readFileSync(join(ROOT, 'flasher', 'app.js'), 'utf-8');
+  assert.ok(/if \(targetAddr >= 0x400000\)/.test(appJs),
+    '自定义刷写必须在目标 >= 0x400000 时先实测 Flash 容量');
+  const guard = appJs.slice(appJs.indexOf('if (targetAddr >= 0x400000)'));
+  assert.ok(guard.slice(0, 900).includes('detectFlashSize()'),
+    '容量校验必须用 detectFlashSize() 实测, 不能只看芯片型号 (4MB 镜像也可能刷在 16MB 板上)');
+  assert.ok(guard.slice(0, 1200).includes('目标槽位超出本板 Flash 容量'),
+    '越界时必须明确提示 0x400000/0x7F0000 只在 16MB 三系统布局中存在');
+});
+
+test('多系统引导(契约): 烧录台支持一键载入官方 Muse 固件与复位引导至 ota_0', () => {
+  const html = readFileSync(join(ROOT, 'flasher', 'index.html'), 'utf-8');
+  const appJs = readFileSync(join(ROOT, 'flasher', 'app.js'), 'utf-8');
+  const indexJs = readFileSync(join(ROOT, 'server', 'src', 'index.js'), 'utf-8');
+
+  assert.ok(html.includes('id="btnLoadMusePreset"'), '必须有一键载入官方原版 Muse 固件按钮');
+  assert.ok(html.includes('id="btnResetToAudit"'), '必须有复位引导至 Wi-Fi 审计系统按钮');
+  assert.ok(html.includes('id="consoleInput"') && html.includes('id="btnSendConsole"'), '串口控制台必须包含命令输入框与发送按钮');
+  assert.ok(html.includes('id="btnQuickBootMuse"') && html.includes('id="btnQuickBootAudit"'), '串口控制台必须包含 boot muse / boot audit 快捷按钮');
+  assert.ok(appJs.includes('sendConsoleCmd'), '前端必须实现串口命令发送逻辑');
+  assert.ok(appJs.includes('/api/firmware/muse'), '烧录台必须通过 /api/firmware/muse 获取 Muse 固件');
+  assert.ok(appJs.includes('/api/firmware/otadata-blank'), '烧录台必须通过 /api/firmware/otadata-blank 获取清空扇区');
+  assert.ok(indexJs.includes("app.get('/api/firmware/muse'"), '服务端必须注册 /api/firmware/muse 接口');
+  assert.ok(indexJs.includes("app.get('/api/firmware/otadata-blank'"), '服务端必须注册 /api/firmware/otadata-blank 接口');
+});
+
+test('多系统引导(契约): 官方 Muse 镜像不得写入 ota_0, 源码不得硬编码 SDK Token', () => {
+  const html = readFileSync(join(ROOT, 'flasher', 'index.html'), 'utf-8');
+  const appJs = readFileSync(join(ROOT, 'flasher', 'app.js'), 'utf-8');
+  const museH = readFileSync(join(ROOT, 'firmware', 'src', 'muse_companion.h'), 'utf-8');
+  const mainCpp = readFileSync(join(ROOT, 'firmware', 'src', 'main.cpp'), 'utf-8');
+
+  // Meta 官方镜像按官方布局编译 (表 0x10000 / app 0x20000 / 4M 槽位)，
+  // 写进 ota_0 既覆盖审计固件，又会让应用把自己的镜像头当分区表解析而断言崩溃。
+  const presetStart = appJs.indexOf('btnLoadMusePreset.onclick');
+  assert.ok(presetStart > -1, '必须保留 Muse 预设载入逻辑');
+  const presetBlock = appJs.slice(presetStart, appJs.indexOf('btnResetToAudit'));
+  assert.ok(/slotSelect\.value = '0x7F0000'/.test(presetBlock),
+    'Muse 预设必须指向 ota_2 (0x7F0000) 预留槽位');
+  assert.ok(!/slotSelect\.value = '0x10000'/.test(appJs),
+    '不得把官方 Muse 镜像自动写入 ota_0 (0x10000)');
+  assert.ok(!/一键载入官方原版 Muse 固件/.test(html), '按钮不得再宣称「一键载入官方原版 Muse 固件」');
+  assert.ok(html.includes('不兼容'), '烧录台必须明确提示官方布局与本机三系统布局不兼容');
+
+  // 每台设备必须用自己的 mgst_ Token (官方经串口写入 NVS)，源码里不能留字面量密钥。
+  assert.ok(!/mgst_[A-Za-z0-9_-]{10,}/.test(museH), 'muse_companion.h 不得硬编码 SDK Token');
+  assert.ok(!/mgst_[A-Za-z0-9_-]{10,}/.test(mainCpp), 'main.cpp 不得硬编码 SDK Token');
+});
+
+test('多系统引导(契约): 烧录台的 Muse 预设是已适配三系统的重编固件', () => {
+  const html = readFileSync(join(ROOT, 'flasher', 'index.html'), 'utf-8');
+  const appJs = readFileSync(join(ROOT, 'flasher', 'app.js'), 'utf-8');
+  const indexJs = readFileSync(join(ROOT, 'server', 'src', 'index.js'), 'utf-8');
+  const gitignore = readFileSync(join(ROOT, '.gitignore'), 'utf-8');
+
+  // 内置镜像必须是按本工程三系统表重编的应用镜像：ESP app image magic 0xE9 起头，
+  // 体积约 1.7MB（< ota_2 的 4032K）。若是整片合并镜像（0xE9 在 0x1000/0x2000）或
+  // 仍是官方布局的旧版，这条会先失败，避免烧录台悄悄下发不能启动的固件。
+  const musePath = join(ROOT, 'server', 'firmware', 'muse-gadget.bin');
+  assert.ok(existsSync(musePath), 'server/firmware/muse-gadget.bin 必须存在（烧录台预设依赖它）');
+  const muse = readFileSync(musePath);
+  assert.equal(muse[0], 0xe9, 'muse-gadget.bin 必须是 ESP 应用镜像（首字节 0xE9），不是整片合并镜像');
+  assert.ok(muse.length > 1024 * 1024 && muse.length < 0x3f0000,
+    `muse-gadget.bin 体积必须落在 ota_2 槽位内 (实测 ${muse.length} B)`);
+
+  // 必须入库：/.gitignore 曾把它整行忽略，clone 下来烧录台会 404。
+  const ignored = gitignore.split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('#'))
+    .some((l) => l === 'server/firmware/muse-gadget.bin');
+  assert.ok(!ignored, '.gitignore 不得再忽略 server/firmware/muse-gadget.bin');
+
+  // otadata 空白扇区改为现生成，不再依赖被忽略的 tools/otadata-blank.bin。
+  assert.ok(/new Uint8Array\(4096\)\.fill\(0xff\)/.test(indexJs),
+    '/api/firmware/otadata-blank 必须直接生成 4KB 0xFF，不依赖本地临时文件');
+  assert.ok(!indexJs.includes("'otadata-blank.bin')"),
+    '服务端不得再从 tools/otadata-blank.bin 读文件（该文件被 .gitignore 忽略）');
+
+  // 前端文案必须与实际行为一致（适配版可直接启动，Token 由串口注入）。
+  assert.ok(html.includes('载入已适配的 Muse 固件'), '按钮文案必须说明是已适配的 Muse 固件');
+  assert.ok(appJs.includes('三系统适配版'), '终端反馈必须说明载入的是三系统适配版');
+  assert.ok(appJs.includes('sdk_token=mgst_'), '必须提示配对前用串口注入个人 Token');
+});
+
+test('多系统引导(契约): Muse SDK 覆盖分区表与工程分区表保持一致', () => {
+  const read = (p) => readFileSync(join(ROOT, p), 'utf-8');
+  const rows = (text) => text.split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('#'));
+
+  const projectRows = rows(read('firmware/partitions-16mb-triple.csv'));
+  const museRows = rows(read('firmware/muse-sdk/partitions_c5_16mb_triple.csv'));
+  assert.deepStrictEqual(museRows, projectRows,
+    'firmware/muse-sdk/partitions_c5_16mb_triple.csv 的分区行必须与工程分区表逐行一致');
+
+  const overlay = read('firmware/muse-sdk/sdkconfig.c5-16mb-triple');
+  assert.ok(/^CONFIG_PARTITION_TABLE_OFFSET=0x8000$/m.test(overlay),
+    'overlay 必须把分区表放回 0x8000 (否则官方 app 会把自身镜像头当分区表)');
+  assert.ok(overlay.includes('CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_c5_16mb_triple.csv"'),
+    'overlay 必须引用 muse-sdk 的分区表文件');
+  assert.ok(/^CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y$/m.test(overlay), 'overlay 必须按 16MB Flash 构建');
 });
 
 test('多系统引导(契约): C5 构建开启原生 USB CDC (真机验收要求)', () => {

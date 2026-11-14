@@ -2597,12 +2597,17 @@ async function doSwitchBoot(id, name, installed) {
     msg = `【固件未就绪提示】\n目标分区 (${id}) 尚未检测到有效固件，切换后可能因镜像缺失而无法启动（需在烧录台先刷入对应分区）。\n\n是否仍然强制切换引导分区？`;
   }
   if (!confirm(msg)) return;
+  let sdkToken = '';
+  if (id === 'muse') {
+    const input = prompt('【可选】Meta Muse SDK Token (以 mgst_ 开头)。\n\n注意: 本机的 Muse 模式是项目自实现的 BLE 握手，不是 Meta 官方配对协议；要在 Muse 官方 App 里完成配对，需要使用按官方布局构建的固件。留空则沿用设备已存 Token。');
+    if (input && input.trim()) sdkToken = input.trim();
+  }
   try {
     toast(`正在切换引导至【${name}】并重启 …`);
     const r = await api('/api/system/boot', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ target: id })
+      body: JSON.stringify({ target: id, sdk_token: sdkToken })
     });
     if (r && r.ok) {
       alert(`已成功设置引导分区为【${name}】！\n\n设备正在重启中，请留意板载指示灯并切换连接方式：\n- ESPsoup 模式：请使用 Native USB 数据线连接电脑/手机打开 app.espsoup.com\n- Muse AI 模式：请使用家庭 Wi-Fi 6 并在 Muse 手机端配对`);

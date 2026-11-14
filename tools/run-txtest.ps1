@@ -1,4 +1,4 @@
-# txtest 运行器: 等设备启动 → 连热点 → 串口发 txtest → 打印结果
+﻿# txtest 运行器: 等设备启动 → 连热点 → 串口发 txtest → 打印结果
 $ser = New-Object System.IO.Ports.SerialPort('COM3',115200,'None',8,'One')
 $ser.Open()
 Start-Sleep -Seconds 16

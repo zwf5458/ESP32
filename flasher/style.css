@@ -245,11 +245,33 @@ html.dark .card.yellow .box-check,html.dark .card.blue .box-check{background:rgb
   border-top:var(--bd); border-bottom:var(--bd);
 }
 .console{
-  margin:0; height:520px; overflow-y:auto;
+  margin:0; height:460px; overflow-y:auto;
   background:var(--console-bg); color:var(--console-tx);
   font-family:"SF Mono",Menlo,Consolas,monospace; font-size:13px; line-height:1.75;
   padding:14px 18px; white-space:pre-wrap; word-break:break-all;
   border-top:var(--bd);
+}
+.console-cmd-bar{
+  background:var(--panel); border-top:var(--bd);
+  padding:10px 14px; display:flex; flex-direction:column; gap:8px;
+}
+.cmd-quick-row{
+  display:flex; align-items:center; flex-wrap:wrap; gap:8px;
+}
+.cmd-label{
+  font-size:12px; font-weight:700; color:var(--ink); margin-right:4px;
+}
+.cmd-input-row{
+  display:flex; gap:8px; align-items:center;
+}
+.cmd-input-row input{
+  flex:1; background:var(--bg); color:var(--ink);
+  border:var(--bd); border-radius:8px; padding:7px 12px;
+  font-family:"SF Mono",Menlo,Consolas,monospace; font-size:13px;
+  outline:none; box-sizing:border-box;
+}
+.cmd-input-row input:focus{
+  border-color:var(--ink); box-shadow:var(--shadow-sm);
 }
 .console::-webkit-scrollbar{width:12px}
 .console::-webkit-scrollbar-thumb{background:var(--yellow-bd); border:var(--bd)}

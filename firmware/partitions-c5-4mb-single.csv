@@ -1,0 +1,14 @@
+# ESP32-C5 4MB Flash single-app partition table.
+# Replaces min_spiffs.csv for [env:esp32c5] only: the audit firmware outgrew
+# min_spiffs' dual-OTA slots (2,031,617 B > 0x1E0000 = 1,966,080 B per slot),
+# and dual OTA was already unusable there (no ota_1/ota_2 to switch to).
+# nvs / otadata / spiffs / coredump keep the min_spiffs offsets and sizes, so
+# existing settings and SPIFFS data survive a reflash; only the unused second
+# app slot (0x1F0000-0x3CFFFF) is merged into app0.
+# NOTE: keep this file ASCII-only (PlatformIO parses it with the system codec).
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,  0x5000,
+otadata,  data, ota,     0xe000,  0x2000,
+app0,     app,  ota_0,   0x10000, 0x3C0000,
+spiffs,   data, spiffs,  0x3D0000,0x20000,
+coredump, data, coredump,0x3F0000,0x10000,

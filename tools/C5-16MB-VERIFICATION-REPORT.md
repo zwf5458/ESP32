@@ -204,6 +204,12 @@ esac
 - [ ] 整片备份恢复（16MB 全片读回 + esptool write_flash 0x0）
 - [ ] 切换过程中断电：otadata 原子性回退
 
+> ⚠️ 2026-11-14 纠偏（Muse 槽位）：Meta 官方预编译 `muse-gadget.bin` 按官方布局编译
+> （分区表 `0x10000` / app `0x20000` / 4M 槽位），与本表不兼容，写进 `ota_0` 或 `ota_2`
+> 都不启动（前者崩溃在 `esp_ota_get_running_partition()`，后者同样读不到自己的分区）。
+> 因此上面两条 Muse 项**不能**用官方原始镜像验证，须先按 `firmware/muse-sdk/README.md`
+> 重编，再验 installed 检测 / 切换 / 配对。细节见 `docs/firmware-flashing.md` §6.6、§6.9。
+
 ---
 
 ## 六、快速诊断命令
