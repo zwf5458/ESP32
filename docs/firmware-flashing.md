@@ -23,8 +23,11 @@
 > 烧录台依赖已随仓库内置在 `flasher/vendor/`（esptool-js 0.7.1 + crypto-js 4.2.0），
 > 页面加载**不需要**访问公网 CDN，离线 / 内网环境可直接使用。
 
-> 原生 USB 开发板（S3 / C3 / C6 / C5 常见两个 USB 口）请连接标注 **UART** 的口；
-> 本固件未启用 USB CDC，连接原生 USB 口可能无法识别串口。
+> 原生 USB 开发板（S3 / C3 / C6 / C5 常见两个 USB 口）：C5 的两个 env
+> （`esp32c5` / `esp32c5_16mb`）已开启 `ARDUINO_USB_CDC_ON_BOOT=1`，原生 USB 口即
+> `Serial`（日志 / CLI / 首次口令）所在口；其余芯片的固件仍走 UART，请连接标注
+> **UART** 的口。C5 实测：射频反复重启后原生 USB CDC 可能不再重新枚举，此时改用板载
+> CH340 的 UART 口抓日志 / 复位（见 §5.7）。
 
 ---
 
@@ -203,7 +206,9 @@ python3 -m esptool --chip esp32s3 -p /dev/ttyUSB0 -b 460800 \
 | 输入 `esp32admin` 无效 | 该值是旧版遗留默认值，仅用于升级识别 | 使用串口输出的随机初始口令 |
 | 网页备份读不出来 / 中途失败 | 高速率不稳、供电不足、串口被其他程序占用 | 关闭其他串口工具、换线换口后重试；或用命令行 `read-flash` 降到 460800/115200；备份只读，失败不影响设备 |
 | 忘记后台口令 | 口令只存 NVS，无物理重置入口 | 重新烧录整片镜像（或 `erase-flash`）→ 首次启动重新生成口令 |
-| C5 部分功能报错 | C5 对 raw TX 的 SDK 支持受限（实验性） | 属预期行为，后台会显示错误码；刷写与后台本身不受影响 |
+| C5 启动反复打印 `invalid header: 0xa8030007` | 用 `pio run -t upload` 直接烧时 bootloader 被写到 0x0（C5 应在 0x2000） | 见 §5.7；改用合并镜像从 0x0 整片写入，或 `pio run` 已由 post 脚本自动修正偏移后重烧 |
+| C5 原生 USB 口（CDC）重启后消失 | 射频反复重启后 USB CDC 未重新枚举 | 用 CH340 的 UART 口（如 COM5）抓日志 / 复位，见 §5.7；不是板子变砖 |
+| 起邪恶双子后管理热点 `WiFi-12F9` 消失 | 克隆阶段软 AP 已真实改名为目标 SSID（开放） | 属预期行为；攻击停止或复位后恢复 `WiFi-12F9`，见 §5.7 |
 
 ---
 
@@ -238,7 +243,8 @@ esptool --chip esp32c5 -p COM5 read-mac
 > 若提示找不到 `esptool`，改用 `python -m esptool`，或使用 PlatformIO 自带的
 > `%USERPROFILE%\.platformio\packages\tool-esptool\esptool.exe`（见 2.2 节）。
 
-> 连接板子标注 **UART** 的 USB 口；固件未启用 USB CDC，只接原生 USB 口可能看不到启动日志。
+> C5 已开启 USB CDC：原生 USB 口（COM3）与 UART 口（CH340，如 COM5）都能看到启动日志；
+> 射频反复重启后原生 USB CDC 可能不再重新枚举，此时改用 UART 口。
 > 自动复位失败时：按住 **BOOT** → 点一下 **RST/EN** → 松开 BOOT，再执行命令。
 
 ### 5.2 备份整片 16MB Flash（首刷最重要的一步）
@@ -307,9 +313,67 @@ esptool --chip esp32c5 -p COM5 -b 460800 write-flash 0x0 c5n16r8-backup.bin
   只有做 16MB 三系统时才需要手动选同芯片的 `ESP32-C5 (16MB 三系统)` 变体）；
 - 不要往 4MB 镜像上强行套 16MB 分区表 / 改 bootloader 头：要用满 16MB 请直接
   构建并烧录 `esp32c5_16mb` 专用镜像（见 §6），两个镜像在烧录台里分开注册；
-- 不要因为 Deauth / raw TX 报错就判断板子坏：C5 对 raw TX 的 SDK 支持受限，
-  后台会如实显示错误码；
+- 不要因为个别 raw TX 报错就判断板子坏：C5 的帧类型白名单已解除（Deauth/Disassoc
+  真机可发），广播 Deauth 被 Wi-Fi 6 终端丢弃时会转而学习客户端 MAC 做单播定向踢线；
+  若某平台仍拒绝，后台会如实显示错误码；
 - 不要用劣质 USB 线或供电不足的 Hub 刷写，写入中断虽可恢复，但会增加排查成本。
+
+### 5.7 `pio run -t upload` 开发态烧录（C5 bootloader 偏移坑）
+
+网页烧录台 / 命令行写的是 **合并镜像**，从 `0x0` 整片写入，bootloader 已在镜像内
+按芯片排好（C5 在 `0x2000`），不会踩坑。但开发时常用的
+`pio run -e esp32c5_16mb -t upload` 走的是 PlatformIO 的分段写入：
+
+- `framework-arduinoespressif32/tools/platformio-build.py` 的 `FLASH_EXTRA_IMAGES`
+  对 riscv 芯片统一用 `0x0000`（只有 esp32/esp32s2 用 `0x1000`），而 **ESP32-C5 的
+  二阶段 bootloader 实际位于 `0x2000`**（arduino `boards.txt`：
+  `esp32c5.build.bootloader_addr=0x2000`，PlatformIO 不读该文件）。
+- 后果：`pio upload` 把 bootloader 写到 `0x0`，`0x2000` 处无合法镜像头，上电 ROM
+  反复打印 `invalid header: 0xa8030007` +
+  `assertion "result == ETS_OK" failed: ... ets_flash_boot`，无限复位。
+
+**已修复（2026-11-13，提交 `ff62eda`）**：
+
+- `firmware/platformio.ini` 的 `[env:esp32c5_16mb]` 加
+  `board_build.bootloader_addr = 0x2000` 并**显式重写** `extra_scripts`（该选项不会
+  自动继承 `[env]`，必须再带上 `pre:tools/embed_admin_page.py`）：
+  ```ini
+  extra_scripts =
+      pre:tools/embed_admin_page.py
+      post:tools/fix_c5_bootloader_offset.py
+  ```
+- `post` 脚本同时修正 `FLASH_EXTRA_IMAGES` 与**已经展开的** `UPLOADERFLAGS`（pre 阶段
+  框架还没追加镜像，改不到），仅 `mcu == esp32c5` 生效。
+- 自检：`pio run -e esp32c5_16mb -t upload -v --upload-port COM99` 的 esptool 命令行
+  应出现 `write-flash ... 0x2000 ...bootloader.bin 0x8000 ...partitions.bin
+  0xe000 ...boot_app0.bin 0x10000 ...firmware.bin`。真机实烧后串口 `invalid header`
+  计数为 0、正常打印 `v1.1.0` 启动横幅。
+
+**若仍用旧配置刷坏了**（无限复位）：用 esptool 按正确偏移手动重烧即可救回，
+不需要再次整片擦除：
+
+```powershell
+esptool --chip esp32c5 -p COM5 -b 921600 write-flash -z `
+  --flash-mode dio --flash-freq 80m --flash-size 16MB `
+  0x2000 .pio\build\esp32c5_16mb\bootloader.bin `
+  0x8000 .pio\build\esp32c5_16mb\partitions.bin `
+  0xe000 "$env:USERPROFILE\.platformio\packages\framework-arduinoespressif32\tools\partitions\boot_app0.bin" `
+  0x10000 .pio\build\esp32c5_16mb\firmware.bin
+```
+
+### 5.8 C5N16R8 射频重启后的串口 / 热点现象（排障）
+
+- **原生 USB CDC（COM3）可能不再重新枚举**：邪恶双子 / 双频跳频会让射频反复
+  stop/start，实测此后原生 USB 口在设备管理器里消失，但板载 CH340 的 UART 口
+  （本板为 **COM5**）始终可用，`esptool --chip esp32c5 -p COM5 chip_id` 能读到 MAC。
+  用 UART 口正常启动的复位时序：`DTR=1`（拉低 EN）→ 200ms → `DTR=0`；esptool /
+  烧录台的 `--after hard-reset` 也会触发复位。这不是变砖。
+- **起攻击后 `WiFi-12F9` 热点消失**：克隆阶段把软 AP **真实改名**为目标 SSID
+  （本环境 `WiFi6`，开放无密码）并驻留到主目标信道；管理热点自然不可见。
+  单射频双频覆盖时克隆热点会在 5G ch149 与双子 2.4G ch11 之间每 2s 跳一次，
+  扫描结果时有时无属预期。停止攻击或复位后恢复 `WiFi-12F9` / `00000000` / 管理页。
+- **板子 RTS 接复位脚**：开/关串口或动 RTS 都会触发复位，长时间挂串口会打断验证；
+  纯 HTTP 验证时不要保持 COM 长连接。
 
 ---
 

@@ -4,6 +4,13 @@
 > 设备：ESP32-C5N16R8，MAC `14:C1:9F:8A:12:F9`，COM3 (USB CDC)
 > 验收方式：`tools\verify-*.py` 脚本化真机流程 + 合成目标（全程不碰真实网络）
 
+> ⚠️ **重要后续更新（2026-11-13 当日晚些时候）**：本文 §1 记录的「Deauth 平台受限」
+> 结论**已被后续提交推翻**，仅作为当时的实验记录保留。现已通过覆盖
+> `ieee80211_raw_frame_sanity_check`（链接加 `-Wl,--allow-multiple-definition`）解除
+> C5 帧类型白名单，并改用「从空口学习客户端 MAC → 单播定向 Deauth」把真实 Wi-Fi 6
+> 客户端踢下线；同日补齐 5G 克隆 AP 与双频跳频压制，均已在真机复测通过。
+> **以 §5 为准**；§1 的「诚实降级」分支现仅作为白名单确被解除前的兜底路径。
+
 ---
 
 ## 结论总览
@@ -13,8 +20,8 @@
 | BLE 扫描 | ✓ 有效 | 扫描启动/停止/设备计数正常 |
 | 802.15.4 嗅探 | ✓ 有效（带服务窗口制） | 单射频共存问题已定位并修复 |
 | Karma 探针捕获 | ✓ 有效 | 45s 捕获 26 个真实探针（含邻居 SSID） |
-| Deauth 远程压制 | ✗ 平台受限（诚实降级） | C5 WiFi 库白名单拒绝，见下 |
-| 邪恶双子 | ✓ 核心链路有效 | 克隆热点+凭据捕获+自动收尾+恢复 |
+| Deauth 远程压制 | ✓ 有效（当日后续修复，见 §5） | 初测平台受限（§1 保留）；白名单已解除 + 单播定向踢线，真机把 5G/2.4G 客户端踢下线 |
+| 邪恶双子 | ✓ 核心链路有效 | 克隆热点+凭据捕获+自动收尾+恢复；5G 克隆与双频跳频真机复测通过（§5） |
 
 ---
 
@@ -68,13 +75,83 @@
 
 ---
 
-## 相关提交（均已提交未推送）
+## 5. 后续真机复测（2026-11-13）：真实 802.11 压制生效
+
+本节记录 §1「平台受限」结论被推翻后的真机结果，提交 `14a8dc3` / `cb1cd8b` /
+`c806001` / `0aeb60b` / `f466a6b` / `ff62eda`（均已 push 到 `origin/main`）。
+
+### 5.1 两个叠加根因（手机此前「没被挤掉」）
+
+1. **广播 Deauth 被丢弃**：`DA=FF:FF:FF:FF:FF:FF` 的解除认证帧在 Wi-Fi 6 手机/网卡
+   上被驱动层静默丢弃 —— 帧计数一直涨、设备毫无反应。
+2. **攻击频段与目标不符**：目标 `WiFi6` 是双频同名（2.4G ch11 = `…DD:71`、
+   5G ch149 = `…DD:72`，均 WPA2 / 802.11ax），手机与 Windows AX210 默认优先 5G；
+   而 `softAP(ch149)` 返回 true 却驻留在 2.4G（band mode 未切），攻击全发在错误频段。
+
+### 5.2 修复链路（均为真实空口帧，经 `esp_wifi_80211_tx`）
+
+- **解除白名单**（`227d545`）：`extern "C" int ieee80211_raw_frame_sanity_check(...) { return 0; }`
+  覆盖 `libnet80211.a` 的强符号，链接加 `-Wl,--allow-multiple-definition`；
+  C5 的 Deauth/Disassoc 不再返回 258。
+- **单播定向踢线**（`cb1cd8b`）：Deauth 运行期开 promiscuous，从 ToDS/FromDS 数据帧
+  学习该 AP 下客户端 MAC（最多 12 个，`learnClientMac`），发送单播 Deauth
+  （DA=客户端 / TA=BSSID=目标 AP），原因码 1/3/7/15 轮换，每 4 帧留 1 帧广播兜底。
+- **信标走 STA 接口**（`wifiBeaconTx`）：AP 接口注入的 Beacon 空口不可见，改由
+  `WIFI_IF_STA` 发出（真机 4 次扫描 4 次命中）。
+- **5G 克隆 / 频段顺序**（`14a8dc3` / `f466a6b`）：5G 目标先
+  `esp_wifi_set_band_mode(WIFI_BAND_MODE_5G_ONLY)` 再起 AP，且顺序为「先切频段、再设
+  HT20 带宽」（AUTO 下 `set_bandwidth` 会报错），启动后用 `esp_wifi_get_channel` 校验
+  真实驻留信道。
+- **promiscuous 时序**（`c806001` / `0aeb60b`）：直接进阶段 2 时
+  `syncPromiscuousEngine()` 恢复被 `softAP` 重配清掉的混杂态；探测 Deauth 前先开
+  promiscuous，避免误判「平台阻断」走 CSA。新增 `prom / rxFrames / rxData / rxMatch`
+  诊断计数，用于区分「收不到帧」与「收到但没有目标 BSSID 的数据帧」。
+
+### 5.3 量化结果（`/api/info` 实测）
+
+| 目标 | 学到客户端 | 单播帧 | 真实 AP 在线设备变化 |
+|---|---|---|---|
+| 5G ch149 `…DD:72` | 5 台 | 1111+ 帧（count 1481，rxMatch 2865） | 6 → **2** |
+| 2.4G ch11 `…DD:71` | 2 台 | 持续单播（每 8s +60 帧） | 1~3 → **0**（被踢光） |
+
+克隆热点 `14:c1:9f:8a:12:f9` 同期只有 1 台（本机），说明其它设备确被踢下线。
+
+### 5.4 双频同名一次覆盖（主 5G + 双子 2.4G）
+
+把 2.4G `…DD:71`（ch11）加进「双子目标」后，主目标仍为 5G `…DD:72`（ch149）：
+单射频靠 `TWIN_HOP_INTERVAL_MS=2000` 每 2s 跳到双子信道发一轮 Deauth 再跳回主信道。
+真机现象：克隆 `WiFi6`（开放）在 **5G ch149** 与 **2.4G ch11** 交替出现；手机连
+`WiFi6` 持续抖动 / 被踢；两个真实 BSSID 的在线设备数同时被打下来。
+
+> 副作用（非崩溃）：克隆阶段管理热点 `WiFi-12F9` 会消失（软 AP 已改名为目标
+> SSID）；原生 USB CDC（COM3）在射频反复重启后可能不再枚举，但 CH340 UART
+> （COM5）始终可用，可抓日志 / 复位（`DTR=1`→200ms→`DTR=0` 正常启动）。
+> 复位后攻击停止、热点恢复 `WiFi-12F9` / `00000000` / 口令 `admin888`。
+
+### 5.5 烧录坑（同日修复，`ff62eda`）
+
+`pio run -e esp32c5_16mb -t upload` 把 bootloader 写到 `0x0`（C5 应在 `0x2000`），
+导致 `invalid header: 0xa8030007` 无限复位。已用 `post` 脚本
+`firmware/tools/fix_c5_bootloader_offset.py` 修正 esptool 命令行偏移，实烧验证启动
+日志 `invalid header`=0、正常打印 `v1.1.0` 横幅。详见 `docs/firmware-flashing.md` §5.7。
+
+### 5.6 结论
+
+**C5 的 5G 克隆 AP、真实 802.11 Deauth、5G 目标取消认证、双频跳频压制全链路真机通过**；
+§1 的「平台受限 / 诚实降级」仅代表修复前的实验快照，兜底分支（CSA / 停用引擎）保留
+应对个别平台仍拒绝 raw TX 的情况，不再是 C5 的常态。
+
+---
+
+## 相关提交
 
 - d7a6eb7 / 2861265 扫描频段过滤
 - 18dd6f3 / 2aa34cf / 8476894 / 5d05eef 真机验证与窗口制
 - 15b4d0f 分区表新增 coredump 分区
 - 067cabf i154 服务窗口共存修复
-- d1c5994 Deauth 平台限制探测与诚实降级
-- 3fb604b Deauth 引擎 258 后停止重试
+- 227d545 覆盖 `ieee80211_raw_frame_sanity_check` 解除 C5 帧类型白名单
+- d1c5994 / 3fb604b Deauth 平台限制探测与诚实降级（修复前兜底，见 §1）
 - 71b7df3 HWCDC 背压防护
 - 4a5f56e 验收脚本集 + coredump 取证工具
+- 14a8dc3 / cb1cd8b / c806001 / 0aeb60b / f466a6b / ff62eda 5G 克隆 / 单播定向
+  Deauth / promiscuous 时序 / 频段带宽顺序 / bootloader 偏移（见 §5，均已 push）

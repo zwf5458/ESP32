@@ -1,7 +1,9 @@
 # 设备识别与指纹（P4）改造清单
 
 日期：2026-11-12
-状态：**P4-0 ~ P4-3 已实现（待真机验证）**；不阻塞 v1.1.0 首刷与 16MB 三系统部署
+状态：**P4-0 ~ P4-3 已实现**；**2026-11-13 在 ESP32-C5N16R8 真机验证 BLE 扫描 /
+802.15.4 嗅探 / Karma 基本链路有效**（见 `tools/c5-feature-acceptance-report.md`），
+OUI 厂商名 / Remote ID 解析的现场信号回放仍待补；不阻塞 v1.1.0 首刷与 16MB 三系统部署
 关联：[C5 5GHz / BLE / 802.15.4 roadmap](./2026-11-11-c5-5ghz-ble-802154-roadmap.md)、
 [平台设计文档 §4 能力矩阵](./2026-11-09-esp32-firmware-platform-design.md)、
 [刷固件说明 §6 三系统](../firmware-flashing.md#6-附16mb-flash-三系统-triple-boot-部署说明)

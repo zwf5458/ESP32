@@ -63,7 +63,8 @@ ESP32/
   `FW_IEEE802154_SUPPORTED = SOC_IEEE802154_SUPPORTED && CONFIG_IEEE802154_ENABLED && !FW_IEEE802154_DISABLED`），
   不做源码分叉；经典 ESP32 因 Bluedroid 体积与 4MB 双槽冲突在 `platformio.ini` 里
   `-DFW_BLE_DISABLED` 裁剪 BLE
-- 串口 UART 日志 115200（烧录台串口控制台可见；未启用 USB CDC 宏）
+- 串口 UART 日志 115200（烧录台串口控制台可见）；C5 两个 env 另开
+  `-DARDUINO_USB_CDC_ON_BOOT=1`，原生 USB 口即 `Serial`（2026-11-13 起，见 C5 验收报告）
 - AP：SSID `WiFi-` + MAC 尾 4 位十六进制，密码 `00000000`，信道 6
 - Captive Portal（强制门户）：`DNSServer` UDP 53 通配 `*` 解析 → `192.168.4.1`；
   `notFound()` 对 iOS(`/hotspot-detect.html`) / Android(`/generate_204`) /
@@ -138,8 +139,9 @@ Karma 自 2026-11-10 / 2026-11-11 起为真实空口实现，影响真实周边�
    仅限演示，不应用于真实网络，实验后应清空。
 
 法律提醒：干扰他人通信 / 伪造他人网络可触及《网络安全法》第 27 条等，
-销售形态风险更高；C5 作为 WiFi 6 双频芯片对 raw TX 的 SDK 支持受限
-（此时 Deauther 会返回 TX 错误码并在后台如实标注，不再计数）。
+销售形态风险更高。C5 早期因 WiFi 库帧类型白名单拒绝 Deauth（2026-11-13 已通过覆盖
+`ieee80211_raw_frame_sanity_check` 解除并真机验证 5G 单播定向踢线生效，见 C5 验收报告）；
+若个别平台仍拒绝 raw TX，Deauther 会返回 TX 错误码并在后台如实标注，不再计数。
 Deauther 自 2026-11-10 起为**真实空口帧注入**；握手包模块自 2026-11-10 起为
 **真实空口抓包 + 真实离线跑包**（promiscuous 解析 EAPOL-Key 帧，MIC 校验与
 aircrack-ng 官方向量一致）；Evil Twin 自 2026-11-10 起为**真实实现**
@@ -327,19 +329,24 @@ redeem 只在 writeFlash 完整成功后由前端触发，且后端按 nonce+chi
 ## 9. 后续阶段（非本期）
 
 - 教学模块空口实现：Deauther / Evil Twin / 握手包 / Sniffer / Airodump / Karma 已完成
-  真实实现；剩余为 C5 真机复核（双频并发压制、raw TX 支持度）与端到端验收。
+  真实实现；**2026-11-13 已在 ESP32-C5N16R8 真机复核通过**（5G 克隆 AP、单播定向
+  Deauth、双频跳频压制；raw TX 帧类型白名单已解除），详见
+  `tools/c5-feature-acceptance-report.md` §5。剩余为其余 5 颗芯片端到端验收。
   真抓包涉及监听他人网络的授权边界（法律风险高）
 - 云部署（HTTPS 域名 + CDN 托管静态烧录台）
 - 图文教程静态页（tw.html / az.html 等）
-- ESP32-C5 真机验证（镜像已产出；espressif32 v8 无官方 c5-libs，
-  由 tools/install-c5-libs.sh 本地注入编译，板级参数待真机复核）
+- ESP32-C5 真机验证（**2026-11-13 已完成**：镜像、16MB 三系统、5G/2.4G 邪恶双子 +
+  双频 Deauth 压制、bootloader 烧录偏移修复均真机通过，见
+  `tools/c5-feature-acceptance-report.md` 与 `tools/C5-16MB-VERIFICATION-REPORT.md`；
+  espressif32 v8 无官方 c5-libs，由 tools/install-c5-libs.sh 本地注入编译）
 - Web 发码管理页（当前仅 `tools/gen-code.mjs` CLI 发码 + `POST /api/admin/codes`）
 - **C5 5GHz / BLE 5 / 802.15.4 能力扩展**：差距与改造清单见
   [C5 5GHz / BLE 5 / 802.15.4 能力差距与改造清单](./2026-11-11-c5-5ghz-ble-802154-roadmap.md)。
-  当前 AP / 取消认证 / 双子的 5G 路径已实现（**P0** 5G 抓包停驻与跳频；
-  **P1** 5G AP（非 DFS）、5G 取消认证/双子（含 DFS 跳频注入），均待 C5 真机验证）；
+  当前 AP / 取消认证 / 双子的 5G 路径已实现并 **2026-11-13 C5 真机验证通过**
+  （**P0** 5G 抓包停驻与跳频；**P1** 5G AP（非 DFS）、5G 取消认证/双子（含 DFS 跳频注入），
+  实测 5G ch149 克隆、单播定向踢线、主 5G + 双子 2.4G 双频压制）；
   **P2** BLE 广播嗅探已实现（纯被动，C3/C5/C6/S3 走 NimBLE，
-  经典 ESP32 因 Bluedroid 体积与 4MB 双槽冲突裁剪），待真机验证；
+  经典 ESP32 因 Bluedroid 体积与 4MB 双槽冲突裁剪），C5 基本链路真机通过；
   **P3** 802.15.4 纯被动帧嗅探 + 信道能量扫描已实现（C5/C6 开放，其余芯片 501），
   与 WiFi 2.4G 分时共存、不停 AP，待真机验证
 - ~~CDN 本地化~~（已完成）：`flasher/vendor/` 内置 esptool-js 0.7.1 + crypto-js 4.2.0，
@@ -358,6 +365,7 @@ redeem 只在 writeFlash 完整成功后由前端触发，且后端按 nonce+chi
 | 2026-11-11 | 新增 [C5 5GHz / BLE 5 / 802.15.4 能力差距与改造清单](./2026-11-11-c5-5ghz-ble-802154-roadmap.md)；§9 标记录 CDN 本地化已完成（esptool-js 0.7.1 + crypto-js 4.2.0 内置） |
 | 2026-11-11 | 落地 **P2 BLE 广播嗅探**：后台扩为 10 页（新增「BLE 扫描」）、5 个 `/api/ble/*` 路由、`FW_BLE_SUPPORTED` 能力门控；经典 ESP32 因 Bluedroid 体积（+810KB）与 min_spiffs 双 app 槽冲突用 `-DFW_BLE_DISABLED` 裁剪，S2 无 BLE 硬件 |
 | 2026-11-12 | 落地 **P3 802.15.4 纯被动嗅探**：后台扩为 11 页（新增「802.15.4 扫描」）、5 个 `/api/ieee802154/*` 路由、`FW_IEEE802154_SUPPORTED` 门控（仅 C5/C6）；帧解析在 ISR 内完成，生命周期收敛到单任务状态机；与 WiFi 2.4G 分时共存、保持 AP 在线，不做注入 |
-| 2026-11-11 | P0 实现：C5 Sniffer / Airodump 支持 5G 停驻与跳频（含跳过 DFS、`band` 状态字段与 UI 分段），6 芯片编译回归通过，待真机验证 |
-| 2026-11-11 | P1 实现：5G AP（非 DFS 36–48/149–165）与 5G 取消认证 / 双子（含 DFS 跳频注入）；主目标「2.4G 或 5G 非 DFS」，DFS 明确引导改用双子；状态 JSON 加 `band`；esp32c5/s3 编译通过，`npm test` 40/40，待真机验证 |
+| 2026-11-11 | P0 实现：C5 Sniffer / Airodump 支持 5G 停驻与跳频（含跳过 DFS、`band` 状态字段与 UI 分段），6 芯片编译回归通过 |
+| 2026-11-11 | P1 实现：5G AP（非 DFS 36–48/149–165）与 5G 取消认证 / 双子（含 DFS 跳频注入）；主目标「2.4G 或 5G 非 DFS」，DFS 明确引导改用双子；状态 JSON 加 `band`；esp32c5/s3 编译通过，`npm test` 40/40 |
+| 2026-11-13 | **C5 真机复核通过**：解除帧类型白名单 → 学习客户端 MAC 单播定向 Deauth（真机把 5G/2.4G 客户端踢下线）；5G 克隆 AP 先切频段再起 AP 并校验真实信道；主 5G + 双子 2.4G 每 2s 跳频双频压制；`pio upload` bootloader 偏移修正到 0x2000。见 `tools/c5-feature-acceptance-report.md` §5。修正文中「未启用 USB CDC」「raw TX 受限」「待真机验证」等描述漂移 |
 

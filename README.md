@@ -66,8 +66,8 @@ BLE 扫描 / 802.15.4 扫描 / 捕获凭据 / 配置）。**首次上电时设�
 | 已连客户端计数 | ✅ 实现 | `softAPgetStationNum()` 只读计数 |
 | 事件日志 | ✅ 实现 | 64 条环形缓冲，`GET /api/log?since=` 增量拉取 |
 | 内存/运行诊断 | ✅ 实现 | 堆、PSRAM、信道、uptime |
-| Evil Twin（邪恶双子） | ✅ 真实实现 | 攻击时把本机热点**真实改名**为与主目标一模一样的 SSID（开放无密码、信道对齐主目标）→ 目标设备免密直连；同时自动对主目标持续注入 Deauth，并对双子目标（通常同路由 5G BSSID）每 2s 跳频连发注入 → 目标两个频段都无法联网；Captive Portal 自动弹钓鱼页，捕获第一条凭据后自动停止干扰，手动停止恢复原热点名/密码/信道 |
-| Deauther（WiFi 杀手） | ✅ 真实实现 | 经 `esp_wifi_80211_tx` 向空口注入真实 Deauthentication 管理帧（0x00c0，广播踢出目标 AP 下全部客户端），带 Reason Code 与帧率/计数遥测。启动时自动把热点切到目标信道（已连受测设备短暂掉线后自动重连），停止时恢复配置信道；C5 raw TX 受限时返回错误码并如实显示 |
+| Evil Twin（邪恶双子） | ✅ 真实实现（C5 真机已验证） | 攻击时把本机热点**真实改名**为与主目标一模一样的 SSID（开放无密码、信道对齐主目标）→ 目标设备免密直连；主目标可为 2.4G 或 5G 非 DFS（5G 克隆先切 `WIFI_BAND_MODE_5G_ONLY` 再起 AP，并以 `esp_wifi_get_channel` 校验真实驻留信道，避免「`softAP(ch149)` 返回 true 却停在 2.4G」）。同时自动对主目标持续注入**定向单播 Deauth**，并对双子目标（同一路由器另一频段 BSSID）每 2s 跳频连发注入 → 单射频也能让目标两个频段都无法联网（2026-11-13 真机：主 5G ch149 + 双子 2.4G ch11，两个频段在线设备均被打掉）；Captive Portal 自动弹钓鱼页，捕获第一条凭据后自动停止干扰，手动停止恢复原热点名/密码/信道 |
+| Deauther（WiFi 杀手） | ✅ 真实实现（C5 真机已验证） | 经 `esp_wifi_80211_tx` 注入真实 Deauthentication 管理帧（0x00c0）。C5 的帧类型白名单由覆盖 `ieee80211_raw_frame_sanity_check`（链接加 `-Wl,--allow-multiple-definition`）解除，Deauth/Disassoc 真机可发。为应对 Wi-Fi 6 终端静默丢弃广播 Deauth，运行期开 promiscuous 从空口数据帧学习目标 AP 下客户端 MAC（最多 12 个），改为**单播定向踢线**（DA=客户端、TA/BSSID=目标 AP，原因码 1/3/7/15 轮换，每 4 帧留 1 帧广播兜底）。带 Reason Code / `unicast` / `knownStas` / `prom` / `rxFrames·rxData·rxMatch` 诊断计数遥测。启动时自动把热点切到目标信道，停止时恢复；探测前先开 promiscuous |
 | Handshake / 握手包与跑包 | ✅ 真实实现 | `esp_wifi_set_promiscuous` 真实空口捕获 4-Way Handshake（M1~M4，含 PMKID KDE）；板载用内置 7,153 条弱口令逐条跑包（PMK=PBKDF2-HMAC-SHA1 4096 轮 → PTK → 重算 M2 的 MIC 比对，支持 keyver 1/2）。keyver 3（802.11w PMF）导出后交服务端 `/api/wpa/crack`（SHA256-KDF + AES-CMAC） |
 | 数据包分析器 (Sniffer) | ✅ 真实实现 | 共用 promiscuous 回调抓真实 802.11 管理/控制/数据帧，解析帧类型、源/目的 MAC、SSID、Deauth Reason；支持单信道停驻与 1-13 自动跳频，实时帧率统计；源/目的 MAC 悬停显示 OUI 厂商名。同一回调顺带解析 Beacon / Probe Response 中的 ASTM F3411 Remote ID 厂商 IE |
 | Remote ID 解析 | ✅ 真实实现 | 纯被动解析两路载体：BLE Service Data（UUID 0xFFFA + App Code 0x0D）与 WiFi Beacon / ProbeResp 厂商 IE（OUI `FA-0B-BC` / Type 0x0D）。解析 Basic ID（UAS ID / 机型 / ID 类型）、Location（无人机经纬度 / 高度）、System（操作员位置）；同一 MAC 的 BLE 与 WiFi 数据自动归并，2 分钟未更新自动隐藏，最多 8 条。坐标仅文本展示并可点击复制，不加载在线地图（AP 模式无外网） |
@@ -88,12 +88,15 @@ Handshake 自 2026-11-10 起为真实抓包 + 真实跑包（见变更记录）�
    《治安管理处罚法》、《刑法》第 285/286 条；销售形态风险更高。
    凭据捕获页记录的口令仅限演示，实验后应清空。
 3. **实现性质**：Deauther 为**真实空口帧注入**（`esp_wifi_80211_tx`，26 字节
-   Deauth 管理帧，仅 TX 成功后计数）；Handshake 为**真实空口抓包 + 真实离线跑包**
+   Deauth 管理帧，仅 TX 成功后计数）；C5 的帧类型白名单已通过覆盖
+   `ieee80211_raw_frame_sanity_check` 解除（2026-11-13 真机验证可发，见验收报告）。
+   为避免 Wi-Fi 6 终端丢弃广播 Deauth，改为从空口学习客户端 MAC 后**单播定向踢线**。
+   Handshake 为**真实空口抓包 + 真实离线跑包**
    （promiscuous 回调解析 EAPOL-Key 帧，MIC 校验与 aircrack-ng 官方向量一致）；
    Evil Twin 为**真实实现**：热点真实改名为目标 SSID（开放认证）+ 联动 Deauth
-   压制主目标，并对双子目标（通常 5G）周期跳频注入 Deauth，使目标双频段都无法联网；
-   凭据页与记录均为真实捕获。
-   C5 对 raw TX 的 SDK 支持受限时会返回错误码并在后台如实标注。
+   压制主目标（可为 5G），并对双子目标（另一频段 BSSID）周期跳频注入 Deauth，
+   单射频即可让目标双频段都无法联网；凭据页与记录均为真实捕获。
+   若个别平台仍拒绝 raw TX，后台会返回错误码并如实标注。
 
 详细边界与使用约束见设计文档 §3.1。
 
@@ -174,8 +177,9 @@ firmware/           PlatformIO 工程（Arduino 框架, espressif32 v8）
 ├── src/admin_page.h       自动生成（勿手改）
 ├── src/wifi_weak_dict.h   内置 7,153 条弱口令（由 build-wordlist.mjs 生成）
 ├── data/admin.html        固件后台 SPA（内嵌源文件；zlib deflate 压缩进固件）
-├── tools/embed_admin_page.py   预构建脚本: admin.html → admin_page.h
-└── tools/patch-platformio-c5.py  espressif32 平台的 C5 补丁（幂等可重跑）
+├── tools/embed_admin_page.py          预构建脚本: admin.html → admin_page.h
+├── tools/fix_c5_bootloader_offset.py  后置脚本: 把 esp32c5 的 bootloader 烧录偏移修正到 0x2000
+└── tools/patch-platformio-c5.py      espressif32 平台的 C5 补丁（幂等可重跑）
 
 flasher/            烧录台纯静态前端（Web Serial + esptool-js 0.7.1）
 ├── index.html      Neo-brutalism 布局（步骤卡 ①~④ + 控制台 + 条款/说明卡）
@@ -249,8 +253,13 @@ esptool `BOOTLOADER_FLASH_OFFSET`）：
 （并兼容直接从 `0x0` 开始的 app-only 调试镜像）。
 
 > ⚠️ espressif32 v8 的 `platformio-build.py` 把 `esp32c5` 也按 `0x0` 处理
-> （平台对 C5 的适配缺陷，与 C5 的 ROM/sdkconfig/esptool 均矛盾）。
-> 因此 `build-firmware.sh` 显式按芯片指定偏移，不沿用 `pio upload` 默认值。
+> （平台对 C5 的适配缺陷，与 C5 的 ROM/sdkconfig/esptool 均矛盾）。因此：
+> - `build-firmware.sh`（合并镜像）显式按芯片指定偏移，不沿用 `pio upload` 默认值；
+> - 直接 `pio run -e esp32c5_16mb -t upload` 会踩同一坑（bootloader 被写到 0x0，
+>   上电 `invalid header: 0xa8030007` 无限复位）。已由
+>   `firmware/tools/fix_c5_bootloader_offset.py`（`post:` 脚本）修正 esptool 命令行
+>   的 bootloader 偏移到 `0x2000`，见 `[env:esp32c5_16mb]` 的 `extra_scripts`。
+>   2026-11-13 真机实烧验证通过，详见 `docs/firmware-flashing.md` §5.7。
 
 ## Serial JSON 遥测（外部设备即插即用）
 
@@ -330,10 +339,50 @@ unused ──verify──▶ verified(15min) ──烧录成功/pair nonce──
   旧版 `esp32admin` 升级后自动轮换
 - ✅ 抓包模块回归：Sniffer / Airodump / Karma 共用 promiscuous 回调抓真实帧，
   握手状态并入 `/api/info`，冗余路由不再注册
-- ⬜ 真机烧录 + 热点后台端到端（需要接一块 ESP32/S2/S3/C3/C6 板）
-- ⬜ 16MB 三系统真机验证（需 ESP32-C5N16R8，步骤见 `docs/firmware-flashing.md` §6.6）
+- ✅ 2026-11-13 ESP32-C5N16R8 真机：5G/2.4G 邪恶双子 + 定向单播 Deauth 双频压制
+  （主 5G ch149 在线设备 6→2、2.4G ch11 在线设备 1~3→0；双频同名目标加双子后
+  两个频段同时被踢，详见 `tools/c5-feature-acceptance-report.md` §5）
+- ✅ 2026-11-13 16MB 三系统真机（分区表、三槽 API、audit↔espsoup 切换、NVS 持久），
+  见 `tools/C5-16MB-VERIFICATION-REPORT.md` §四
+- ✅ 2026-11-13 `pio run -e esp32c5_16mb -t upload` 烧录闭环（bootloader 自动写 0x2000，
+  串口无 `invalid header`、正常打印 v1.1.0 启动横幅）
+- ⬜ 真机烧录 + 热点后台端到端（ESP32/S2/S3/C3/C6 板待补；C5 已验证）
+- ⬜ 16MB 三系统剩余项（ota_2 / ESPsoup·Muse 真实固件行为 / Web Serial 刷写，
+  见 `tools/C5-16MB-VERIFICATION-REPORT.md` §五）
 
 ## 变更记录
+
+### 2026-11-13（五）C5 真机：定向单播 Deauth 双频压制 + bootloader 烧录偏移修复
+
+- **真机根因定位（手机没被挤掉）**：① 广播 Deauth（`DA=FF:FF:FF:FF:FF:FF`）被
+  Wi-Fi 6 终端驱动静默丢弃，帧数一直涨但目标毫无反应；② 双频同名 AP 的手机/网卡
+  默认优先 5G，而克隆热点 `softAP(ch149)` 返回 true 却驻留在 2.4G，攻击发在错误频段。
+- **定向单播踢线**（`cb1cd8b`）：Deauth 运行期开 promiscuous，从 ToDS/FromDS 数据帧
+  学习目标 AP 下客户端 MAC（最多 12 个），改为单播 Deauth（DA=客户端、TA/BSSID=
+  目标 AP），原因码 1/3/7/15 轮换，每 4 帧留 1 帧广播兜底；`/api/info` 与
+  `/api/deauth/status` 暴露 `unicast / knownStas / prom / rxFrames / rxData / rxMatch`。
+- **帧白名单与注入路径**：覆盖 `ieee80211_raw_frame_sanity_check`（配合
+  `-Wl,--allow-multiple-definition`）解除 C5 对 Deauth/Disassoc 的驱动拒绝；
+  信标类帧改走 STA 接口注入（AP 接口注入的 Beacon 空口不可见）。
+- **5G / 双频链路**：5G 克隆先切 `WIFI_BAND_MODE_5G_ONLY` 再起 AP 并用
+  `esp_wifi_get_channel` 校验真实信道（`14a8dc3`）；起 AP 顺序改为「先切频段再设带宽」
+  消除 AUTO 下 `set_bandwidth` 报错（`f466a6b`）；探测 Deauth 前先开 promiscuous，
+  并补阶段 2 的 `syncPromiscuousEngine()`（`0aeb60b` / `c806001`）。
+- **真机结果**：目标 5G ch149（`…DD:72`）学到 5 台客户端、单播 1111+ 帧，
+  真实 5G AP 在线设备 6→2；目标 2.4G ch11（`…DD:71`）在线设备 1~3→0。
+  双频覆盖实测：主 5G + 双子 2.4G 每 2s 跳频，克隆热点在 5G ch149 与 2.4G ch11
+  交替出现，`WiFi6` 两个频段均被压制（手机持续被踢）。
+- **烧录坑修复**（`ff62eda`）：C5 二阶段 bootloader 位于 flash **0x2000**，
+  而 `framework-arduinoespressif32/tools/platformio-build.py` 的 `FLASH_EXTRA_IMAGES`
+  对 riscv 统一用 `0x0000` → `pio run -t upload` 把 bootloader 写错位置，上电
+  `invalid header: 0xa8030007` 无限复位。新增 `firmware/tools/fix_c5_bootloader_offset.py`
+  post 脚本同时修正 `FLASH_EXTRA_IMAGES` 与展开后的 `UPLOADERFLAGS`（仅 esp32c5 生效），
+  `[env:esp32c5_16mb]` 加 `board_build.bootloader_addr = 0x2000` 并重写 `extra_scripts`。
+  实烧验证：esptool 命令行出现 `0x2000 …bootloader.bin`，启动日志 `invalid header`=0。
+- **真机操作备忘**：C5 原生 USB CDC（COM3）在射频反复重启后可能不再重新枚举，
+  但 CH340 UART（COM5）始终可用；从 UART 正常启动的复位时序为 `DTR=1`（拉低 EN）
+  → 200ms → `DTR=0`。克隆阶段软 AP 改名为目标 SSID（`WiFi6` 开放），管理热点
+  `WiFi-12F9` 会暂时消失，属预期行为而非崩溃。
 
 ### 2026-11-12（四）审核加固：异步跑包 / 槽位容量校验 / 回环绑定 / 口令比较
 
@@ -600,14 +649,17 @@ EAPOL/握手材料（M1~M4、PMKID、nonce、MIC）、凭据或密码字段。
 
 - 云部署（HTTPS + CDN；Web Serial 要求安全上下文）
 - 图文教程页（tw.html / az.html 占位）
-- C5 真机验证（镜像已出，等一块 ESP32-C5 板）
 - C5 5GHz / BLE 5 / 802.15.4 能力扩展：P0（5G 抓包）与 P1（5G AP 非 DFS、5G 取消认证 /
-  双子含 DFS 跳频）已实现，均待真机验证；P2（BLE 广播嗅探，C3/C5/C6/S3 走 NimBLE，
-  经典 ESP32 因 Bluedroid 体积与双 app 槽冲突而裁剪）已实现待真机验证；P3（802.15.4
-  纯被动嗅探 + 信道能量扫描，C5/C6 开放）已实现待真机验证。差距与改造清单见
+  双子含 DFS 跳频）已实现；**2026-11-13 真机已验证 5G 克隆 AP + 5G 取消认证 +
+  双频跳频压制**（见 `tools/c5-feature-acceptance-report.md` §5）。P2（BLE 广播嗅探，
+  C3/C5/C6/S3 走 NimBLE，经典 ESP32 因 Bluedroid 体积与双 app 槽冲突而裁剪）与
+  P3（802.15.4 纯被动嗅探 + 信道能量扫描，C5/C6 开放）已实现，C5 上已真机验证基本链路，
+  其余芯片待复核。差距与改造清单见
   [docs/plans/2026-11-11-c5-5ghz-ble-802154-roadmap.md](docs/plans/2026-11-11-c5-5ghz-ble-802154-roadmap.md)
 - P4 设备识别与指纹（BLE 厂商/类别、OUI 厂商名、ASTM F3411 Remote ID）：
-  **P4-0/P4-1/P4-2/P4-3 已实现（待真机验证）**——公开数据生成 `vendor_db.js`、BLE 字段扩展与
+  **P4-0/P4-1/P4-2/P4-3 已实现，C5 真机已验证 BLE / 802.15.4 / Karma 基本链路**
+  （见 `tools/c5-feature-acceptance-report.md`）——公开数据生成 `vendor_db.js`、BLE 字段扩展与
   10 类设备画像、`/vendor-db.js` 资源路由、扫描/Airodump OUI 厂商名、BLE + WiFi Remote ID
   解析与 `GET /api/rid`、契约测试；4MB C5 实测 97.2%（P4 全增量 +19.6KB）。见
   [docs/plans/2026-11-12-p4-device-identification-roadmap.md](docs/plans/2026-11-12-p4-device-identification-roadmap.md)
+- 其余 5 颗芯片（esp32/s2/s3/c3/c6）真机首刷 + 热点后台端到端待补（C5 已全链路验证）

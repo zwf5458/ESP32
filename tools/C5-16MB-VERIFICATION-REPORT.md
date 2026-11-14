@@ -237,11 +237,23 @@ esptool --chip esp32c5 erase_region 0xD000 0x2000
   2. 配置：C5 原生 USB 无串口输出 → 开启 CDC（`2aa34cf`，esp32c5 余 41,781B）
 - 契约测试 **57/57** 全绿
 
-**提交记录**（均未推送，等待用户确认）：
+**提交记录**（`18dd6f3` / `8476894` / `2aa34cf` / `5d05eef` 后续均已推送到 `origin/main`）：
 - `18dd6f3` fix(firmware): 切换到当前运行系统时返回提示而非重启
 - `8476894` test(tools): C5 16MB 三系统离线自检脚本 + 真机验收清单/报告
 - `2aa34cf` build(c5): 开启原生 USB CDC
+- `5d05eef` docs(tools): 验证报告收尾 - CDC 修复真机复测结果
+
+### 后续（2026-11-13）开发态 `pio upload` 烧录偏移修复
+
+`tools/build-firmware.sh` 的合并镜像从 0x0 整片写入不踩坑；但直接
+`pio run -e esp32c5_16mb -t upload` 会把 bootloader 写到 0x0（C5 应在 0x2000），
+上电 `invalid header: 0xa8030007` 无限复位。已由 `ff62eda` 用 post 脚本
+`firmware/tools/fix_c5_bootloader_offset.py` 修正 esptool 命令行偏移，并在
+`[env:esp32c5_16mb]` 重写 `extra_scripts`（含 `pre:tools/embed_admin_page.py` +
+`post:tools/fix_c5_bootloader_offset.py`）。真机实烧验证：esptool 命令行出现
+`0x2000 …bootloader.bin`，启动 `invalid header`=0、正常打印 v1.1.0 横幅。
+详见 `docs/firmware-flashing.md` §5.7。
 
 **下一步**：
-1. 确认后推送三条提交
-2. 拿到 ESPsoup / Muse 真固件后完成剩余验证项（ota_2 切换、真实固件行为、烧录台 Web Serial 刷写路径）
+1. 拿到 ESPsoup / Muse 真固件后完成剩余验证项（ota_2 切换、真实固件行为、烧录台 Web Serial 刷写路径）
+2. 邪恶双子 / 5G 取消认证 / 双频跳频已在同板真机验证，见 `tools/c5-feature-acceptance-report.md` §5
