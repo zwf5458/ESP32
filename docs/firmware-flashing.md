@@ -374,6 +374,15 @@ esptool --chip esp32c5 -p COM5 -b 921600 write-flash -z `
   扫描结果时有时无属预期。停止攻击或复位后恢复 `WiFi-12F9` / `00000000` / 管理页。
 - **板子 RTS 接复位脚**：开/关串口或动 RTS 都会触发复位，长时间挂串口会打断验证；
   纯 HTTP 验证时不要保持 COM 长连接。
+- **一键复位小工具**：`tools/reset_c5.ps1` 封装了上面的 DTR 复位时序，默认走 CH340
+  UART 口（COM5），发完脉冲立即释放串口（不像串口监视器长连 COM 打断验证）：
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File tools\reset_c5.ps1               # 复位 + 抓 4s 启动日志
+  powershell -ExecutionPolicy Bypass -File tools\reset_c5.ps1 -Port COM7 -WaitSec 8
+  powershell -ExecutionPolicy Bypass -File tools\reset_c5.ps1 -NoLog        # 只复位, 不读日志
+  ```
+  脚本会检测 `invalid header`（bootloader 偏移错，见 §5.7）与正常启动横幅；复位线接
+  RTS 的板子加 `-RtsPulse`。
 
 ---
 

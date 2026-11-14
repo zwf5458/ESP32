@@ -209,6 +209,7 @@ tools/              构建与运维脚本
 ├── install-c5-libs.sh      ESP32-C5 libs 本地注入
 ├── patch-platformio-c5.py  espressif32 C5 平台补丁
 ├── esp32-c5-devkitc-1.json C5 板级定义副本
+├── reset_c5.ps1            C5N16R8 一键复位 (经 CH340 UART 拉 DTR/EN, 可选抓启动日志)
 └── serial-telemetry.py     Serial JSON 遥测 PC 命令行消费端
 
 docs/plans/         设计文档（含固件 API、合规边界、视觉规范）
@@ -552,6 +553,21 @@ unused ──verify──▶ verified(15min) ──烧录成功/pair nonce──
 - 测试新增契约用例 `Deauther 为真实帧注入而非纯计数`（断言源码含 `esp_wifi_80211_tx(WIFI_IF_AP`、
   `f[0] = 0xC0` 且计数不再无条件自增）与 `Deauther 启动前自动对齐目标信道且停止时恢复`
   （断言 `esp_wifi_set_channel` 调用与停止恢复、临时切换不写 NVS）。`npm test` 14/14。
+
+### 2026-11-14 双频覆盖默认流程 + C5 一键复位小工具
+
+- **后台默认双频覆盖**（`firmware/data/admin.html`）：设主目标时自动把「另一频段同名 AP」
+  补为双子目标（每 2s 跳频压制），解决双频同名路由器单射频只压一个频段、客户端切到
+  另一频段继续上网的问题（2026-11-13 真机根因）。`dualBandTwinCandidates()` 严格筛
+  「同名 + 跨频段 + 不同 BSSID + 未添加过」，受 `MAX_TWINS=4` 限制、失败静默跳过不打断
+  主目标设置；扫描页有「双频覆盖」开关（默认开，仅 5G 芯片显示），邪恶双子页另有手动
+  「补齐另一频段 (双频)」按钮（需先选「范围: 双频全部」扫描一次）。
+  配套契约测试 `server/test/index.test.js` 覆盖默认开、严格筛选与 force 手动补齐。
+- **`tools/reset_c5.ps1`**：C5N16R8 一键复位，经始终可用的 CH340 UART 口（默认 COM5）
+  打 `DTR=1 → 200ms → DTR=0` 复位脉冲（真机验证时序），可选抓 4s 启动日志并检测
+  `invalid header` / 正常启动横幅；发完立即释放串口（板子 RTS 接复位脚，长连 COM 会
+  反复打断纯 HTTP 验证）。支持 `-Port` / `-Baud` / `-WaitSec` / `-RtsPulse` / `-NoLog`。
+  `admin_page.h` 已由 `firmware/tools/embed_admin_page.py` 同步重生成，`npm test` 59/59 全绿。
 
 ### 2026-11-14 CNA 全平台防拦截升级与脱机便携扩展 (v1.1.0-portable)
 
