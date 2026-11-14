@@ -292,6 +292,7 @@ const state = {
   bleStatus: { supported: true, running: false, phase: 'idle', initFailed: false, continuous: true, durationSec: 0, totalAdv: 0, uptime: 0, deviceCount: 0, devices: [] },
   etCloneSsid: '',  // 邪恶双子页「克隆 SSID」输入框草稿 (页面重建时保留)
   etPreCapture: true,  // 邪恶双子「先抓握手再开克隆」勾选框草稿 (页面重建时保留)
+  autoDualBand: true,  // 扫描页: 设主目标时自动把另一频段同名 AP 补为双子 (双频覆盖默认开启)
   creds: []
 };
 
@@ -749,6 +750,10 @@ function renderScan() {
   </div>
   <div class="card" style="padding:10px 14px;margin:0 0 12px;font-size:13px">
     操作顺序: <b>③ 点击开始扫描 → ④ 把其它频段/同名目标设为「+双子」 → ⑤ 把主目标设为「目标」(2.4G${has5g() ? ' 或 5G 非 DFS' : ''}; 5G DFS 只能做双子)</b> → ⑥ 进入「邪恶双子攻击」点击「发起攻击」
+    <label style="display:flex;align-items:center;gap:8px;margin-top:8px;font-weight:800;cursor:pointer;${has5g() ? '' : 'display:none'}">
+      <input type="checkbox" id="chkAutoDual" style="width:16px;height:16px" ${(state.autoDualBand !== false) ? 'checked' : ''}>
+      双频覆盖默认流程: 设主目标时自动把「另一频段同名 AP」补为双子 (建议先选「范围: 双频全部」扫描一次)
+    </label>
   </div>
   <div class="note">BSSID 下方显示 OUI 厂商名（公开 IEEE 注册表）。标注「随机 MAC」的是本地管理地址（手机 / 手环的随机化 MAC），<b>不能</b>据此反查真实厂商，也不代表设备身份。</div>
   <div class="table-wrap"><table style="background:#1b1b1b">
@@ -763,11 +768,54 @@ function renderScan() {
   if (bandSel) bandSel.onchange = () => { state.scanBand = bandSel.value; };
   const chk = $('#chkHidden');
   if (chk) chk.onchange = () => { state.showHidden = chk.checked; paintScan(); };
+  const autoDual = $('#chkAutoDual');
+  if (autoDual) autoDual.onchange = () => {
+    state.autoDualBand = autoDual.checked;
+    toast(autoDual.checked ? '双频覆盖已开启: 设主目标时自动补另一频段双子' : '双频覆盖已关闭: 只压主目标频段');
+  };
   $('#btnScan').onclick = realScan;
   const btnStop = $('#btnStopScan');
   if (btnStop) btnStop.onclick = () => stopOrResetScan('用户手动取消');
   paintScan();
 }
+/* ---------- 双频覆盖: 设主目标时自动把「另一频段同名 AP」补为双子 ----------
+ * 双频同名路由器 (2.4G + 5G 共用一个 SSID) 的手机/网卡默认优先 5G; 单射频克隆
+ * 若只压主目标那个频段, 客户端会切到另一频段继续上网。把另一频段同名 BSSID
+ * 补成双子目标 (每 2s 跳频注入) 才能两个频段一起压制 (2026-11-13 真机验证)。
+ * 严格「同名 + 另一频段 + 不同 BSSID + 未添加过」, 不误伤邻居的近似 SSID。 */
+function dualBandTwinCandidates(primary) {
+  const ssid = (primary?.ssid || '').trim().toLowerCase();
+  if (!ssid || !has5g()) return [];                    // 2.4G-only 芯片无双频可覆盖
+  const twins = state.info?.twins || [];
+  const existing = new Set(twins.map(x => (x.bssid || '').toLowerCase()));
+  const primaryBssid = (primary.bssid || '').toLowerCase();
+  const pIs5g = is5gCh(primary.channel);
+  const room = Math.max(0, 4 - twins.length);          // 固件 MAX_TWINS = 4
+  if (!room) return [];
+  return (state.scan || []).filter(n => {
+    const b = (n.bssid || '').toLowerCase();
+    if (!n.ssid || b === primaryBssid || existing.has(b)) return false;
+    if (n.ssid.trim().toLowerCase() !== ssid) return false;   // 严格同名
+    return is5gCh(n.channel) !== pIs5g;                        // 只要「另一频段」
+  }).slice(0, room);
+}
+
+async function autoAddDualBandTwins(primary, force = false) {
+  if (!force && state.autoDualBand === false) return 0;
+  const cand = dualBandTwinCandidates(primary);
+  let added = 0;
+  for (const n of cand) {
+    try {
+      await api('/api/twin', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ssid: n.ssid, bssid: n.bssid, channel: n.channel,
+                               auth: n.auth, rssi: n.rssi, fakeAp: 'false' }) });
+      added++;
+    } catch (_) {}   // 达上限 / 信道校验失败: 跳过, 绝不打断主目标设置
+  }
+  if (added) log('[twin] 双频自动覆盖: 已把 ' + added + ' 个另一频段同名 AP 补为双子 (每 2s 跳频压制)', 't-ok');
+  return added;
+}
+
 async function pickTarget(t, role) {
   role = role || 'primary';
   // 主目标要起同名克隆热点: 2.4G 1-14 (全芯片) 或 5G 非 DFS (仅 C5)。
@@ -798,7 +846,16 @@ async function pickTarget(t, role) {
       await api('/api/target', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(t) });
       state.target = t;
       log('[target] 已设置主目标: ' + (t.ssid || '(隐藏)') + ' @ ' + t.bssid + ' 信道' + t.channel);
-      toast('已设置主目标: ' + (t.ssid || t.bssid));
+      // 双频覆盖默认流程: 自动把「另一频段同名 AP」补为双子 (扫描结果里找, 严格同名+跨频段)。
+      // 没有双频扫描结果时会静默跳过, 可在邪恶双子页点「补齐另一频段」手动补。
+      let autoN = 0;
+      try { autoN = await autoAddDualBandTwins(t); } catch (_) {}
+      if (autoN) {
+        await pollInfo();
+        toast('已设置主目标, 并自动补入 ' + autoN + ' 个另一频段双子 (双频覆盖)');
+      } else {
+        toast('已设置主目标: ' + (t.ssid || t.bssid));
+      }
       go('eviltwin');
     }
   } catch (e) {
@@ -1739,9 +1796,10 @@ function renderEvilTwin() {
       <div><label class="flbl">BSSID</label><input type="text" id="twBssid" placeholder="AA:BB:CC:DD:EE:FF"></div>
       <div><label class="flbl">SSID</label><input type="text" id="twSsid" placeholder="WiFi-5G"></div>
       <div><label class="flbl">信道</label><input type="number" id="twCh" value="36" min="1" max="165" placeholder="1-14 / 36-165 (含 DFS)"></div>
-      <div style="display:flex;align-items:flex-end;gap:6px">
+      <div style="display:flex;align-items:flex-end;gap:6px;flex-wrap:wrap">
         <button class="btn sm green" id="btnTwinAdd">+ 添加</button>
         <button class="btn sm yellow" id="btnTwinScan">扫描相似AP</button>
+        <button class="btn sm purplebg" id="btnTwinAutoDual" title="从最近一次扫描结果里, 把与主目标同名但在另一频段的 AP 补为双子 (双频覆盖)">补齐另一频段 (双频)</button>
       </div>
     </div>
     <div class="sub" style="display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap">
@@ -1908,6 +1966,21 @@ function renderEvilTwin() {
     }
     log('[twin] 扫描相似AP: 匹配 ' + hits.length + ' 个, 已加入 ' + added + ' 条', 't-ok');
     toast('已加入 ' + added + ' 个相似 AP');
+    await pollInfo(); paintTwins();
+  };
+  $('#btnTwinAutoDual').onclick = async () => {
+    // 手动补齐另一频段同名双子 (force=true 忽略扫描页开关)。需先做过一次双频扫描。
+    const primary = state.target || state.info?.target;
+    if (!primary || !primary.ssid) { toast('请先设置主目标'); return; }
+    if (!has5g()) { toast('本芯片仅支持 2.4G, 无另一频段可补'); return; }
+    const cand = dualBandTwinCandidates(primary);
+    if (!cand.length) {
+      toast('未找到另一频段同名 AP — 请到「扫描与嗅探」选「范围: 双频全部」重新扫描');
+      log('[twin] 补齐另一频段: 无匹配 (需先做一次双频扫描)', 't-warn');
+      return;
+    }
+    const added = await autoAddDualBandTwins(primary, true);
+    toast(added ? ('已补入 ' + added + ' 个另一频段双子 (双频覆盖)') : '双子已满或添加失败');
     await pollInfo(); paintTwins();
   };
 

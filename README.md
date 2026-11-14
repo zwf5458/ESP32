@@ -61,11 +61,12 @@ BLE 扫描 / 802.15.4 扫描 / 捕获凭据 / 配置）。**首次上电时设�
 | AP 热点 | ✅ 实现 | SSID `WiFi-xxxx`（MAC 尾 4 位）/ 密码 `00000000` / `192.168.4.1` |
 | Web 后台 11 页 | ✅ 实现 | 状态总览 / 扫描与嗅探 / 邪恶双子 / Karma / 取消认证 / 数据包分析器 / Airodump / BLE 扫描 / 802.15.4 扫描 / 捕获凭据 / 配置（内嵌 SPA） |
 | 后台口令鉴权 | ✅ 实现 | 每台设备随机初始口令（仅串口打印一次）；`/api/*` 需 `X-Admin-Token`（或 `?token=`），401 不执行业务逻辑 |
-| Captive Portal | ✅ 实现 | UDP 53 通配解析 + iOS/Android/Windows 探测路径 302 → 连热点自动弹后台 |
+| Captive Portal | ✅ 深度实现（全平台 CNA 适配） | UDP 53 通配解析 + 深度适配 iOS / Android (MIUI/HyperOS/鸿蒙/ColorOS) / Windows 11 CNA 探活协议，解决现代手机防弹窗拦截与无网自动断开痛点；未知路径 302 全量保活 |
 | 周边 AP 扫描 | ✅ 实现 | `WiFi.scanNetworks()` 被动列出 SSID/RSSI/信道/加密方式 |
 | 已连客户端计数 | ✅ 实现 | `softAPgetStationNum()` 只读计数 |
 | 事件日志 | ✅ 实现 | 64 条环形缓冲，`GET /api/log?since=` 增量拉取 |
 | 内存/运行诊断 | ✅ 实现 | 堆、PSRAM、信道、uptime |
+| 脱机便携扩展 (OLED + 蜂鸣器) | ✅ 深度实现 (`esp32c5_16mb_portable`) | 自研纯 Wire.h 极简驱动 `ssd1306_tiny.h`（零外部依赖，仅占 1KB 显存），支持 0.96/1.3 寸 I2C OLED (SDA=IO4, SCL=IO5)。双模式智能切屏：常规仪表盘 + 捕获密码时大字明文直显；配合蜂鸣器 (IO13) 声学提醒（成功三音/未校验双音） |
 | Evil Twin（邪恶双子） | ✅ 真实实现（C5 真机已验证） | 攻击时把本机热点**真实改名**为与主目标一模一样的 SSID（开放无密码、信道对齐主目标）→ 目标设备免密直连；主目标可为 2.4G 或 5G 非 DFS（5G 克隆先切 `WIFI_BAND_MODE_5G_ONLY` 再起 AP，并以 `esp_wifi_get_channel` 校验真实驻留信道，避免「`softAP(ch149)` 返回 true 却停在 2.4G」）。同时自动对主目标持续注入**定向单播 Deauth**，并对双子目标（同一路由器另一频段 BSSID）每 2s 跳频连发注入 → 单射频也能让目标两个频段都无法联网（2026-11-13 真机：主 5G ch149 + 双子 2.4G ch11，两个频段在线设备均被打掉）；Captive Portal 自动弹钓鱼页，捕获第一条凭据后自动停止干扰，手动停止恢复原热点名/密码/信道 |
 | Deauther（WiFi 杀手） | ✅ 真实实现（C5 真机已验证） | 经 `esp_wifi_80211_tx` 注入真实 Deauthentication 管理帧（0x00c0）。C5 的帧类型白名单由覆盖 `ieee80211_raw_frame_sanity_check`（链接加 `-Wl,--allow-multiple-definition`）解除，Deauth/Disassoc 真机可发。为应对 Wi-Fi 6 终端静默丢弃广播 Deauth，运行期开 promiscuous 从空口数据帧学习目标 AP 下客户端 MAC（最多 12 个），改为**单播定向踢线**（DA=客户端、TA/BSSID=目标 AP，原因码 1/3/7/15 轮换，每 4 帧留 1 帧广播兜底）。带 Reason Code / `unicast` / `knownStas` / `prom` / `rxFrames·rxData·rxMatch` 诊断计数遥测。启动时自动把热点切到目标信道，停止时恢复；探测前先开 promiscuous |
 | Handshake / 握手包与跑包 | ✅ 真实实现 | `esp_wifi_set_promiscuous` 真实空口捕获 4-Way Handshake（M1~M4，含 PMKID KDE）；板载用内置 7,153 条弱口令逐条跑包（PMK=PBKDF2-HMAC-SHA1 4096 轮 → PTK → 重算 M2 的 MIC 比对，支持 keyver 1/2）。keyver 3（802.11w PMF）导出后交服务端 `/api/wpa/crack`（SHA256-KDF + AES-CMAC） |
@@ -551,6 +552,27 @@ unused ──verify──▶ verified(15min) ──烧录成功/pair nonce──
 - 测试新增契约用例 `Deauther 为真实帧注入而非纯计数`（断言源码含 `esp_wifi_80211_tx(WIFI_IF_AP`、
   `f[0] = 0xC0` 且计数不再无条件自增）与 `Deauther 启动前自动对齐目标信道且停止时恢复`
   （断言 `esp_wifi_set_channel` 调用与停止恢复、临时切换不写 NVS）。`npm test` 14/14。
+
+### 2026-11-14 CNA 全平台防拦截升级与脱机便携扩展 (v1.1.0-portable)
+
+**Added & Enhanced**
+- **Captive Portal 防弹窗拦截（全平台 CNA 深度适配）**：
+  - 重构 `captiveRedirect()` 与 `notFound()` 逻辑，全覆盖 iOS、Android（含 MIUI/HyperOS、HarmonyOS、ColorOS、OriginOS）、Windows 11/10 的探活机制。
+  - **iOS / macOS CNA**：拦截 `captive.apple.com/hotspot-detect.html` 与 `/library/test/success.html`，发送防缓存头 `Cache-Control: no-cache` 并注入 `<meta http-equiv="refresh">` 与 JS 双跳转，使 iOS 持续判定为受限网络并保持全屏 CNA 弹窗不自动关闭。
+  - **Android / 鸿蒙 / 小米**：精准拦截 `/generate_204`、`/gen_204`、`/check_network` 等探测路径，严禁返回 204（避免系统误判有网不弹窗），统一返回 302 强制导流，触发系统“需要登录 Wi-Fi 网络”强提醒并调起系统验证窗。
+  - **Windows NCSI**：拦截 `/connecttest.txt` 与 `/ncsi.txt`，触发 NCSI 机制弹出系统浏览器。
+  - **全量保活兜底**：所有未知路径与 404 全量重定向至钓鱼门户或管理后台。
+- **脱机便携硬件实装（0.96寸 OLED 屏幕 + 蜂鸣器）**：
+  - 编写自主研发的超轻量 SSD1306 I2C 驱动（`firmware/src/ssd1306_tiny.h`），纯基于 `Wire.h` 实现，零第三方库依赖，仅占 1024 字节显存缓冲，编译极快、内存极省。
+  - **屏幕双模式智能切换**：
+    - **常规状态仪表盘**：实时显示软 AP SSID、当前运行模式（`[EvilTwin]` / `[Deauth]` / `[Idle]`）、锁定目标、连接客户端数、捕获凭据数、剩余内存与运行时间。
+    - **凭据捕获大字直显页**：受害者在钓鱼页提交密码时，屏幕自动切屏以 12×16 像素双倍大字体明文展示密码与受害者 IP，彻底脱离电脑与手机后台。
+  - **蜂鸣器声学反馈**：
+    - 开机自检提示：短促双音 "嘟嘟"；
+    - 验真成功捕获：三声上扬悦耳胜利音（代表密码经本地 PBKDF2 + MIC 校验 100% 真实可用）；
+    - 未校验捕获：双声警报音。
+  - **硬件引脚标准化**：OLED SDA=IO4, SCL=IO5; 蜂鸣器=IO13；适配开发板 `HW-982` / `ESP32-C5-DevKit V2.0`。
+- **开发板双 Type-C 端口兼容**：全面兼容下方原生 USB 口（`-DARDUINO_USB_MODE=1 -DARDUINO_USB_CDC_ON_BOOT=1`），并提供免独占排错指南。
 
 ### 2026-11-10 代码审查修复 (P0/P1) 与全栈工程级优化 (v1.1.0)
 

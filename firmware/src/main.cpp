@@ -5527,7 +5527,7 @@ void setup() {
   onAdmin("/api/deauth/start", HTTP_POST, handleDeauthStart);
   onAdmin("/api/deauth/stop", HTTP_POST, handleDeauthStop);
   onAdmin("/api/deauth/status", HTTP_GET, handleDeauthStatus);
-  onAdmin("/api/test/beacon", HTTP_POST, handleTestBeacon);   // 诊断: 伪造信标空口验证
+  server.on("/api/test/beacon", HTTP_POST, []() { if (requireAdmin()) handleTestBeacon(); }); // 诊断: 伪造信标空口验证 (内部测试端点)
 
   onAdmin("/api/handshake/start", HTTP_POST, handleHandshakeStart);
   onAdmin("/api/handshake/stop", HTTP_POST, handleHandshakeStop);

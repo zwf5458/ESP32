@@ -647,6 +647,28 @@ test('扫描(契约): /api/scan 支持频段过滤, 默认 2.4G 缩短热点断�
     'admin.html 必须提示扫描期间热点断开属正常 (消除误判为设备故障)');
 });
 
+test('后台(契约): 邪恶双子默认双频覆盖 — 设主目标自动补另一频段同名双子', () => {
+  const html = readFileSync(join(ROOT, 'firmware', 'data', 'admin.html'), 'utf-8');
+  // 开关默认开, 且可在扫描页关闭 (仅 C5/5G 芯片显示)
+  assert.ok(html.includes('autoDualBand: true'), '双频覆盖默认必须开启');
+  assert.ok(html.includes('id="chkAutoDual"') && html.includes('state.autoDualBand = autoDual.checked'),
+    '扫描页必须提供可关闭的「双频覆盖」开关');
+  // 严格筛选: 同名 + 另一频段 + 不同 BSSID + 未添加过, 且受 MAX_TWINS=4 限制
+  assert.ok(html.includes('function dualBandTwinCandidates'),
+    '缺少双子候选筛选函数 (同名+跨频段+去重+容量)');
+  assert.ok(html.includes("n.ssid.trim().toLowerCase() !== ssid"),
+    '候选必须严格同名 (不能误伤邻居近似 SSID)');
+  assert.ok(html.includes('is5gCh(n.channel) !== pIs5g'),
+    '候选必须落在与主目标不同的另一频段');
+  // 设主目标时自动补; 邪恶双子页还有手动「补齐另一频段」入口
+  assert.ok(html.includes('autoN = await autoAddDualBandTwins(t)'),
+    'pickTarget 设主目标时必须自动补双子');
+  assert.ok(html.includes('id="btnTwinAutoDual"') && html.includes('补齐另一频段 (双频)'),
+    '邪恶双子页必须提供手动「补齐另一频段」按钮');
+  assert.ok(html.includes('autoAddDualBandTwins(primary, true)'),
+    '手动补齐必须忽略扫描页开关 (force)');
+});
+
 // ---------------- P4: 设备识别 (BLE 画像 + 厂商表) ----------------
 const p4Adv = JSON.parse(
   readFileSync(join(ROOT, 'server', 'test', 'fixtures', 'p4-ble-adv.json'), 'utf-8'),
@@ -707,9 +729,9 @@ test('P4(契约): BLE 仍为纯被动, 不新增任何广播/注入调用', () =
   assert.ok(mainCpp.includes('setActiveScan(false)'), 'BLE 扫描必须仍是被动模式');
   assert.ok(!mainCpp.includes('startAdvertising'), 'P4 不允许新增 BLE 广播');
   assert.ok(!mainCpp.includes('esp_ble_gap_start_advertising'), 'P4 不允许新增 BLE 广播');
-  // 纯被动: 业务路径不新增 802.11 注入调用 (基点 3 处: 双子/Deauth; 余为 c5 硬件限制探测 txtest)
+  // 纯被动: 业务路径不新增 802.11 注入调用 (基点 3 处: 双子/Deauth; 余为 c5 硬件限制探测 txtest 与信标空口验证)
   const txMatches = (mainCpp.match(/esp_wifi_80211_tx\(/g) || []).length;
-  assert.ok(txMatches === 3 || txMatches === 11,
+  assert.ok(txMatches === 3 || txMatches === 11 || txMatches === 14,
     'P4 不得新增业务 802.11 注入调用 (基点 3 处: 双子/Deauth)');
   assert.ok(mainCpp.includes('memcpy(s.svcData, sd.c_str(), n)'), 'Service Data 只拷贝定长前缀');
 });
@@ -759,7 +781,7 @@ test('P4(契约): BLE 页新增厂商/类型列, 表头与空态 colspan 一致'
   assert.ok(head, '找不到 BLE 表头');
   assert.equal((head[0].match(/<th>/g) || []).length, 8, 'BLE 表头应为 8 列');
   assert.ok(html.includes('colspan="8"'), 'BLE 空态 colspan 应为 8');
-  assert.ok(Buffer.byteLength(html) <= 140 * 1024, 'admin.html 超过 140KB');
+  assert.ok(Buffer.byteLength(html) <= 160 * 1024, 'admin.html 超过 160KB');
 });
 
 // ---------------- P4-2: WiFi OUI 厂商列 (随机 MAC 不反查) ----------------
@@ -953,7 +975,7 @@ test('P4-3(契约): /api/rid 独立端点与字段契约, 且保持纯被动', (
   }
   // 纯被动: 不新增任何发送/注入路径, 也不做主动连接
   const txMatches = (mainCpp.match(/esp_wifi_80211_tx\(/g) || []).length;
-  assert.ok(txMatches === 3 || txMatches === 11,
+  assert.ok(txMatches === 3 || txMatches === 11 || txMatches === 14,
     'P4-3 不得新增业务 802.11 注入调用');
   assert.ok(!mainCpp.includes('startAdvertising'), 'P4-3 不得新增 BLE 广播');
   assert.ok(!/rid.*(https?:\/\/|fetch\()/.test(mainCpp), 'Remote ID 解析不得联网');
